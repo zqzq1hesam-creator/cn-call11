@@ -1,0 +1,4 @@
+fastapi
+uvicorn[standard]
+firebase-admin==7.5.0
+livekit-api
