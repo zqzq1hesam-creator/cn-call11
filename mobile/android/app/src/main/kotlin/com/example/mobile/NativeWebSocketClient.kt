@@ -25,7 +25,7 @@ import java.util.ArrayDeque
  * and the server endpoint server/main.py /ws/{user_id}:
  *
  *   URL      : wss://<host>/ws/<userId>?token=<token>
- *              (host = cn-call10-production.up.railway.app, as ServerConfig.host)
+ *              (host = cn-call11-production.up.railway.app, as ServerConfig.host)
  *   Auth     : the access token is passed as the `token` query parameter.
  *              An invalid/revoked token makes the server send
  *              {"type":"session_invalid","reason":...} and close with 1008.
@@ -59,7 +59,7 @@ interface NativeWebSocketListener {
  * is invoked. Inactive in the current phase unless an external caller drives it.
  */
 object NativeWebSocketClient {
-    private const val WS_HOST = "cn-call10-production.up.railway.app"
+    private const val WS_HOST = "cn-call11-production.up.railway.app"
     private const val WS_SCHEME = "wss"
     private const val RECONNECT_DELAY_MAX_SHIFT = 5
     private const val CLOSE_NORMAL = 1000

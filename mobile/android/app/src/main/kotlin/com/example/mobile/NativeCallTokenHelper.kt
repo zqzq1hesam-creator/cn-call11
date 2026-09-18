@@ -28,7 +28,7 @@ import java.util.concurrent.TimeUnit
  *   - "flutter.cn_call_display_name" (stored, but not needed by this helper)
  *
  * LiveKit token endpoint:
- *   GET https://cn-call10-production.up.railway.app/livekit/token
+ *   GET https://cn-call11-production.up.railway.app/livekit/token
  *       ?user_id=<userId>&call_id=<callId>
  *   Authorization: Bearer <accessToken>
  *   Success: 200 {"success": true, "url": "<LIVEKIT_URL>",
@@ -50,7 +50,7 @@ object NativeCallTokenHelper {
     private const val KEY_ACCESS_TOKEN = "flutter.cn_call_access_token"
 
     // Mirrors ServerConfig.host (mobile/lib/services/server_config.dart).
-    private const val HOST = "cn-call10-production.up.railway.app"
+    private const val HOST = "cn-call11-production.up.railway.app"
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
