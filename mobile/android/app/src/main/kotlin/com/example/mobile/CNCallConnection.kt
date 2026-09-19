@@ -252,6 +252,19 @@ class CNCallConnection(
         if (!CNCallRegistry.claimAnswer(callId)) return
         answering = true
         CNCallNotification.cancel(appContext, callId)
+
+        val t0 = System.currentTimeMillis()
+        println("[CN CALL][SPEED_METRICS] T0_answer_pressed call_id=$callId ts=$t0")
+
+        // Pre-start FGS immediately on Main Thread to get microphone context warm
+        // before LiveKit attempts track publication.
+        try {
+            val fgsStarted = CNCallAudioService.startForCall(appContext, callId)
+            println("[CN CALL][TELECOM] pre-started CNCallAudioService onAnswer call_id=$callId ok=$fgsStarted")
+        } catch (e: Exception) {
+            println("[CN CALL][TELECOM] pre-start CNCallAudioService exception call_id=$callId err=$e")
+        }
+
         // Phase 3: only the native signaling owner may answer. If Flutter still
         // owns the socket (a live/ringing Flutter call, or an app that reclaimed
         // ownership in the meantime), refuse here: call_accept is sent exactly

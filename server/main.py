@@ -907,6 +907,43 @@ async def get_turn_credentials(
 
 
 @app.get("/livekit/token")
+def _generate_livekit_token_for_user(user_id: str, call_id: str) -> dict[str, str] | None:
+    """Generates LiveKit join credentials for a given participant with 10-min TTL.
+
+    Secrets and tokens are never logged. Returns dict with url, token, room or
+    None if LiveKit is unconfigured.
+    """
+    livekit_url = os.getenv("LIVEKIT_URL")
+    livekit_key = os.getenv("LIVEKIT_API_KEY")
+    livekit_secret = os.getenv("LIVEKIT_API_SECRET")
+
+    if not livekit_url or not livekit_key or not livekit_secret:
+        return None
+
+    room_name = f"call-{call_id}"
+
+    jwt = (
+        api.AccessToken(
+            livekit_key,
+            livekit_secret,
+        )
+        .with_identity(user_id)
+        .with_ttl(timedelta(minutes=10))
+        .with_grants(
+            api.VideoGrants(
+                room_join=True,
+                room=room_name,
+            )
+        )
+    )
+
+    return {
+        "url": livekit_url,
+        "token": jwt.to_jwt(),
+        "room": room_name,
+    }
+
+
 def livekit_token(
     user_id: str,
     call_id: str,
@@ -931,34 +968,15 @@ def livekit_token(
     ):
         raise HTTPException(status_code=409, detail="unknown_or_ended_call")
 
-    livekit_url = os.getenv("LIVEKIT_URL")
-    livekit_key = os.getenv("LIVEKIT_API_KEY")
-    livekit_secret = os.getenv("LIVEKIT_API_SECRET")
-
-    if not livekit_url or not livekit_key or not livekit_secret:
+    creds = _generate_livekit_token_for_user(user_id, call_id.strip())
+    if not creds:
         raise HTTPException(status_code=500, detail="livekit not configured")
-
-    room_name = f"call-{call_id}"
-
-    jwt = (
-        api.AccessToken(
-            livekit_key,
-            livekit_secret,
-        )
-        .with_identity(user_id)
-        .with_grants(
-            api.VideoGrants(
-                room_join=True,
-                room=room_name,
-            )
-        )
-    )
 
     return {
         "success": True,
-        "url": livekit_url,
-        "token": jwt.to_jwt(),
-        "room": room_name,
+        "url": creds["url"],
+        "token": creds["token"],
+        "room": creds["room"],
     }
 
 
@@ -1302,26 +1320,63 @@ async def websocket_endpoint(
                 )
                 print("[CN CALL][CALL_ACCEPT SERVER] call_id=", call_id)
 
-                # Explicit acknowledgement for the accepting endpoint.
-                # The ACK is sent only AFTER the authoritative state has
-                # changed to "accepted", so the native caller never requests
-                # a LiveKit token while the server still sees "ringing".
-                try:
-                    await websocket.send_json({
-                        "type": "call_accept_ack",
-                        "call_id": call_id,
-                        "target_id": expected_target,
-                        "from_id": user_id,
+                # Design C: Generate distinct LiveKit credentials for callee and caller.
+                # Secrets and tokens are kept out of server logs.
+                callee_creds = _generate_livekit_token_for_user(user_id, call_id)
+                caller_creds = _generate_livekit_token_for_user(caller_id, call_id)
+
+                # 1. Send call_accept_ack to the accepting endpoint (callee - user_id)
+                callee_ack_payload = {
+                    "type": "call_accept_ack",
+                    "call_id": call_id,
+                    "target_id": expected_target,
+                    "from_id": user_id,
+                }
+                if callee_creds:
+                    callee_ack_payload.update({
+                        "livekit_url": callee_creds["url"],
+                        "livekit_token": callee_creds["token"],
+                        "room": callee_creds["room"],
                     })
+
+                try:
+                    await websocket.send_json(callee_ack_payload)
                     print(
                         "[CN CALL][CALL_ACCEPT ACK SENT] "
-                        f"call_id={call_id} target={user_id}"
+                        f"call_id={call_id} target={user_id} embedded_creds={callee_creds is not None}"
                     )
                 except Exception as exc:
                     print(
                         "[CN CALL][CALL_ACCEPT ACK FAILED] "
                         f"call_id={call_id} target={user_id} error={exc}"
                     )
+
+                # 2. Forward call_accept to caller (caller_id) with caller's token
+                caller_socket = connections.get(caller_id)
+                if caller_socket is not None:
+                    caller_accept_payload = {
+                        "type": "call_accept",
+                        "call_id": call_id,
+                        "target_id": caller_id,
+                        "from_id": user_id,
+                    }
+                    if caller_creds:
+                        caller_accept_payload.update({
+                            "livekit_url": caller_creds["url"],
+                            "livekit_token": caller_creds["token"],
+                            "room": caller_creds["room"],
+                        })
+                    try:
+                        await caller_socket.send_json(caller_accept_payload)
+                        print(
+                            "[CN CALL][CALL_ACCEPT FORWARDED TO CALLER] "
+                            f"call_id={call_id} caller={caller_id} embedded_creds={caller_creds is not None}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "[CN CALL][CALL_ACCEPT FORWARD FAILED] "
+                            f"call_id={call_id} caller={caller_id} error={exc}"
+                        )
             elif message_type == "offer":
                 record["connection_expires_at"] = (
                     int(time.time() * 1000) + 30000
@@ -1362,6 +1417,10 @@ async def websocket_endpoint(
                     message_type,
                     user_id,
                 )
+            elif message_type == "call_accept":
+                # Design C: call_accept and its credentials were already forwarded
+                # to caller_socket above; skip double-forwarding here.
+                pass
             elif expected_target in connections:
                 try:
                     await connections[expected_target].send_json(forwarded)
