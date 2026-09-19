@@ -129,16 +129,17 @@ async def _send_terminal_call_event(
         "target_id": target_id,
         "from_id": from_id,
     }
-    print(
-        "[CN CALL][CALL TERMINAL FCM PRIMARY]",
-        message_type,
-        "call_id=",
-        call_id,
-        "target=",
-        target_id,
-    )
+    target_socket = connections.get(target_id)
+    if target_socket is not None:
+        try:
+            await target_socket.send_json(payload)
+            print("[CN CALL][CALL TERMINAL WS]", message_type, "call_id=", call_id, "target=", target_id)
+            return
+        except Exception as exc:
+            print("[CN CALL][CALL TERMINAL WS ERROR]", exc)
 
-    # Terminal events always use FCM. WebSocket is not used for call delivery.
+    # Only the callee has an incoming native call UI to remove.  FCM is the
+    # fallback when that UI exists without a WebSocket (background/terminated).
     if message_type in {"call_cancelled", "call_reject", "hangup", "timeout", "disconnected"}:
         print("[CN CALL][CALL TERMINAL FCM]", message_type, "call_id=", call_id, "target=", target_id)
         send_call_notification(
@@ -1175,22 +1176,48 @@ async def websocket_endpoint(
                 })
 
                 print(
-                    "[CN CALL][CALL INITIAL FCM PRIMARY] "
-                    f"call_id={call_id} target={target_id}"
+                    "[CN CALL][CALL INITIAL WS ATTEMPT] "
+                    f"call_id={call_id} target={target_id} "
+                    f"socket_present={target_socket is not None}"
                 )
-                fcm_sent = send_call_notification(
-                    target_id=target_id,
-                    caller_id=user_id,
-                    caller_name=str(
-                        message.get("caller_name", "مستخدم CN CALL")
-                    ),
-                    call_id=call_id,
-                )
-                print(
-                    "[CN CALL][CALL INITIAL FCM "
-                    f"{'SENT' if fcm_sent else 'FAILED'}] "
-                    f"call_id={call_id} target={target_id}"
-                )
+                delivered = False
+                if target_socket is not None:
+                    try:
+                        await target_socket.send_json({
+                            **message,
+                            "call_id": call_id,
+                            "ring_expires_at": ring_expires_at,
+                            "from_id": user_id,
+                        })
+                        delivered = True
+                        print(
+                            "[CN CALL][CALL INITIAL WS SENT] "
+                            f"call_id={call_id} target={target_id}"
+                        )
+                    except Exception as exc:
+                        print(
+                            "[CN CALL][CALL INITIAL WS FAILED] "
+                            f"call_id={call_id} target={target_id} error={exc}"
+                        )
+
+                if not delivered:
+                    print(
+                        "[CN CALL][CALL INITIAL FCM FALLBACK] "
+                        f"call_id={call_id} target={target_id}"
+                    )
+                    fcm_sent = send_call_notification(
+                        target_id=target_id,
+                        caller_id=user_id,
+                        caller_name=str(
+                            message.get("caller_name", "مستخدم CN CALL")
+                        ),
+                        call_id=call_id,
+                    )
+                    print(
+                        "[CN CALL][CALL INITIAL FCM "
+                        f"{'SENT' if fcm_sent else 'FAILED'}] "
+                        f"call_id={call_id} target={target_id}"
+                    )
                 continue
 
             record = active_calls.get(call_id)
