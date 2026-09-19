@@ -93,6 +93,49 @@ def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
     )
 
 
+def _ready_users_to_json(users) -> str:
+    """Serialize the media-ready user set stored in call_records."""
+    if users is None:
+        return "[]"
+    if isinstance(users, str):
+        try:
+            parsed = json.loads(users)
+        except (TypeError, ValueError):
+            return "[]"
+        users = parsed
+    if not isinstance(users, (list, tuple, set)):
+        return "[]"
+    return json.dumps(
+        sorted(
+            {
+                str(user_id).strip()
+                for user_id in users
+                if str(user_id).strip()
+            }
+        )
+    )
+
+
+def _ready_users_from_json(value) -> set[str]:
+    """Deserialize call_records.media_ready_users without raising."""
+    if value is None:
+        return set()
+    if isinstance(value, (list, tuple, set)):
+        raw_values = value
+    else:
+        try:
+            raw_values = json.loads(str(value))
+        except (TypeError, ValueError):
+            return set()
+    if not isinstance(raw_values, (list, tuple, set)):
+        return set()
+    return {
+        str(user_id).strip()
+        for user_id in raw_values
+        if str(user_id).strip()
+    }
+
+
 def transition_call_state(
     call_id: str,
     new_status: str,
