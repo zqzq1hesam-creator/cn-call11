@@ -600,7 +600,9 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
-            releaseNativeOwnershipIfOwned()
+            // Keep native signaling ownership/session alive so a terminal frame
+            // queued during the WebSocket handshake cannot be cleared before
+            // it reaches the server.
             return sent
         }
 
@@ -625,7 +627,7 @@ object CNCallEngine {
             // being cancelled before the socket connected (ghost-ring fix); the
             // terminal frame below is the only frame that may still go out.
             NativeWebSocketClient.clearPendingFrames()
-            NativeWebSocketClient.send(
+            val sent = NativeWebSocketClient.send(
                 if (callerStillRinging) "call_cancelled" else "hangup",
                 mapOf("call_id" to callId, "target_id" to targetId),
             )
@@ -647,8 +649,9 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
-            releaseNativeOwnershipIfOwned()
-            return true
+            // Keep native signaling ownership/session alive so a queued terminal
+            // frame can flush after the WebSocket handshake.
+            return sent
         }
 
         override fun hold(callId: String): Boolean = false
