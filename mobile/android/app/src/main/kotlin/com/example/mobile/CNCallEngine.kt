@@ -600,7 +600,6 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
-            releaseNativeOwnershipIfOwned()
             return sent
         }
 
@@ -647,7 +646,6 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
-            releaseNativeOwnershipIfOwned()
             return true
         }
 
@@ -690,7 +688,6 @@ object CNCallEngine {
             // automatically.
             if (released) {
                 stopCallAudioService(callId)
-                releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): call finished; no queued frame may be flushed.
                 NativeWebSocketClient.clearPendingFrames()
             }
@@ -732,7 +729,6 @@ object CNCallEngine {
                 outgoingTargetId = null
             }
             stopCallAudioService(endedCallId)
-            releaseNativeOwnershipIfOwned()
             // Phase 2.3 (E1): hard end; no queued frame may be flushed after
             // the call is over.
             NativeWebSocketClient.clearPendingFrames()
@@ -1270,7 +1266,6 @@ object CNCallEngine {
             )
             if (cleared) {
                 stopCallAudioService(callId)
-                releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): an inbound terminal frame ended this call;
                 // nothing queued for it may be flushed afterwards.
                 NativeWebSocketClient.clearPendingFrames()
