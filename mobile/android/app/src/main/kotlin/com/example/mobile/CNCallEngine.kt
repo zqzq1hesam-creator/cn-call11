@@ -239,6 +239,12 @@ object CNCallEngine {
                 val current: String? = synchronized(lock) { scoredCallId }
                 if (current == null) return
 
+                val t6 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T6_livekit_connected call_id=$current ts=$t6")
+
+                val t7 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T7_mic_publish_start call_id=$current ts=$t7")
+
                 NativeLiveKit.setMicrophoneEnabled(true) { error ->
                     val stillCurrent = synchronized(lock) {
                         current == scoredCallId
@@ -253,15 +259,9 @@ object CNCallEngine {
                         return@setMicrophoneEnabled
                     }
 
-                    // Phase WS-media: only now — LiveKit connected AND the local
-                    // microphone is enabled — report a usable media path to the
-                    // server, exactly once per call_id and with the same shape as
-                    // the Flutter client (rtc_call_manager.dart:241-246:
-                    // {type:"connected", call_id, target_id, from_id}). The server
-                    // flips the call to "connected" only after BOTH endpoints
-                    // report (main.py:1233-1235, 1260-1274); without this frame a
-                    // native call stays in "accepted" and is force-ended at the
-                    // +30s negotiation deadline (expire_active_calls main.py:205-211).
+                    val t8 = System.currentTimeMillis()
+                    println("[CN CALL][SPEED_METRICS] T8_mic_published call_id=$current ts=$t8")
+
                     val reportContext = appContext
                     val reportUserId = reportContext?.let {
                         NativeCallTokenHelper.restoreUserId(it)
@@ -291,6 +291,8 @@ object CNCallEngine {
                         null
                     }
                     if (reportUserId != null && reportTargetId != null) {
+                        val t9 = System.currentTimeMillis()
+                        println("[CN CALL][SPEED_METRICS] T9_connected_signaling_sent call_id=$current ts=$t9")
                         val sent = NativeWebSocketClient.send(
                             "connected",
                             mapOf(
@@ -304,6 +306,9 @@ object CNCallEngine {
                                 " call_id=$current sent=$sent",
                         )
                     }
+
+                    val t10 = System.currentTimeMillis()
+                    println("[CN CALL][SPEED_METRICS] T10_first_usable_audio call_id=$current ts=$t10")
 
                     println(
                         "[CN CALL][ENGINE] media ready " +
@@ -528,6 +533,9 @@ object CNCallEngine {
                 }
             }
 
+            val t1 = System.currentTimeMillis()
+            println("[CN CALL][SPEED_METRICS] T1_call_accept_sent call_id=$callId ts=$t1")
+
             val sent = NativeWebSocketClient.send(
                 "call_accept",
                 mapOf("call_id" to callId, "target_id" to targetId),
@@ -546,10 +554,6 @@ object CNCallEngine {
                 return false
             }
 
-            // IMPORTANT: do not fetch the LiveKit token yet.
-            // Native media starts only after the server sends
-            // "call_accept_ack", which is emitted after the server has
-            // committed status="accepted".
             println(
                 "[CN CALL][ENGINE] call_accept sent; waiting for server ACK " +
                     "call_id=$callId"
@@ -819,12 +823,33 @@ object CNCallEngine {
         }
 
         /**
-         * Starts the async LiveKit join: fetch the token on the background
-         * worker, re-validate generation + current call AFTER the (slow) fetch,
-         * and only then hand it to NativeLiveKit.connect. The final
-         * media-ready signal comes from [liveKitListener].
+         * Direct Design C LiveKit join: uses embedded credentials from signaling,
+         * completely bypassing the HTTP token fetch round trip.
          */
-        private fun startLiveKitConnect(callId: String) {
+        private fun startLiveKitConnectDirect(callId: String, url: String, token: String) {
+            val myGeneration: Long
+            val context: Context
+            synchronized(lock) {
+                if (callId != scoredCallId) return
+                myGeneration = generation
+            }
+            context = appContext ?: return
+
+            val t5 = System.currentTimeMillis()
+            println("[CN CALL][SPEED_METRICS] T5_livekit_connect_start call_id=$callId ts=$t5")
+
+            val audioServiceStarted = CNCallAudioService.startForCall(context, callId)
+            println(
+                "[CN CALL][ENGINE] mic phone-call FGS call_id=$callId" +
+                    " started=$audioServiceStarted",
+            )
+            NativeLiveKit.connect(url, token, callId)
+        }
+
+        /**
+         * Fallback HTTP LiveKit join used only when signaling credentials are absent.
+         */
+        private fun startLiveKitConnectFallback(callId: String) {
             val myGeneration: Long
             val context: Context
             synchronized(lock) {
@@ -834,22 +859,23 @@ object CNCallEngine {
             context = appContext ?: return
             val userId = NativeCallTokenHelper.restoreUserId(context) ?: return
 
+            println("[CN CALL][ENGINE] Design C credentials missing; using HTTP fallback call_id=$callId")
+
             worker.execute {
+                val fetchStart = System.currentTimeMillis()
                 val result = NativeCallTokenHelper.fetchLiveKitToken(
                     context,
                     userId,
                     callId,
                 )
+                val fetchEnd = System.currentTimeMillis()
+                println(
+                    "[CN CALL][SPEED_METRICS] HTTP_fallback_fetch call_id=$callId" +
+                        " duration_ms=${fetchEnd - fetchStart}",
+                )
+
                 val stillCurrent: Boolean
                 synchronized(lock) {
-                    // Phase 6: a rejected/revoked accept must never start media.
-                    // All abort paths funnel into this single gate: terminal
-                    // frames and signaling_rejected bump generation via
-                    // clearScoredCall; session_invalid bumps it via
-                    // clearScoredCallForSessionInvalid AND flips
-                    // sessionTokenValid. If any of them landed while the token
-                    // fetch was in flight, the connect is cancelled right here,
-                    // immediately before NativeLiveKit.connect executes.
                     stillCurrent =
                         myGeneration == generation &&
                             callId == scoredCallId &&
@@ -860,14 +886,10 @@ object CNCallEngine {
                     callbacks?.onError("LiveKit token fetch failed call_id=$callId")
                     return@execute
                 }
-                // Android 14+ (and Samsung) restrict microphone capture while
-                // the app is not visibly in the foreground. An ACTIVE Telecom
-                // call keeps this process backgrounded, so the call-media
-                // foreground service — declared with the microphone|phoneCall
-                // types — must be up before WebRTC starts its AudioRecord.
-                // The ConnectionService (system-bound) is BAL-exempt, so the
-                // background start is allowed here. Best-effort: a denied start
-                // is logged, never allowed to put the call in a failed state.
+
+                val t5 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T5_livekit_connect_start call_id=$callId ts=$t5")
+
                 val audioServiceStarted = CNCallAudioService.startForCall(
                     context,
                     callId,
@@ -1042,6 +1064,8 @@ object CNCallEngine {
 
                 "call_accept" -> {
                     val shouldStartMedia: Boolean
+                    val embeddedUrl = payload["livekit_url"].orEmpty().trim()
+                    val embeddedToken = payload["livekit_token"].orEmpty().trim()
 
                     synchronized(lock) {
                         val matches =
@@ -1052,8 +1076,10 @@ object CNCallEngine {
                         if (matches) {
                             acceptedCallId = frameCallId
                             shouldStartMedia = true
+                            val t4 = System.currentTimeMillis()
                             println(
-                                "[CN CALL][ENGINE] signaling call_accept call_id=$frameCallId",
+                                "[CN CALL][SPEED_METRICS] T4_caller_call_accept_received call_id=$frameCallId ts=$t4" +
+                                    " has_embedded_credentials=${embeddedUrl.isNotEmpty() && embeddedToken.isNotEmpty()}",
                             )
                         } else {
                             shouldStartMedia = false
@@ -1064,12 +1090,18 @@ object CNCallEngine {
                     }
 
                     if (shouldStartMedia) {
-                        startLiveKitConnect(frameCallId)
+                        if (embeddedUrl.isNotEmpty() && embeddedToken.isNotEmpty()) {
+                            startLiveKitConnectDirect(frameCallId, embeddedUrl, embeddedToken)
+                        } else {
+                            startLiveKitConnectFallback(frameCallId)
+                        }
                     }
                 }
 
                 "call_accept_ack" -> {
                     val shouldStartMedia: Boolean
+                    val embeddedUrl = payload["livekit_url"].orEmpty().trim()
+                    val embeddedToken = payload["livekit_token"].orEmpty().trim()
 
                     synchronized(lock) {
                         shouldStartMedia =
@@ -1077,14 +1109,22 @@ object CNCallEngine {
                                 frameCallId == scoredCallId &&
                                 !isCaller &&
                                 acceptedCallId == frameCallId
+
+                        if (shouldStartMedia) {
+                            val t4 = System.currentTimeMillis()
+                            println(
+                                "[CN CALL][SPEED_METRICS] T4_callee_call_accept_ack_received call_id=$frameCallId ts=$t4" +
+                                    " has_embedded_credentials=${embeddedUrl.isNotEmpty() && embeddedToken.isNotEmpty()}",
+                            )
+                        }
                     }
 
                     if (shouldStartMedia) {
-                        println(
-                            "[CN CALL][ENGINE] server accepted call_id=$frameCallId; " +
-                                "starting LiveKit",
-                        )
-                        startLiveKitConnect(frameCallId)
+                        if (embeddedUrl.isNotEmpty() && embeddedToken.isNotEmpty()) {
+                            startLiveKitConnectDirect(frameCallId, embeddedUrl, embeddedToken)
+                        } else {
+                            startLiveKitConnectFallback(frameCallId)
+                        }
                     } else {
                         println(
                             "[CN CALL][ENGINE] stale call_accept_ack " +
