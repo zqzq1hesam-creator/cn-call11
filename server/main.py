@@ -2003,29 +2003,24 @@ async def websocket_endpoint(
                             f"call_id={call_id} target={target_id} error={exc}"
                         )
 
-                # CN CALL's Flutter foreground WebSocket intentionally does not
-                # render incoming calls; native Android Telecom delivery is
-                # driven by CallFirebaseService. Therefore FCM is a secondary
-                # delivery channel even when the target currently has a WS.
-                # TelecomRegistry/claimTelecomPresentation on the target makes
-                # the duplicate WS/FCM delivery idempotent.
-                print(
-                    "[CN CALL][CALL INITIAL FCM SECONDARY] "
-                    f"call_id={call_id} target={target_id} ws_delivered={delivered}"
-                )
-                fcm_sent = send_call_notification(
-                    target_id=target_id,
-                    caller_id=user_id,
-                    caller_name=str(
-                        message.get("caller_name", "مستخدم CN CALL")
-                    ),
-                    call_id=call_id,
-                )
-                print(
-                    "[CN CALL][CALL INITIAL FCM "
-                    f"{'SENT' if fcm_sent else 'FAILED'}] "
-                    f"call_id={call_id} target={target_id} ws_delivered={delivered}"
-                )
+                if not delivered:
+                    print(
+                        "[CN CALL][CALL INITIAL FCM FALLBACK] "
+                        f"call_id={call_id} target={target_id}"
+                    )
+                    fcm_sent = send_call_notification(
+                        target_id=target_id,
+                        caller_id=user_id,
+                        caller_name=str(
+                            message.get("caller_name", "مستخدم CN CALL")
+                        ),
+                        call_id=call_id,
+                    )
+                    print(
+                        "[CN CALL][CALL INITIAL FCM "
+                        f"{'SENT' if fcm_sent else 'FAILED'}] "
+                        f"call_id={call_id} target={target_id}"
+                    )
                 continue
 
             record = active_calls.get(call_id)
