@@ -1765,6 +1765,19 @@ object CNCallEngine {
         return CNCallRegistry.hasActiveCall()
     }
 
+    /**
+     * Forwards a durable terminal-event ACK request from the background FCM
+     * service through the real native engine implementation.
+     */
+    fun acknowledgeTerminalEventFromFcm(
+        context: Context,
+        eventId: String,
+    ): Boolean {
+        return (delegate as? CNCallEngineImpl)
+            ?.acknowledgeTerminalEventFromFcm(context, eventId)
+            ?: false
+    }
+
     // ------------------------------------------------------------
     // Lifecycle hooks (routed into the real engine)
     // ------------------------------------------------------------
