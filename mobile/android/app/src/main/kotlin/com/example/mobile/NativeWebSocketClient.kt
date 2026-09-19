@@ -154,6 +154,31 @@ object NativeWebSocketClient {
         return active.isNotEmpty()
     }
 
+    /**
+     * Phase 2.1: acquires (or requests a handoff of) native signaling
+     * ownership. Returns true when native is (or remains) the owner.
+     *
+     * Handoff: when Flutter owns the marker but has no currently managed call,
+     * native takes ownership. A live Flutter call is never hijacked because
+     * [flutterHasManagedCall] blocks the handoff.
+     */
+    fun tryAcquireNativeOwnership(context: Context): Boolean {
+        val prefs = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+
+        synchronized(ownershipLock) {
+            val owner = prefs.getString(OWNER_KEY, "")
+            when (owner) {
+                "native" -> return true
+                "flutter" -> {
+                    if (flutterHasManagedCall(prefs)) return false
+                }
+            }
+
+            prefs.edit().putString(OWNER_KEY, "native").apply()
+            return true
+        }
+    }
+
     /** Phase 2.1: clears native ownership only while native actually holds it. */
     fun releaseNativeOwnership(context: Context) {
         val prefs = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
