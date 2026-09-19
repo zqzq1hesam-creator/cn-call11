@@ -141,50 +141,17 @@ object NativeWebSocketClient {
     private val ownershipLock = Any()
 
     /**
-     * True while a Flutter-managed active/ringing call exists. Flutter writes
-     * "flutter.cn_call_active_call_id" on any incoming ring/accept
-     * (RtcCallManager → CallSession.markCallActive) and clears it on call end
-     * (markCallEnded); "flutter.pending_incoming_call" covers a cold-start
-     * notification that has not been consumed yet. These block a native
-     * handoff so an outgoing call never seizes an in-progress Flutter call.
+     * True while Flutter has a currently managed call.
+     *
+     * The active-call marker is the authoritative live Flutter ownership
+     * signal. The legacy pending_incoming_call value is not considered here
+     * because the current incoming-call path is Telecom/native-owned and no
+     * longer creates a Flutter pending incoming screen.
      */
     private fun flutterHasManagedCall(prefs: SharedPreferences): Boolean {
-        val active = prefs.getString("flutter.cn_call_active_call_id", "").orEmpty()
-        if (active.isNotEmpty()) return true
-        val pending = prefs.getString("flutter.pending_incoming_call", null)
-        return !pending.isNullOrEmpty()
-    }
-
-    /**
-     * Phase 2.1: acquires (or requests a handoff of) native signaling
-     * ownership. Returns true when native is (or remains) the owner.
-     *
-     * Handoff: when Flutter owns the marker but has no managed active/ringing
-     * call, native takes ownership ("flutter" → "native"). Flutter observes
-     * the loss the moment its socket is closed — the server keeps a single
-     * socket per user, so opening native's socket replaces Flutter's — and
-     * the Flutter ownership guard then refuses every reconnect. No
-     * timestamp/debounce, no explicit control frame.
-     *
-     * NOTE_CAS: [SharedPreferences] is NOT an atomic compare-and-swap across
-     * the Flutter/Android processes; the read-check-write here is only
-     * serialized for concurrent native callers via [ownershipLock]. A racing
-     * Flutter write can still interleave; CNCallEngine retries the acquisition
-     * and the server's single-socket eviction is the final tie-breaker.
-     */
-    fun tryAcquireNativeOwnership(context: Context): Boolean {
-        val prefs = context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-        synchronized(ownershipLock) {
-            val owner = prefs.getString(OWNER_KEY, "")
-            when (owner) {
-                "native" -> return true
-                "flutter" -> {
-                    if (flutterHasManagedCall(prefs)) return false
-                }
-            }
-            prefs.edit().putString(OWNER_KEY, "native").apply()
-            return true
-        }
+        val active =
+            prefs.getString("flutter.cn_call_active_call_id", "").orEmpty()
+        return active.isNotEmpty()
     }
 
     /** Phase 2.1: clears native ownership only while native actually holds it. */
@@ -194,6 +161,48 @@ object NativeWebSocketClient {
             if (prefs.getString(OWNER_KEY, "") == "native") {
                 prefs.edit().remove(OWNER_KEY).apply()
             }
+        }
+    }
+
+    /**
+     * Closes native signaling only while native still owns the shared marker.
+     * The ownership check, transport teardown, and marker removal are kept
+     * together under the native-side ownership lock.
+     */
+    fun disconnectAndReleaseNativeOwnership(context: Context): Boolean {
+        val prefs =
+            context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+
+        synchronized(ownershipLock) {
+            if (prefs.getString(OWNER_KEY, "") != "native") {
+                println(
+                    "[CN CALL][WS] release skipped: native ownership is no longer held",
+                )
+                return false
+            }
+
+            generation++
+            reconnectEnabled = false
+            cancelPendingReconnect()
+            connecting.set(false)
+
+            synchronized(this) {
+                pendingFrames.clear()
+            }
+
+            closeQuietly()
+            currentUserId = null
+            currentToken = null
+
+            val removed = prefs.edit()
+                .remove(OWNER_KEY)
+                .commit()
+
+            println(
+                "[CN CALL][WS] native ownership released commit=$removed",
+            )
+
+            return removed
         }
     }
 

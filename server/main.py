@@ -58,6 +58,13 @@ call_expiry_task: asyncio.Task | None = None
 # extended (a real conversation is never auto-cut); if one side's socket stays
 # gone, the call is released after this window and both users are freed.
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
+TERMINAL_EVENT_RETRY_MS = 5000
+TERMINAL_EVENT_FCM_AFTER_MS = 30000
+
+_UNSET = object()
+
+terminal_outbox_task: asyncio.Task | None = None
+terminal_outbox_lock = asyncio.Lock()
 
 
 def _mark_active_user(user_id: str, call_id: str, role: str) -> None:
@@ -86,69 +93,476 @@ def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
     )
 
 
-def release_call(call_id: str, reason: str) -> bool:
-    record = active_calls.pop(call_id, None)
-    if record is None:
-        return False
-
-    caller_id = str(record["caller_id"])
-    target_id = str(record["target_id"])
-    _unmark_active_user(caller_id, call_id, reason)
-    _unmark_active_user(target_id, call_id, reason)
-
-    status = reason
-    if reason == "timeout":
-        status = "missed" if record["status"] == "ringing" else "timeout"
+def transition_call_state(
+    call_id: str,
+    new_status: str,
+    *,
+    negotiation_expires_at=_UNSET,
+    connection_expires_at=_UNSET,
+    media_ready_users=_UNSET,
+) -> int | None:
+    """Persist authoritative call state and mirror it in active_calls."""
 
     db = get_db()
-    db.execute(
-        "UPDATE call_records SET status = ? WHERE call_id = ?",
-        (status, call_id),
-    )
-    db.commit()
-    db.close()
-    print("[CN CALL][CALL TERMINAL] call_id=", call_id, "reason=", reason)
-    return True
+    try:
+        db.execute("BEGIN IMMEDIATE")
+
+        row = db.execute(
+            """
+            SELECT status,
+                   negotiation_expires_at,
+                   connection_expires_at,
+                   media_ready_users,
+                   state_version
+            FROM call_records
+            WHERE call_id = ?
+            """,
+            (call_id,),
+        ).fetchone()
+
+        if row is None:
+            db.rollback()
+            return None
+
+        current_version = int(row["state_version"] or 1)
+
+        next_negotiation = (
+            row["negotiation_expires_at"]
+            if negotiation_expires_at is _UNSET
+            else negotiation_expires_at
+        )
+        next_connection = (
+            row["connection_expires_at"]
+            if connection_expires_at is _UNSET
+            else connection_expires_at
+        )
+        next_ready_json = (
+            row["media_ready_users"] or "[]"
+            if media_ready_users is _UNSET
+            else _ready_users_to_json(media_ready_users)
+        )
+
+        changed = (
+            str(row["status"]) != str(new_status)
+            or row["negotiation_expires_at"] != next_negotiation
+            or row["connection_expires_at"] != next_connection
+            or (row["media_ready_users"] or "[]") != next_ready_json
+        )
+
+        version = current_version + 1 if changed else current_version
+
+        if changed:
+            db.execute(
+                """
+                UPDATE call_records
+                SET status = ?,
+                    negotiation_expires_at = ?,
+                    connection_expires_at = ?,
+                    media_ready_users = ?,
+                    state_version = ?
+                WHERE call_id = ?
+                """,
+                (
+                    str(new_status),
+                    next_negotiation,
+                    next_connection,
+                    next_ready_json,
+                    version,
+                    call_id,
+                ),
+            )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    record = active_calls.get(call_id)
+    if record is not None:
+        record["status"] = str(new_status)
+        record["negotiation_expires_at"] = next_negotiation
+        record["connection_expires_at"] = next_connection
+        record["media_ready_users"] = _ready_users_from_json(next_ready_json)
+        record["state_version"] = version
+
+    return version
 
 
-async def _send_terminal_call_event(
+def _insert_terminal_event_in_db(
+    db,
     record: dict[str, object],
     target_id: str,
     message_type: str,
     from_id: str,
-):
-    """Deliver terminal signaling through the same route as the call.
-
-    A terminal event must not depend on a live WebSocket: an incoming Android
-    CallKit UI may be the only process left on the target device.
-    """
+    state_version: int,
+) -> str:
     call_id = str(record["call_id"])
+    target_id = str(target_id)
+    message_type = str(message_type)
+    from_id = str(from_id)
+
+    existing = db.execute(
+        """
+        SELECT event_id
+        FROM durable_terminal_events
+        WHERE call_id = ?
+          AND target_user_id = ?
+          AND event_type = ?
+          AND acknowledged_at IS NULL
+        LIMIT 1
+        """,
+        (call_id, target_id, message_type),
+    ).fetchone()
+
+    if existing is not None:
+        return str(existing["event_id"])
+
+    event_id = uuid.uuid4().hex
+
+    cursor = db.execute(
+        """
+        INSERT OR IGNORE INTO durable_terminal_events
+        (
+            event_id,
+            call_id,
+            source_user_id,
+            target_user_id,
+            event_type,
+            created_at,
+            acknowledged_at,
+            state_version,
+            last_attempt_at,
+            attempt_count
+        )
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 0)
+        """,
+        (
+            event_id,
+            call_id,
+            from_id,
+            target_id,
+            message_type,
+            int(time.time() * 1000),
+            state_version,
+        ),
+    )
+
+    if cursor.rowcount != 1:
+        existing = db.execute(
+            """
+            SELECT event_id
+            FROM durable_terminal_events
+            WHERE call_id = ?
+              AND target_user_id = ?
+              AND event_type = ?
+              AND acknowledged_at IS NULL
+            LIMIT 1
+            """,
+            (call_id, target_id, message_type),
+        ).fetchone()
+
+        if existing is None:
+            raise RuntimeError(
+                "terminal event insert lost race without existing row"
+            )
+
+        return str(existing["event_id"])
+
+    return event_id
+
+
+def finalize_call_terminal(
+    call_id: str,
+    new_status: str,
+    terminal_events: list[tuple[str, str, str]],
+) -> list[str]:
+    """
+    Atomically:
+      1. commits the terminal call state,
+      2. records every required durable terminal event,
+      3. updates the in-memory record,
+      4. releases active-user locks.
+
+    Transport delivery happens only AFTER this function commits.
+    Therefore a process crash cannot leave a terminal DB state without
+    its durable outbox event.
+    """
+    record = active_calls.get(call_id)
+    if record is None:
+        return []
+
+    db = get_db()
+    event_ids: list[str] = []
+
+    try:
+        db.execute("BEGIN IMMEDIATE")
+
+        row = db.execute(
+            """
+            SELECT status,
+                   negotiation_expires_at,
+                   connection_expires_at,
+                   media_ready_users,
+                   state_version
+            FROM call_records
+            WHERE call_id = ?
+            """,
+            (call_id,),
+        ).fetchone()
+
+        if row is None:
+            db.rollback()
+            return []
+
+        current_version = int(row["state_version"] or 1)
+        next_ready_json = row["media_ready_users"] or "[]"
+
+        changed = (
+            str(row["status"]) != str(new_status)
+            or row["negotiation_expires_at"] is not None
+            or row["connection_expires_at"] is not None
+        )
+
+        next_version = current_version + 1 if changed else current_version
+
+        if changed:
+            db.execute(
+                """
+                UPDATE call_records
+                SET status = ?,
+                    negotiation_expires_at = NULL,
+                    connection_expires_at = NULL,
+                    media_ready_users = ?,
+                    state_version = ?
+                WHERE call_id = ?
+                """,
+                (
+                    str(new_status),
+                    next_ready_json,
+                    next_version,
+                    call_id,
+                ),
+            )
+
+        durable_record = dict(record)
+        durable_record["state_version"] = next_version
+
+        for target_id, message_type, from_id in terminal_events:
+            event_ids.append(
+                _insert_terminal_event_in_db(
+                    db,
+                    durable_record,
+                    target_id,
+                    message_type,
+                    from_id,
+                    next_version,
+                )
+            )
+
+        db.commit()
+
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    record = active_calls.pop(call_id, None)
+    if record is None:
+        return event_ids
+
+    record["status"] = str(new_status)
+    record["negotiation_expires_at"] = None
+    record["connection_expires_at"] = None
+    record["media_ready_users"] = _ready_users_from_json(next_ready_json)
+    record["state_version"] = next_version
+
+    caller_id = str(record["caller_id"])
+    target_id = str(record["target_id"])
+
+    _unmark_active_user(caller_id, call_id, "terminal")
+    _unmark_active_user(target_id, call_id, "terminal")
+
+    print(
+        "[CN CALL][ATOMIC TERMINAL]",
+        "call_id=", call_id,
+        "status=", new_status,
+        "state_version=", next_version,
+        "event_ids=", event_ids,
+    )
+
+    return event_ids
+
+
+
+
+
+
+def _mark_terminal_attempt(event_id: str) -> None:
+    db = get_db()
+    db.execute(
+        """
+        UPDATE durable_terminal_events
+        SET last_attempt_at = ?,
+            attempt_count = attempt_count + 1
+        WHERE event_id = ?
+          AND acknowledged_at IS NULL
+        """,
+        (int(time.time() * 1000), event_id),
+    )
+    db.commit()
+    db.close()
+
+
+async def _deliver_terminal_event(event_id: str) -> bool:
+    db = get_db()
+    row = db.execute(
+        """
+        SELECT event_id, call_id, source_user_id, target_user_id,
+               event_type, created_at
+        FROM durable_terminal_events
+        WHERE event_id = ? AND acknowledged_at IS NULL
+        """,
+        (event_id,),
+    ).fetchone()
+    db.close()
+
+    if row is None:
+        return True
+
+    target_id = str(row["target_user_id"])
     payload = {
-        "type": message_type,
-        "call_id": call_id,
+        "type": str(row["event_type"]),
+        "call_id": str(row["call_id"]),
         "target_id": target_id,
-        "from_id": from_id,
+        "from_id": str(row["source_user_id"]),
+        "event_id": str(row["event_id"]),
     }
+
     target_socket = connections.get(target_id)
+
     if target_socket is not None:
+        _mark_terminal_attempt(event_id)
         try:
             await target_socket.send_json(payload)
-            print("[CN CALL][CALL TERMINAL WS]", message_type, "call_id=", call_id, "target=", target_id)
-            return
+            print(
+                "[CN CALL][DURABLE TERMINAL WS SENT]",
+                row["event_type"],
+                "call_id=", row["call_id"],
+                "event_id=", event_id,
+            )
+            return True
         except Exception as exc:
-            print("[CN CALL][CALL TERMINAL WS ERROR]", exc)
+            print(
+                "[CN CALL][DURABLE TERMINAL WS ERROR]",
+                "call_id=", row["call_id"],
+                "event_id=", event_id,
+                "error=", exc,
+            )
 
-    # Only the callee has an incoming native call UI to remove.  FCM is the
-    # fallback when that UI exists without a WebSocket (background/terminated).
-    if message_type in {"call_cancelled", "call_reject", "hangup", "timeout", "disconnected"}:
-        print("[CN CALL][CALL TERMINAL FCM]", message_type, "call_id=", call_id, "target=", target_id)
+    age_ms = int(time.time() * 1000) - int(row["created_at"])
+
+    if age_ms >= TERMINAL_EVENT_FCM_AFTER_MS:
+        _mark_terminal_attempt(event_id)
         send_call_notification(
             target_id=target_id,
-            caller_id=str(record["caller_id"]),
-            caller_name=str(record.get("caller_name", "مستخدم CN CALL")),
-            call_id=call_id,
-            message_type=message_type,
+            caller_id=str(row["source_user_id"]),
+            caller_name="?????? CN CALL",
+            call_id=str(row["call_id"]),
+            message_type=str(row["event_type"]),
+            event_id=str(row["event_id"]),
         )
+
+    return False
+
+
+async def deliver_pending_terminal_events(target_user_id: str | None = None) -> None:
+    async with terminal_outbox_lock:
+        now = int(time.time() * 1000)
+        db = get_db()
+
+        if target_user_id is None:
+            rows = db.execute(
+                """
+                SELECT event_id, last_attempt_at
+                FROM durable_terminal_events
+                WHERE acknowledged_at IS NULL
+                ORDER BY created_at ASC
+                """
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """
+                SELECT event_id, last_attempt_at
+                FROM durable_terminal_events
+                WHERE acknowledged_at IS NULL
+                  AND target_user_id = ?
+                ORDER BY created_at ASC
+                """,
+                (target_user_id,),
+            ).fetchall()
+
+        db.close()
+
+        for row in rows:
+            last_attempt = row["last_attempt_at"]
+
+            if (
+                last_attempt is not None
+                and now - int(last_attempt) < TERMINAL_EVENT_RETRY_MS
+            ):
+                continue
+
+            await _deliver_terminal_event(str(row["event_id"]))
+
+
+async def _terminal_outbox_loop():
+    while True:
+        try:
+            await deliver_pending_terminal_events()
+        except Exception as exc:
+            print("[CN CALL][TERMINAL OUTBOX ERROR]", exc)
+        await asyncio.sleep(1)
+
+
+async def acknowledge_terminal_event(
+    user_id: str,
+    event_id: str,
+) -> bool:
+    event_id = event_id.strip()
+
+    if not event_id:
+        return False
+
+    db = get_db()
+    cursor = db.execute(
+        """
+        UPDATE durable_terminal_events
+        SET acknowledged_at = ?
+        WHERE event_id = ?
+          AND target_user_id = ?
+          AND acknowledged_at IS NULL
+        """,
+        (int(time.time() * 1000), event_id, user_id),
+    )
+    db.commit()
+    db.close()
+
+    acknowledged = cursor.rowcount == 1
+
+    if acknowledged:
+        print(
+            "[CN CALL][DURABLE TERMINAL ACK]",
+            "user=", user_id,
+            "event_id=", event_id,
+        )
+
+    return acknowledged
+
+
 
 
 async def release_calls_for_user(user_id: str, token: str | None = None):
@@ -181,13 +595,24 @@ async def release_calls_for_user(user_id: str, token: str | None = None):
             if user_id == caller_id and status == "ringing"
             else "call_reject" if status == "ringing" else "hangup"
         )
-        await _send_terminal_call_event(
-            record,
-            peer_id,
-            message_type,
-            user_id,
+        terminal_status = (
+            "cancelled"
+            if message_type == "call_cancelled"
+            else "rejected"
+            if message_type == "call_reject"
+            else "ended"
         )
-        release_call(call_id, "cancelled" if message_type == "call_cancelled" else "ended")
+
+        event_ids = finalize_call_terminal(
+            call_id,
+            terminal_status,
+            [
+                (peer_id, message_type, user_id),
+            ],
+        )
+
+        for event_id in event_ids:
+            await _deliver_terminal_event(event_id)
 
 
 async def expire_active_calls():
@@ -229,8 +654,11 @@ async def expire_active_calls():
                 # Both endpoints are still reachable: keep the call alive by
                 # re-arming the idle deadline every sweep. Only a genuinely
                 # missing party lets the countdown reach release.
-                record["connection_expires_at"] = (
-                    now + CONNECTED_IDLE_TIMEOUT_MS
+                transition_call_state(
+                    call_id,
+                    "connected",
+                    connection_expires_at=now + CONNECTED_IDLE_TIMEOUT_MS,
+                    media_ready_users=record.get("media_ready_users") or set(),
                 )
                 continue
             if (
@@ -246,27 +674,31 @@ async def expire_active_calls():
             continue
         caller_id = str(record["caller_id"])
         target_id = str(record["target_id"])
-        if str(record["status"]) == "ringing":
-            await _send_terminal_call_event(
-                record,
-                target_id,
-                "call_cancelled",
-                caller_id,
-            )
-        else:
-            await _send_terminal_call_event(
-                record,
-                target_id,
-                "hangup",
-                caller_id,
-            )
-            await _send_terminal_call_event(
-                record,
-                caller_id,
-                "hangup",
-                target_id,
-            )
-        release_call(call_id, "timeout")
+        terminal_status = (
+            "missed"
+            if str(record["status"]) == "ringing"
+            else "timeout"
+        )
+
+        terminal_events = (
+            [
+                (target_id, "call_cancelled", caller_id),
+            ]
+            if terminal_status == "missed"
+            else [
+                (target_id, "hangup", caller_id),
+                (caller_id, "hangup", target_id),
+            ]
+        )
+
+        event_ids = finalize_call_terminal(
+            call_id,
+            terminal_status,
+            terminal_events,
+        )
+
+        for event_id in event_ids:
+            await _deliver_terminal_event(event_id)
 
 
 async def _call_expiry_loop():
@@ -282,19 +714,23 @@ async def _call_expiry_loop():
 
 @app.on_event("startup")
 async def start_call_expiry_loop():
-    global call_expiry_task
+    global call_expiry_task, terminal_outbox_task
     load_fcm_tokens()
     load_access_tokens()
     rebuild_active_calls_from_db()
     call_expiry_task = asyncio.create_task(_call_expiry_loop())
+    terminal_outbox_task = asyncio.create_task(_terminal_outbox_loop())
 
 
 @app.on_event("shutdown")
 async def stop_call_expiry_loop():
-    global call_expiry_task
+    global call_expiry_task, terminal_outbox_task
     if call_expiry_task is not None:
         call_expiry_task.cancel()
         call_expiry_task = None
+    if terminal_outbox_task is not None:
+        terminal_outbox_task.cancel()
+        terminal_outbox_task = None
 
 FCM_TOKENS: dict[str, str] = {}
 
@@ -370,6 +806,7 @@ def init_db():
             status TEXT NOT NULL,
             negotiation_expires_at INTEGER,
             connection_expires_at INTEGER,
+            media_ready_users TEXT NOT NULL DEFAULT '[]',
             state_version INTEGER NOT NULL DEFAULT 1
         )
         """
@@ -385,8 +822,22 @@ def init_db():
             event_type TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             acknowledged_at INTEGER,
-            state_version INTEGER NOT NULL DEFAULT 1
+            state_version INTEGER NOT NULL DEFAULT 1,
+            last_attempt_at INTEGER,
+            attempt_count INTEGER NOT NULL DEFAULT 0
         )
+        """
+    )
+
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_durable_terminal_pending
+        ON durable_terminal_events (
+            call_id,
+            target_user_id,
+            event_type
+        )
+        WHERE acknowledged_at IS NULL
         """
     )
 
@@ -403,6 +854,18 @@ def init_db():
         db.execute("ALTER TABLE call_records ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1")
     except Exception:
         pass
+    try:
+        db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE durable_terminal_events ADD COLUMN last_attempt_at INTEGER")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE durable_terminal_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+    except Exception:
+        pass
 
     db.commit()
     db.close()
@@ -412,61 +875,172 @@ init_db()
 
 
 def rebuild_active_calls_from_db():
-    """Restores active call state and user locks from SQLite on server startup."""
+    """Restores active calls and atomically finalizes already-expired calls."""
     db = get_db()
     now = int(time.time() * 1000)
-    rows = db.execute(
-        """
-        SELECT call_id, caller_id, target_id, caller_name, created_at, expires_at,
-               status, negotiation_expires_at, connection_expires_at, state_version
-        FROM call_records
-        WHERE status IN ('ringing', 'accepted', 'negotiating', 'connected')
-        """
-    ).fetchall()
 
-    for row in rows:
-        call_id = row["call_id"]
-        status = row["status"]
-        expires_at = row["expires_at"]
-        negotiation_expires_at = row["negotiation_expires_at"]
-        connection_expires_at = row["connection_expires_at"]
+    try:
+        rows = db.execute(
+            """
+            SELECT call_id, caller_id, target_id, caller_name, created_at,
+                   expires_at, status, negotiation_expires_at,
+                   connection_expires_at, media_ready_users, state_version
+            FROM call_records
+            WHERE status IN ('ringing', 'accepted', 'negotiating', 'connected')
+            """
+        ).fetchall()
 
-        # Check expiry
-        if status == "ringing" and expires_at and expires_at <= now:
-            db.execute("UPDATE call_records SET status = 'missed' WHERE call_id = ?", (call_id,))
-            continue
-        if status == "accepted" and negotiation_expires_at and negotiation_expires_at <= now:
-            db.execute("UPDATE call_records SET status = 'timeout' WHERE call_id = ?", (call_id,))
-            continue
-        if status in ("negotiating", "connected") and connection_expires_at and connection_expires_at <= now:
-            db.execute("UPDATE call_records SET status = 'timeout' WHERE call_id = ?", (call_id,))
-            continue
+        db.execute("BEGIN IMMEDIATE")
 
-        caller_id = row["caller_id"]
-        target_id = row["target_id"]
+        restored = 0
+        recovered_terminals = 0
+        restored_records: list[dict[str, object]] = []
 
-        active_calls[call_id] = {
-            "call_id": call_id,
-            "caller_id": caller_id,
-            "target_id": target_id,
-            "caller_name": row["caller_name"],
-            "status": status,
-            "created_at": row["created_at"],
-            "ring_expires_at": expires_at,
-            "negotiation_expires_at": negotiation_expires_at,
-            "connection_expires_at": connection_expires_at,
-            "caller_token": user_access_tokens.get(caller_id),
-            "target_token": user_access_tokens.get(target_id),
-            "media_ready_users": set(),
-            "state_version": row["state_version"] or 1,
-        }
-        _mark_active_user(caller_id, call_id, "caller")
-        _mark_active_user(target_id, call_id, "callee")
+        for row in rows:
+            call_id = str(row["call_id"])
+            caller_id = str(row["caller_id"])
+            target_id = str(row["target_id"])
+            status = str(row["status"])
+            expires_at = row["expires_at"]
+            negotiation_expires_at = row["negotiation_expires_at"]
+            connection_expires_at = row["connection_expires_at"]
+            current_version = int(row["state_version"] or 1)
+            next_version = current_version
 
-    db.commit()
-    db.close()
-    print(f"[CN CALL][DB RECOVERY] Restored {len(active_calls)} active calls from database")
+            expired = (
+                status == "ringing"
+                and expires_at
+                and int(expires_at) <= now
+            ) or (
+                status == "accepted"
+                and negotiation_expires_at
+                and int(negotiation_expires_at) <= now
+            ) or (
+                status in ("negotiating", "connected")
+                and connection_expires_at
+                and int(connection_expires_at) <= now
+            )
 
+            if expired:
+                terminal_status = (
+                    "missed"
+                    if status == "ringing"
+                    else "timeout"
+                )
+
+                next_version = current_version + 1
+
+                db.execute(
+                    """
+                    UPDATE call_records
+                    SET status = ?,
+                        negotiation_expires_at = NULL,
+                        connection_expires_at = NULL,
+                        state_version = ?
+                    WHERE call_id = ?
+                    """,
+                    (
+                        terminal_status,
+                        next_version,
+                        call_id,
+                    ),
+                )
+
+                durable_record = {
+                    "call_id": call_id,
+                    "state_version": next_version,
+                }
+
+                if terminal_status == "missed":
+                    terminal_events = [
+                        (
+                            target_id,
+                            "call_cancelled",
+                            caller_id,
+                        ),
+                    ]
+                else:
+                    terminal_events = [
+                        (
+                            target_id,
+                            "hangup",
+                            caller_id,
+                        ),
+                        (
+                            caller_id,
+                            "hangup",
+                            target_id,
+                        ),
+                    ]
+
+                for event_target, event_type, event_source in terminal_events:
+                    event_id = _insert_terminal_event_in_db(
+                        db,
+                        durable_record,
+                        event_target,
+                        event_type,
+                        event_source,
+                        next_version,
+                    )
+                    print(
+                        "[CN CALL][DB RECOVERY TERMINAL]",
+                        "call_id=", call_id,
+                        "status=", terminal_status,
+                        "event_id=", event_id,
+                        "state_version=", next_version,
+                    )
+
+                recovered_terminals += 1
+                continue
+
+            restored_records.append({
+                "call_id": call_id,
+                "caller_id": caller_id,
+                "target_id": target_id,
+                "caller_name": row["caller_name"],
+                "status": status,
+                "created_at": row["created_at"],
+                "ring_expires_at": expires_at,
+                "negotiation_expires_at": negotiation_expires_at,
+                "connection_expires_at": connection_expires_at,
+                "caller_token": user_access_tokens.get(caller_id),
+                "target_token": user_access_tokens.get(target_id),
+                "media_ready_users": _ready_users_from_json(
+                    row["media_ready_users"]
+                ),
+                "state_version": current_version,
+            })
+            restored += 1
+
+        db.commit()
+
+        for restored_record in restored_records:
+            restored_call_id = str(restored_record["call_id"])
+            active_calls[restored_call_id] = restored_record
+
+            _mark_active_user(
+                str(restored_record["caller_id"]),
+                restored_call_id,
+                "caller",
+            )
+            _mark_active_user(
+                str(restored_record["target_id"]),
+                restored_call_id,
+                "callee",
+            )
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+    print(
+        "[CN CALL][DB RECOVERY]",
+        "restored_active=", restored,
+        "finalized_expired=", recovered_terminals,
+    )
 
 def load_fcm_tokens():
     db = get_db()
@@ -559,6 +1133,39 @@ def authenticated_user(authorization: str | None) -> str | None:
 
     token = authorization[7:].strip()
     return access_tokens.get(token)
+
+
+def refresh_active_call_token(user_id: str, token: str) -> int:
+    """Refresh the signaling credential cached by any active call for a user.
+
+    Login intentionally rotates the user's access token and closes the old
+    WebSocket. The active call itself must survive that session handoff, so
+    its in-memory caller/target token is refreshed to the newly issued token.
+    The durable call record does not store credentials; startup recovery reads
+    the current user_access_tokens map instead.
+    """
+    updated = 0
+
+    for record in active_calls.values():
+        caller_id = str(record.get("caller_id", ""))
+        target_id = str(record.get("target_id", ""))
+
+        if caller_id == user_id:
+            record["caller_token"] = token
+            updated += 1
+
+        if target_id == user_id:
+            record["target_token"] = token
+            updated += 1
+
+    if updated:
+        print(
+            "[CN CALL][LOGIN TOKEN REFRESH]",
+            "user_id=", user_id,
+            "active_call_token_slots_updated=", updated,
+        )
+
+    return updated
 
 
 def issue_access_token(user_id: str) -> str:
@@ -781,6 +1388,7 @@ async def login(request: LoginRequest):
         }
 
     token = issue_access_token(user["user_id"])
+    refresh_active_call_token(user["user_id"], token)
 
     old_connection = connections.get(user["user_id"])
     if old_connection is not None:
@@ -849,18 +1457,36 @@ async def get_missed_calls(
 ):
     authenticated_id = authenticated_user(authorization)
     if authenticated_id != user_id.strip():
-        raise HTTPException(status_code=403, detail="غير مصرح")
+        raise HTTPException(status_code=403, detail="?????? ???????")
 
+    user_id = user_id.strip()
     now = int(time.time() * 1000)
+
+    # First materialize expired ringing call ids, then perform the
+    # authoritative transition through the same state machine used by
+    # WebSocket/expiry paths.
     db = get_db()
-    db.execute(
+    expired_rows = db.execute(
         """
-        UPDATE call_records
-        SET status = 'missed'
-        WHERE target_id = ? AND status = 'ringing' AND expires_at <= ?
+        SELECT call_id
+        FROM call_records
+        WHERE target_id = ?
+          AND status = 'ringing'
+          AND expires_at <= ?
         """,
-        (user_id.strip(), now),
-    )
+        (user_id, now),
+    ).fetchall()
+    db.close()
+
+    for row in expired_rows:
+        transition_call_state(
+            str(row["call_id"]),
+            "missed",
+            negotiation_expires_at=None,
+            connection_expires_at=None,
+        )
+
+    db = get_db()
     rows = db.execute(
         """
         SELECT call_id, caller_id, caller_name, created_at
@@ -868,15 +1494,20 @@ async def get_missed_calls(
         WHERE target_id = ? AND status = 'missed'
         ORDER BY created_at DESC
         """,
-        (user_id.strip(),),
+        (user_id,),
     ).fetchall()
-    db.execute(
-        "UPDATE call_records SET status = 'missed_delivered' "
-        "WHERE target_id = ? AND status = 'missed'",
-        (user_id.strip(),),
-    )
-    db.commit()
     db.close()
+
+    # Mark returned missed records as delivered through the same transition
+    # helper so state_version remains authoritative.
+    for row in rows:
+        transition_call_state(
+            str(row["call_id"]),
+            "missed_delivered",
+            negotiation_expires_at=None,
+            connection_expires_at=None,
+        )
+
 
     return {
         "success": True,
@@ -895,6 +1526,7 @@ def send_call_notification(
     caller_name: str,
     call_id: str,
     message_type: str = "incoming_call",
+    event_id: str | None = None,
 ) -> bool:
     token = FCM_TOKENS.get(target_id)
 
@@ -936,6 +1568,11 @@ def send_call_notification(
                 "caller_id": caller_id,
                 "caller_name": caller_name,
                 "target_id": target_id,
+                **(
+                    {"event_id": event_id}
+                    if event_id
+                    else {}
+                ),
             },
             android=messaging.AndroidConfig(
                 priority="high",
@@ -1150,6 +1787,7 @@ async def websocket_endpoint(
         })
 
         await reconcile_user_calls_on_connect()
+        await deliver_pending_terminal_events(user_id)
 
         while True:
             message = await websocket.receive_json()
@@ -1176,6 +1814,11 @@ async def websocket_endpoint(
             print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id)
 
             await expire_active_calls()
+
+            if message_type == "terminal_ack":
+                event_id = str(message.get("event_id", "")).strip()
+                await acknowledge_terminal_event(user_id, event_id)
+                continue
 
             if message_type == "call":
                 if not call_id:
@@ -1235,7 +1878,23 @@ async def websocket_endpoint(
                             call_id=str(previous_record["call_id"]),
                             message_type="call_cancelled",
                         )
-                        release_call(previous_call_id, "missed")
+                        previous_caller_id = str(previous_record["caller_id"])
+                        previous_target_id = str(previous_record["target_id"])
+
+                        event_ids = finalize_call_terminal(
+                            str(previous_call_id),
+                            "missed",
+                            [
+                                (
+                                    previous_caller_id,
+                                    "call_cancelled",
+                                    previous_target_id,
+                                ),
+                            ],
+                        )
+
+                        for event_id in event_ids:
+                            await _deliver_terminal_event(event_id)
                     else:
                         await websocket.send_json({
                             "type": "call_reject",
@@ -1265,8 +1924,9 @@ async def websocket_endpoint(
                     """
                     INSERT INTO call_records
                     (call_id, caller_id, target_id, caller_name,
-                     created_at, expires_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                     created_at, expires_at, status, media_ready_users,
+                     state_version)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 1)
                     """,
                     (
                         call_id,
@@ -1293,6 +1953,7 @@ async def websocket_endpoint(
                     "caller_token": token,
                     "target_token": user_access_tokens.get(target_id),
                     "media_ready_users": set(),
+                    "state_version": 1,
                 }
                 _mark_active_user(user_id, call_id, "caller")
                 _mark_active_user(target_id, call_id, "callee")
@@ -1447,10 +2108,11 @@ async def websocket_endpoint(
                 })
                 continue
 
-            record["status"] = next_status
             if message_type == "call_accept":
-                record["negotiation_expires_at"] = (
-                    int(time.time() * 1000) + 30000
+                transition_call_state(
+                    call_id,
+                    "accepted",
+                    negotiation_expires_at=int(time.time() * 1000) + 30000,
                 )
                 print("[CN CALL][CALL_ACCEPT SERVER] call_id=", call_id)
 
@@ -1511,25 +2173,30 @@ async def websocket_endpoint(
                             "[CN CALL][CALL_ACCEPT FORWARD FAILED] "
                             f"call_id={call_id} caller={caller_id} error={exc}"
                         )
-            elif message_type == "offer":
-                record["connection_expires_at"] = (
-                    int(time.time() * 1000) + 30000
+            elif message_type in {"offer", "answer"}:
+                transition_call_state(
+                    call_id,
+                    "negotiating",
+                    connection_expires_at=int(time.time() * 1000) + 30000,
                 )
             elif message_type == "connected":
-                record["negotiation_expires_at"] = None
-                ready_users = record.setdefault("media_ready_users", set())
-                if isinstance(ready_users, set):
-                    ready_users.add(user_id)
-                    if {caller_id, receiver_id}.issubset(ready_users):
-                        record["status"] = "connected"
-                        record["connection_expires_at"] = (
-                            int(time.time() * 1000)
-                            + CONNECTED_IDLE_TIMEOUT_MS
-                        )
-                    else:
-                        # One endpoint has local media, but the call is not
-                        # connected until both have reported a usable path.
-                        record["status"] = "negotiating"
+                ready_users = set(record.get("media_ready_users") or set())
+                ready_users.add(user_id)
+
+                both_ready = {caller_id, receiver_id}.issubset(ready_users)
+                connected_status = "connected" if both_ready else "negotiating"
+
+                transition_call_state(
+                    call_id,
+                    connected_status,
+                    negotiation_expires_at=None,
+                    connection_expires_at=(
+                        int(time.time() * 1000) + CONNECTED_IDLE_TIMEOUT_MS
+                        if both_ready
+                        else record.get("connection_expires_at")
+                    ),
+                    media_ready_users=ready_users,
+                )
 
                 # Send server confirmation ACK back to reporting endpoint
                 try:
@@ -1544,10 +2211,18 @@ async def websocket_endpoint(
             # Any valid frame that touches a connected call is activity: it
             # re-arms the connected-idle deadline instead of counting toward
             # it, so an active conversation is never auto-cut.
-            if str(record["status"]) == "connected":
-                record["connection_expires_at"] = (
-                    int(time.time() * 1000)
-                    + CONNECTED_IDLE_TIMEOUT_MS
+            if (
+                str(record["status"]) == "connected"
+                and message_type != "connected"
+            ):
+                transition_call_state(
+                    call_id,
+                    "connected",
+                    connection_expires_at=(
+                        int(time.time() * 1000)
+                        + CONNECTED_IDLE_TIMEOUT_MS
+                    ),
+                    media_ready_users=record.get("media_ready_users") or set(),
                 )
             forwarded = {
                 **message,
@@ -1556,12 +2231,17 @@ async def websocket_endpoint(
                 "from_id": user_id,
             }
             if terminal:
-                await _send_terminal_call_event(
-                    record,
-                    expected_target,
-                    message_type,
-                    user_id,
+                event_ids = finalize_call_terminal(
+                    call_id,
+                    next_status,
+                    [
+                        (expected_target, message_type, user_id),
+                    ],
                 )
+
+                for event_id in event_ids:
+                    await _deliver_terminal_event(event_id)
+
             elif message_type == "call_accept":
                 # Design C: call_accept and its credentials were already forwarded
                 # to caller_socket above; skip double-forwarding here.
@@ -1571,9 +2251,6 @@ async def websocket_endpoint(
                     await connections[expected_target].send_json(forwarded)
                 except Exception as exc:
                     print("CALL FORWARD WS ERROR:", exc)
-
-            if terminal:
-                release_call(call_id, next_status)
 
     except WebSocketDisconnect:
         pass

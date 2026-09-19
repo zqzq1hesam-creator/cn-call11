@@ -36,9 +36,12 @@ class CallFirebaseService : FirebaseMessagingService() {
                         "call_id=$callId error=$error",
                 )
             }
+            var terminalHandledLocally = false
+
             try {
                 val connection = CNCallRegistry.get(callId)
                     ?.connection as? CNCallConnection
+
                 if (connection != null) {
                     connection.terminateFromRemote(
                         when (type) {
@@ -50,6 +53,12 @@ class CallFirebaseService : FirebaseMessagingService() {
                         },
                     )
                 }
+
+                // The tombstone is already durably committed above.  A missing
+                // process-local Connection is therefore still a valid terminal
+                // FCM delivery: a later/native WS duplicate is harmless.
+                terminalHandledLocally = true
+
                 println(
                     "[CN CALL][FCM] " +
                         "FCM TERMINAL HANDLED " +
@@ -61,6 +70,31 @@ class CallFirebaseService : FirebaseMessagingService() {
                         "call_id=$callId error=$error",
                 )
             }
+
+            // Durable terminal events carry event_id.  The engine owns the
+            // native signaling setup so the cold-start FCM path does not call
+            // NativeWebSocketClient.send() before it has been configured.
+            val eventId = message.data["event_id"]?.trim().orEmpty()
+            if (terminalHandledLocally && eventId.isNotEmpty()) {
+                try {
+                    val sent =
+                        CNCallEngine.acknowledgeTerminalEventFromFcm(
+                            this,
+                            eventId,
+                        )
+
+                    println(
+                        "[CN CALL][FCM] terminal_ack " +
+                            "sent=$sent event_id=$eventId",
+                    )
+                } catch (error: Exception) {
+                    println(
+                        "[CN CALL][FCM] terminal_ack failed " +
+                            "event_id=$eventId error=$error",
+                    )
+                }
+            }
+
             return
         }
 

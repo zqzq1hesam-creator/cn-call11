@@ -804,9 +804,17 @@ object CNCallEngine {
          */
         private fun releaseNativeOwnershipIfOwned() {
             val context = appContext ?: return
-            NativeWebSocketClient.disconnect()
-            NativeWebSocketClient.releaseNativeOwnership(context)
-            println("[CN CALL][ENGINE] released native WS ownership")
+
+            val released =
+                NativeWebSocketClient.disconnectAndReleaseNativeOwnership(context)
+
+            if (released) {
+                println("[CN CALL][ENGINE] released native WS ownership")
+            } else {
+                println(
+                    "[CN CALL][ENGINE] native WS ownership release skipped",
+                )
+            }
         }
 
         /**
@@ -1169,8 +1177,15 @@ object CNCallEngine {
                     }
                 }
 
-                "call_reject", "call_cancelled", "hangup", "timeout", "signaling_rejected" ->
+                "call_reject", "call_cancelled", "hangup", "timeout", "signaling_rejected" -> {
+                    val terminalEventId = payload["event_id"].orEmpty().trim()
+
+                    if (terminalEventId.isNotEmpty()) {
+                        acknowledgeTerminalEvent(terminalEventId)
+                    }
+
                     clearScoredCall(frameCallId, type)
+                }
 
                 "session_invalid" -> {
                     sessionTokenValid = false
@@ -1257,6 +1272,97 @@ object CNCallEngine {
          * Mutates only when the frame references the current epoch's call;
          * late frames from older calls are ignored.
          */
+        private fun acknowledgeTerminalEvent(eventId: String) {
+            val context = appContext ?: return
+            val userId = NativeCallTokenHelper.restoreUserId(context)?.trim()
+
+            if (userId.isNullOrEmpty() || eventId.isBlank()) {
+                println(
+                    "[CN CALL][ENGINE] terminal_ack skipped" +
+                        " event_id=$eventId missing_credentials",
+                )
+                return
+            }
+
+            val sent = NativeWebSocketClient.send(
+                "terminal_ack",
+                mapOf(
+                    "event_id" to eventId,
+                    "from_id" to userId,
+                ),
+            )
+
+            println(
+                "[CN CALL][ENGINE] terminal_ack" +
+                    " sent=$sent event_id=$eventId user=$userId",
+            )
+        }
+
+        /**
+         * Sends a durable terminal-event ACK from the FCM background path.
+         *
+         * FCM may start this service without a previously configured native
+         * signaling client, so this method performs the same cold-start setup
+         * used by delivery signaling:
+         *   configure -> acquire/check native ownership -> restore credentials
+         *   -> connect -> send terminal_ack.
+         *
+         * The send remains transport-level best effort. If the socket is still
+         * connecting, NativeWebSocketClient may queue the ACK and flush it
+         * after the server handshake. The server-side durable outbox remains
+         * responsible for retrying until an actual ACK arrives.
+         */
+        /**
+         * Best-effort terminal-event ACK from the FCM background path.
+         *
+         * This path must never acquire native WS ownership or open a new
+         * signaling socket just to acknowledge a terminal event. A terminal
+         * FCM delivery may arrive when there is no active native Telecom call.
+         * In that case the durable server outbox remains pending until a later
+         * authenticated WebSocket connection can acknowledge the event.
+         *
+         * When native already owns signaling, the existing socket can carry the
+         * ACK without changing ownership state.
+         */
+        fun acknowledgeTerminalEventFromFcm(
+            context: Context,
+            eventId: String,
+        ): Boolean {
+            val id = eventId.trim()
+            if (id.isEmpty()) {
+                println(
+                    "[CN CALL][ENGINE] FCM terminal_ack skipped: missing event_id",
+                )
+                return false
+            }
+
+            val appCtx = context.applicationContext
+            NativeWebSocketClient.configure(appCtx)
+
+            if (NativeWebSocketClient.readOwner(appCtx) != "native") {
+                println(
+                    "[CN CALL][ENGINE] FCM terminal_ack deferred:" +
+                        " native signaling owner is not active" +
+                        " event_id=$id",
+                )
+                return false
+            }
+
+            val sent = NativeWebSocketClient.send(
+                "terminal_ack",
+                mapOf(
+                    "event_id" to id,
+                ),
+            )
+
+            println(
+                "[CN CALL][ENGINE] FCM terminal_ack" +
+                    " event_id=$id sent=$sent",
+            )
+
+            return sent
+        }
+
         private fun clearScoredCall(callId: String, event: String) {
             val cleared: Boolean
             synchronized(lock) {

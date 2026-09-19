@@ -167,6 +167,12 @@ class CallSession {
       await prefs.remove(_activeCallAtKey);
     }
 
+    // Current incoming delivery is Telecom/native-owned and no longer writes
+    // pending_incoming_call. Remove any residue from the legacy Flutter
+    // incoming-screen path so stale state cannot block a future native
+    // WebSocket ownership handoff after process death/restart.
+    await prefs.remove('pending_incoming_call');
+
     await releaseWsOwnership();
   }
 

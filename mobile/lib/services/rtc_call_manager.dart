@@ -297,6 +297,32 @@ class RtcCallManager {
     };
   }
 
+  Future<void> _acknowledgeTerminalEvent(
+    Map<String, dynamic> message,
+  ) async {
+    final eventId = message['event_id']?.toString().trim();
+
+    if (eventId == null || eventId.isEmpty) {
+      return;
+    }
+
+    try {
+      await session.socket.sendGuaranteed({
+        'type': 'terminal_ack',
+        'event_id': eventId,
+      });
+
+      print(
+        '[CN CALL][DURABLE TERMINAL ACK] sent event_id=$eventId',
+      );
+    } catch (e) {
+      print(
+        '[CN CALL][DURABLE TERMINAL ACK FAILED] ' +
+        'event_id=$eventId error=$e',
+      );
+    }
+  }
+
   Future<void> _handleMessage(Map<String, dynamic> message) async {
     final type = message['type']?.toString();
     final messageCallId = message['call_id']?.toString().trim();
@@ -340,7 +366,11 @@ class RtcCallManager {
     }
 
     if (type == 'call_cancelled') {
-      await handleRemoteTermination(callId: messageCallId, reason: 'cancelled');
+      await handleRemoteTermination(
+        callId: messageCallId,
+        reason: 'cancelled',
+      );
+      await _acknowledgeTerminalEvent(message);
       return;
     }
 
@@ -349,6 +379,16 @@ class RtcCallManager {
         callId: messageCallId,
         reason: type == 'call_reject' ? 'rejected' : 'ended',
       );
+      await _acknowledgeTerminalEvent(message);
+      return;
+    }
+
+    if (type == 'timeout') {
+      await handleRemoteTermination(
+        callId: messageCallId,
+        reason: 'timeout',
+      );
+      await _acknowledgeTerminalEvent(message);
       return;
     }
   }
