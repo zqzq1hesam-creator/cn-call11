@@ -810,16 +810,31 @@ object CNCallEngine {
         }
 
         /**
-         * Stops the call-media foreground service at a terminal edge. Safe to
-         * call on every teardown path even when [startCallAudioService] never
-         * ran (stopService on a missing service is a no-op).
+         * Tracks the active engine generation that currently owns the FGS launch.
          */
-        private fun stopCallAudioService(callId: String?) {
+        @Volatile
+        private var fgsOwnerGeneration = 0L
+
+        /**
+         * Stops the call-media foreground service at a terminal edge, guarded by generation ownership.
+         * Both ownership verification and [CNCallAudioService.stopForCall] execution are serialized inside [lock].
+         */
+        private fun stopCallAudioService(callId: String?, callerGen: Long? = null) {
             val context = appContext ?: return
             val id = callId?.trim().orEmpty()
             if (id.isEmpty()) return
-            CNCallAudioService.stopForCall(context, id)
-            println("[CN CALL][ENGINE] mic phone-call FGS stopped call_id=$id")
+
+            synchronized(lock) {
+                val owner = fgsOwnerGeneration
+                if (owner == 0L) return
+                if (callerGen != null && owner != callerGen) {
+                    println("[CN CALL][ENGINE] stopCallAudioService skipped: fgs owned by gen=$owner, callerGen=$callerGen")
+                    return
+                }
+                fgsOwnerGeneration = 0L
+                CNCallAudioService.stopForCall(context, id)
+                println("[CN CALL][ENGINE] mic phone-call FGS stopped call_id=$id gen=$owner")
+            }
         }
 
         /**
@@ -832,17 +847,30 @@ object CNCallEngine {
             synchronized(lock) {
                 if (callId != scoredCallId) return
                 myGeneration = generation
+                fgsOwnerGeneration = generation
+                context = appContext ?: return
+
+                val t5 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T5_livekit_connect_start call_id=$callId ts=$t5")
+
+                val audioServiceStarted = CNCallAudioService.startForCall(context, callId)
+                println(
+                    "[CN CALL][ENGINE] mic phone-call FGS call_id=$callId" +
+                        " started=$audioServiceStarted gen=$myGeneration",
+                )
             }
-            context = appContext ?: return
 
-            val t5 = System.currentTimeMillis()
-            println("[CN CALL][SPEED_METRICS] T5_livekit_connect_start call_id=$callId ts=$t5")
+            val stillCurrent: Boolean
+            synchronized(lock) {
+                stillCurrent = (myGeneration == generation && callId == scoredCallId && sessionTokenValid)
+            }
 
-            val audioServiceStarted = CNCallAudioService.startForCall(context, callId)
-            println(
-                "[CN CALL][ENGINE] mic phone-call FGS call_id=$callId" +
-                    " started=$audioServiceStarted",
-            )
+            if (!stillCurrent) {
+                println("[CN CALL][ENGINE] startLiveKitConnectDirect aborted: call became stale during FGS launch call_id=$callId gen=$myGeneration")
+                stopCallAudioService(callId, myGeneration)
+                return
+            }
+
             NativeLiveKit.connect(url, token, callId)
         }
 
