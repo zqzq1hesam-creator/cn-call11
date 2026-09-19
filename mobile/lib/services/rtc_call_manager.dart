@@ -328,8 +328,41 @@ class RtcCallManager {
     final messageCallId = message['call_id']?.toString().trim();
 
     if (type == 'call') {
-      print(
-          '[CN CALL][CALL RECEIVE] Suppressed Flutter incoming; Native Telecom owns call_id=$messageCallId');
+      final callerId =
+          (message['from_id'] ?? message['caller_id'])?.toString().trim() ?? '';
+      final callerName =
+          message['caller_name']?.toString().trim().isNotEmpty == true
+              ? message['caller_name'].toString().trim()
+              : 'مستخدم CN CALL';
+
+      if (messageCallId == null || messageCallId.isEmpty || callerId.isEmpty) {
+        print(
+          '[CN CALL][CALL RECEIVE] invalid incoming call identity '
+          'call_id=$messageCallId caller_id=$callerId',
+        );
+        return;
+      }
+
+      try {
+        final accepted = await const MethodChannel('cn_call/call').invokeMethod<bool>(
+          'presentIncomingCall',
+          <String, dynamic>{
+            'callId': messageCallId,
+            'callerId': callerId,
+            'callerName': callerName,
+          },
+        );
+
+        print(
+          '[CN CALL][CALL RECEIVE] handed to native Telecom '
+          'call_id=$messageCallId caller_id=$callerId accepted=$accepted',
+        );
+      } catch (e) {
+        print(
+          '[CN CALL][CALL RECEIVE] native Telecom handoff failed '
+          'call_id=$messageCallId error=$e',
+        );
+      }
       return;
     }
 
