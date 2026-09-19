@@ -335,6 +335,25 @@ class CNCallConnection(
         }
     }
 
+    override fun onMuteStateChanged(isMuted: Boolean) {
+        if (!terminal) {
+            CNCallEngine.setMute(callId, isMuted)
+            MainActivity.postTelecomEvent("muteChanged", mapOf("callId" to callId, "isMuted" to isMuted))
+        }
+    }
+
+    override fun onCallEndpointChanged(endpoint: android.telecom.CallEndpoint) {
+        if (!terminal) {
+            println("[CN CALL][TELECOM] CallEndpoint changed call_id=$callId endpoint=$endpoint")
+        }
+    }
+
+    override fun onAvailableCallEndpointsChanged(availableEndpoints: List<android.telecom.CallEndpoint>) {
+        if (!terminal) {
+            println("[CN CALL][TELECOM] AvailableCallEndpoints changed call_id=$callId count=${availableEndpoints.size}")
+        }
+    }
+
     fun fail(code: Int) {
         synchronized(terminalLock) {
             if (terminal) return
@@ -343,6 +362,7 @@ class CNCallConnection(
         stopOutgoingRingback()
         answering = false
         active = false
+        CNCallEngine.disconnect(callId)
         CNCallEngine.release(callId)
         CNCallNotification.cancel(appContext, callId)
         setDisconnected(DisconnectCause(code))

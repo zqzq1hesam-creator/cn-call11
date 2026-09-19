@@ -1161,6 +1161,14 @@ object CNCallEngine {
                     }
                 }
 
+                "connected_ack" -> {
+                    synchronized(lock) {
+                        if (frameCallId == scoredCallId) {
+                            println("[CN CALL][ENGINE] connected_ack received call_id=$frameCallId")
+                        }
+                    }
+                }
+
                 "call_reject", "call_cancelled", "hangup", "timeout", "signaling_rejected" ->
                     clearScoredCall(frameCallId, type)
 
