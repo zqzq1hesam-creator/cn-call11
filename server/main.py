@@ -1811,7 +1811,7 @@ async def websocket_endpoint(
             message_type = str(message.get("type", "")).strip()
             call_id = str(message.get("call_id", "")).strip()
             target_id = str(message.get("target_id", "")).strip()
-            print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id)
+            print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id, "target=", target_id)
 
             await expire_active_calls()
 
@@ -1831,6 +1831,10 @@ async def websocket_endpoint(
                         "target_id": user_id,
                         "reason": "self_call_not_allowed",
                     })
+                    print(
+                        "[CN CALL][CALL REJECTED] "
+                        f"call_id={call_id} from={user_id} target={target_id} reason=self_call_not_allowed"
+                    )
                     continue
 
                 db = get_db()
@@ -1846,6 +1850,10 @@ async def websocket_endpoint(
                         "target_id": user_id,
                         "reason": "duplicate_or_busy",
                     })
+                    print(
+                        "[CN CALL][CALL REJECTED] "
+                        f"call_id={call_id} from={user_id} target={target_id} reason=duplicate_or_busy existing_call_id={active_call_users.get(target_id) if target_id in active_call_users else 'none'}"
+                    )
                     continue
 
                 # Keep the normal busy protection for calls that are
@@ -1995,24 +2003,29 @@ async def websocket_endpoint(
                             f"call_id={call_id} target={target_id} error={exc}"
                         )
 
-                if not delivered:
-                    print(
-                        "[CN CALL][CALL INITIAL FCM FALLBACK] "
-                        f"call_id={call_id} target={target_id}"
-                    )
-                    fcm_sent = send_call_notification(
-                        target_id=target_id,
-                        caller_id=user_id,
-                        caller_name=str(
-                            message.get("caller_name", "مستخدم CN CALL")
-                        ),
-                        call_id=call_id,
-                    )
-                    print(
-                        "[CN CALL][CALL INITIAL FCM "
-                        f"{'SENT' if fcm_sent else 'FAILED'}] "
-                        f"call_id={call_id} target={target_id}"
-                    )
+                # CN CALL's Flutter foreground WebSocket intentionally does not
+                # render incoming calls; native Android Telecom delivery is
+                # driven by CallFirebaseService. Therefore FCM is a secondary
+                # delivery channel even when the target currently has a WS.
+                # TelecomRegistry/claimTelecomPresentation on the target makes
+                # the duplicate WS/FCM delivery idempotent.
+                print(
+                    "[CN CALL][CALL INITIAL FCM SECONDARY] "
+                    f"call_id={call_id} target={target_id} ws_delivered={delivered}"
+                )
+                fcm_sent = send_call_notification(
+                    target_id=target_id,
+                    caller_id=user_id,
+                    caller_name=str(
+                        message.get("caller_name", "مستخدم CN CALL")
+                    ),
+                    call_id=call_id,
+                )
+                print(
+                    "[CN CALL][CALL INITIAL FCM "
+                    f"{'SENT' if fcm_sent else 'FAILED'}] "
+                    f"call_id={call_id} target={target_id} ws_delivered={delivered}"
+                )
                 continue
 
             record = active_calls.get(call_id)
