@@ -283,6 +283,9 @@ async def _call_expiry_loop():
 @app.on_event("startup")
 async def start_call_expiry_loop():
     global call_expiry_task
+    load_fcm_tokens()
+    load_access_tokens()
+    rebuild_active_calls_from_db()
     call_expiry_task = asyncio.create_task(_call_expiry_loop())
 
 
@@ -364,16 +367,105 @@ def init_db():
             caller_name TEXT NOT NULL,
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            negotiation_expires_at INTEGER,
+            connection_expires_at INTEGER,
+            state_version INTEGER NOT NULL DEFAULT 1
         )
         """
     )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS durable_terminal_events (
+            event_id TEXT PRIMARY KEY,
+            call_id TEXT NOT NULL,
+            source_user_id TEXT NOT NULL,
+            target_user_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            acknowledged_at INTEGER,
+            state_version INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
+    # Safe migration for existing call_records table if columns are missing
+    try:
+        db.execute("ALTER TABLE call_records ADD COLUMN negotiation_expires_at INTEGER")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE call_records ADD COLUMN connection_expires_at INTEGER")
+    except Exception:
+        pass
+    try:
+        db.execute("ALTER TABLE call_records ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1")
+    except Exception:
+        pass
 
     db.commit()
     db.close()
 
 
 init_db()
+
+
+def rebuild_active_calls_from_db():
+    """Restores active call state and user locks from SQLite on server startup."""
+    db = get_db()
+    now = int(time.time() * 1000)
+    rows = db.execute(
+        """
+        SELECT call_id, caller_id, target_id, caller_name, created_at, expires_at,
+               status, negotiation_expires_at, connection_expires_at, state_version
+        FROM call_records
+        WHERE status IN ('ringing', 'accepted', 'negotiating', 'connected')
+        """
+    ).fetchall()
+
+    for row in rows:
+        call_id = row["call_id"]
+        status = row["status"]
+        expires_at = row["expires_at"]
+        negotiation_expires_at = row["negotiation_expires_at"]
+        connection_expires_at = row["connection_expires_at"]
+
+        # Check expiry
+        if status == "ringing" and expires_at and expires_at <= now:
+            db.execute("UPDATE call_records SET status = 'missed' WHERE call_id = ?", (call_id,))
+            continue
+        if status == "accepted" and negotiation_expires_at and negotiation_expires_at <= now:
+            db.execute("UPDATE call_records SET status = 'timeout' WHERE call_id = ?", (call_id,))
+            continue
+        if status in ("negotiating", "connected") and connection_expires_at and connection_expires_at <= now:
+            db.execute("UPDATE call_records SET status = 'timeout' WHERE call_id = ?", (call_id,))
+            continue
+
+        caller_id = row["caller_id"]
+        target_id = row["target_id"]
+
+        active_calls[call_id] = {
+            "call_id": call_id,
+            "caller_id": caller_id,
+            "target_id": target_id,
+            "caller_name": row["caller_name"],
+            "status": status,
+            "created_at": row["created_at"],
+            "ring_expires_at": expires_at,
+            "negotiation_expires_at": negotiation_expires_at,
+            "connection_expires_at": connection_expires_at,
+            "caller_token": user_access_tokens.get(caller_id),
+            "target_token": user_access_tokens.get(target_id),
+            "media_ready_users": set(),
+            "state_version": row["state_version"] or 1,
+        }
+        _mark_active_user(caller_id, call_id, "caller")
+        _mark_active_user(target_id, call_id, "callee")
+
+    db.commit()
+    db.close()
+    print(f"[CN CALL][DB RECOVERY] Restored {len(active_calls)} active calls from database")
 
 
 def load_fcm_tokens():
@@ -1011,11 +1103,53 @@ async def websocket_endpoint(
     connections[user_id] = websocket
     print("[CN CALL][SOCKET READY] user_id=", user_id)
 
+    # Reconcile active calls on WebSocket reconnect
+    async def reconcile_user_calls_on_connect():
+        for active_call_id, rec in list(active_calls.items()):
+            caller_id = str(rec["caller_id"])
+            target_id = str(rec["target_id"])
+            status = str(rec["status"])
+
+            if user_id in (caller_id, target_id):
+                peer_id = target_id if user_id == caller_id else caller_id
+                print(f"[CN CALL][RECONCILE] user={user_id} call_id={active_call_id} status={status}")
+
+                if status == "ringing" and user_id == target_id:
+                    # Replay incoming call for callee
+                    await websocket.send_json({
+                        "type": "call",
+                        "call_id": active_call_id,
+                        "target_id": target_id,
+                        "from_id": caller_id,
+                        "caller_name": str(rec.get("caller_name", "مستخدم CN CALL")),
+                        "ring_expires_at": rec.get("ring_expires_at"),
+                    })
+                elif status in ("accepted", "negotiating", "connected"):
+                    # Replay accepted credentials for reconnecting participant
+                    user_creds = _generate_livekit_token_for_user(user_id, active_call_id)
+                    replay_type = "call_accept_ack" if user_id == target_id else "call_accept"
+                    payload = {
+                        "type": replay_type,
+                        "call_id": active_call_id,
+                        "target_id": peer_id if replay_type == "call_accept_ack" else user_id,
+                        "from_id": peer_id,
+                        "replayed": True,
+                    }
+                    if user_creds:
+                        payload.update({
+                            "livekit_url": user_creds["url"],
+                            "livekit_token": user_creds["token"],
+                            "room": user_creds["room"],
+                        })
+                    await websocket.send_json(payload)
+
     try:
         await websocket.send_json({
             "type": "connected",
             "user_id": user_id,
         })
+
+        await reconcile_user_calls_on_connect()
 
         while True:
             message = await websocket.receive_json()
@@ -1396,6 +1530,17 @@ async def websocket_endpoint(
                         # One endpoint has local media, but the call is not
                         # connected until both have reported a usable path.
                         record["status"] = "negotiating"
+
+                # Send server confirmation ACK back to reporting endpoint
+                try:
+                    await websocket.send_json({
+                        "type": "connected_ack",
+                        "call_id": call_id,
+                        "status": str(record["status"]),
+                        "from_id": user_id,
+                    })
+                except Exception as exc:
+                    print(f"[CN CALL][CONNECTED ACK FAILED] call_id={call_id} user={user_id} error={exc}")
             # Any valid frame that touches a connected call is activity: it
             # re-arms the connected-idle deadline instead of counting toward
             # it, so an active conversation is never auto-cut.
