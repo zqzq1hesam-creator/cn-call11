@@ -83,6 +83,97 @@ class MainActivity : FlutterActivity() {
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "cn_call/call")
             .setMethodCallHandler { call, result ->
                 when (call.method) {
+                    "presentIncomingCall" -> {
+                        val callId = call.argument<String>("callId")?.trim().orEmpty()
+                        val callerId = call.argument<String>("callerId")?.trim().orEmpty()
+                        val callerName =
+                            call.argument<String>("callerName")?.trim().orEmpty()
+                                .ifEmpty { "مستخدم CN CALL" }
+
+                        if (callId.isEmpty() || callerId.isEmpty()) {
+                            result.error(
+                                "missing_incoming_call_identity",
+                                "presentIncomingCall requires callId and callerId",
+                                null,
+                            )
+                            return@setMethodCallHandler
+                        }
+
+                        try {
+                            val acquired =
+                                NativeWebSocketClient.tryAcquireNativeOwnership(this)
+                            println(
+                                "[CN CALL][TELECOM] Flutter incoming handoff" +
+                                    " call_id=$callId caller_id=$callerId native_owner=$acquired",
+                            )
+
+                            if (!acquired) {
+                                result.error(
+                                    "native_signaling_busy",
+                                    "Native CN CALL signaling ownership is unavailable",
+                                    null,
+                                )
+                                return@setMethodCallHandler
+                            }
+
+                            if (!CNCallRegistry.claimTelecomPresentation(callId)) {
+                                println(
+                                    "[CN CALL][TELECOM] incoming already presented" +
+                                        " call_id=$callId",
+                                )
+                                result.success(true)
+                                return@setMethodCallHandler
+                            }
+
+                            val telecomManager =
+                                getSystemService(TelecomManager::class.java)
+                                    ?: run {
+                                        CNCallRegistry.releaseTelecomPresentation(callId)
+                                        result.error(
+                                            "telecom_unavailable",
+                                            "Telecom service is unavailable",
+                                            null,
+                                        )
+                                        return@setMethodCallHandler
+                                    }
+
+                            CNCallEngine.primeIncomingDeliverySignaling(this)
+
+                            telecomManager.addNewIncomingCall(
+                                CNCallPhoneAccount.handle(this),
+                                Bundle().apply {
+                                    putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
+                                    putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
+                                    putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                                },
+                            )
+
+                            val delivered =
+                                CNCallEngine.acknowledgeIncomingCallDelivered(
+                                    this,
+                                    callId,
+                                    callerId,
+                                )
+
+                            println(
+                                "[CN CALL][TELECOM] Flutter incoming handoff complete" +
+                                    " call_id=$callId delivered_ack=$delivered",
+                            )
+                            result.success(true)
+                        } catch (error: Exception) {
+                            CNCallRegistry.releaseTelecomPresentation(callId)
+                            println(
+                                "[CN CALL][TELECOM] Flutter incoming handoff failed" +
+                                    " call_id=$callId error=$error",
+                            )
+                            result.error(
+                                "incoming_telecom_failed",
+                                "Failed to present incoming CN CALL",
+                                error.message,
+                            )
+                        }
+                    }
+
                     "placeCNCall" -> {
                         val callId = call.argument<String>("callId")?.trim().orEmpty()
                         val targetId = call.argument<String>("targetId")?.trim().orEmpty()
