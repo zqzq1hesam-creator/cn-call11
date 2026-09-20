@@ -26,6 +26,10 @@ class CNCallConnection(
     private val ringbackLock = Any()
     private var ringbackPlayer: MediaPlayer? = null
     private var ringbackGeneration = 0L
+    @Volatile
+    private var ringbackPrepared = false
+    @Volatile
+    private var ringbackStartRequested = false
     internal val engineCallbacks = object : CNCallEngine.Callbacks {
         override fun onIncomingCallDelivered() {
             if (terminal || active) return
@@ -73,6 +77,9 @@ class CNCallConnection(
     init {
         setAudioModeIsVoip(true)
         setAddress(address, CallLog.Calls.PRESENTATION_ALLOWED)
+        if (!incoming) {
+            prepareOutgoingRingback()
+        }
         val displayName = callerName.trim()
             .takeIf { it.isNotEmpty() && it != callerId.trim() }
             ?: "مستخدم CN CALL"
@@ -91,14 +98,15 @@ class CNCallConnection(
         }
     }
 
-    private fun startOutgoingRingback() {
+    private fun prepareOutgoingRingback() {
         val generation: Long
         synchronized(ringbackLock) {
             if (terminal || active || ringbackPlayer != null) return
             ringbackGeneration += 1
             generation = ringbackGeneration
         }
-        println("[CN CALL][RINGBACK] start call_id=$callId")
+
+        println("[CN CALL][RINGBACK] prepare call_id=$callId")
 
         val player = MediaPlayer()
         var registered = false
@@ -129,7 +137,7 @@ class CNCallConnection(
             }
             player.setOnPreparedListener { preparedPlayer ->
                 var releasePlayer = false
-                var started = false
+                var shouldStart = false
                 synchronized(ringbackLock) {
                     if (preparedPlayer !== ringbackPlayer ||
                         generation != ringbackGeneration ||
@@ -138,43 +146,48 @@ class CNCallConnection(
                     ) {
                         if (preparedPlayer === ringbackPlayer) {
                             ringbackPlayer = null
+                            ringbackPrepared = false
+                            ringbackStartRequested = false
                             ringbackGeneration += 1
                             releasePlayer = true
                         }
                     } else {
-                        try {
-                            preparedPlayer.start()
-                            started = true
-                        } catch (error: IllegalStateException) {
-                            println(
-                                "[CN CALL][RINGBACK] failed call_id=$callId error=$error",
-                            )
-                            ringbackPlayer = null
-                            ringbackGeneration += 1
-                            releasePlayer = true
+                        ringbackPrepared = true
+                        shouldStart = ringbackStartRequested
+                        if (shouldStart) {
+                            ringbackStartRequested = false
+                            try {
+                                preparedPlayer.start()
+                            } catch (error: IllegalStateException) {
+                                println(
+                                    "[CN CALL][RINGBACK] failed call_id=$callId error=$error",
+                                )
+                                ringbackPlayer = null
+                                ringbackPrepared = false
+                                ringbackGeneration += 1
+                                releasePlayer = true
+                                shouldStart = false
+                            }
                         }
                     }
                 }
                 if (releasePlayer) {
                     releaseOutgoingRingbackPlayer(preparedPlayer)
                 }
-                if (started) {
-                    println("[CN CALL][RINGBACK] started call_id=$callId")
+                if (shouldStart) {
+                    println("[CN CALL][RINGBACK] started call_id=$callId source=prewarmed")
+                } else if (!releasePlayer) {
+                    println("[CN CALL][RINGBACK] prepared call_id=$callId")
                 }
             }
-            var releaseBeforePrepare = false
             synchronized(ringbackLock) {
                 if (generation != ringbackGeneration || terminal || active) {
-                    releaseBeforePrepare = true
-                } else {
-                    ringbackPlayer = player
-                    registered = true
-                    player.prepareAsync()
+                    releaseOutgoingRingbackPlayer(player)
+                    return
                 }
-            }
-            if (releaseBeforePrepare) {
-                releaseOutgoingRingbackPlayer(player)
-                return
+                ringbackPlayer = player
+                registered = true
+                player.prepareAsync()
             }
         } catch (error: IOException) {
             println("[CN CALL][RINGBACK] failed call_id=$callId error=$error")
@@ -198,6 +211,33 @@ class CNCallConnection(
                 releaseOutgoingRingbackPlayer(player)
             }
         }
+    }
+
+    private fun startOutgoingRingback() {
+        synchronized(ringbackLock) {
+            if (terminal || active || ringbackStartRequested) return
+            ringbackStartRequested = true
+
+            val player = ringbackPlayer
+            if (!ringbackPrepared || player == null) {
+                println("[CN CALL][RINGBACK] waiting prepared player call_id=$callId")
+                return
+            }
+
+            try {
+                player.start()
+                ringbackStartRequested = false
+            } catch (error: IllegalStateException) {
+                println("[CN CALL][RINGBACK] failed call_id=$callId error=$error")
+                ringbackPlayer = null
+                ringbackPrepared = false
+                ringbackGeneration += 1
+                releaseOutgoingRingbackPlayer(player)
+                ringbackStartRequested = false
+                return
+            }
+        }
+        println("[CN CALL][RINGBACK] started call_id=$callId source=delivery")
     }
 
     private fun removeOutgoingRingbackPlayer(player: MediaPlayer, generation: Long) {
@@ -229,6 +269,8 @@ class CNCallConnection(
             ringbackGeneration += 1
             player = ringbackPlayer
             ringbackPlayer = null
+            ringbackPrepared = false
+            ringbackStartRequested = false
             if (markActive) {
                 active = true
             }
