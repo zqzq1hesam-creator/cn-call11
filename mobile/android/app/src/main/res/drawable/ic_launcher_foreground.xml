@@ -4,21 +4,50 @@
     android:height="108dp"
     android:viewportWidth="24"
     android:viewportHeight="24">
+
     <group
         android:pivotX="12"
         android:pivotY="12"
-        android:scaleX="0.88"
-        android:scaleY="0.88">
-        <path android:fillColor="#18C875" android:pathData="M1.2,10.8h1.5a0.75,0.75 0,0 1,0.75 0.75v0.9a0.75,0.75 0,0 1,-0.75 0.75H1.2z"/>
-        <path android:fillColor="#14C97A" android:pathData="M3.25,9.45h1.5a0.75,0.75 0,0 1,0.75 0.75v3.6a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#10CB7F" android:pathData="M5.3,8.1h1.5a0.75,0.75 0,0 1,0.75 0.75v6.3a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#0DCD84" android:pathData="M7.35,6.7h1.5a0.75,0.75 0,0 1,0.75 0.75v9.1a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#09CE89" android:pathData="M9.4,5.35h1.5a0.75,0.75 0,0 1,0.75 0.75v11.8a0.75,0.75 0, 0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#06D08E" android:pathData="M11.45,3.9h1.5a0.75,0.75 0,0 1,0.75 0.75v14.7a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#09CE89" android:pathData="M13.5,5.35h1.5a0.75,0.75 0,0 1,0.75 0.75v11.8a0.75,0.75 0, 0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#0DCD84" android:pathData="M15.55,6.7h1.5a0.75,0.75 0,0 1,0.75 0.75v9.1a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#10CB7F" android:pathData="M17.6,8.1h1.5a0.75,0.75 0,0 1,0.75 0.75v6.3a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#14C97A" android:pathData="M19.65,9.45h1.5a0.75,0.75 0,0 1,0.75 0.75v3.6a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
-        <path android:fillColor="#18C875" android:pathData="M21.7,10.8h1.5a0.75,0.75 0,0 1,0.75 0.75v0.9a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        android:scaleX="0.82"
+        android:scaleY="0.82">
+
+        <!-- Left rounded bar -->
+        <path
+            android:fillColor="#19C878"
+            android:pathData="M4.15,8.15
+                A1.15,1.15 0,0 1,5.3 7
+                H5.8
+                A1.15,1.15 0,0 1,6.95 8.15
+                V15.85
+                A1.15,1.15 0,0 1,5.8 17
+                H5.3
+                A1.15,1.15 0,0 1,4.15 15.85
+                Z" />
+
+        <!-- Center tall rounded bar -->
+        <path
+            android:fillColor="#0BA977"
+            android:pathData="M10.45,4.7
+                A1.2,1.2 0,0 1,11.65 3.5
+                H12.35
+                A1.2,1.2 0,0 1,13.55 4.7
+                V19.3
+                A1.2,1.2 0,0 1,12.35 20.5
+                H11.65
+                A1.2,1.2 0,0 1,10.45 19.3
+                Z" />
+
+        <!-- Right rounded bar -->
+        <path
+            android:fillColor="#19C878"
+            android:pathData="M17.05,8.15
+                A1.15,1.15 0,0 1,18.2 7
+                H18.7
+                A1.15,1.15 0,0 1,19.85 8.15
+                V15.85
+                A1.15,1.15 0,0 1,18.7 17
+                H18.2
+                A1.15,1.15 0,0 1,17.05 15.85
+                Z" />
     </group>
 </vector>
