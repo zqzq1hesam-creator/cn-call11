@@ -1255,12 +1255,10 @@ object CNCallEngine {
                     "[CN CALL][ENGINE] Telecom incoming submitted (WS path)" +
                         " call_id=$callId",
                 )
-                val deliveryAcked =
-                    acknowledgeIncomingCallDelivered(context, callId, callerId)
-                println(
-                    "[CN CALL][ENGINE] WS delivery ACK" +
-                        " call_id=$callId sent=$deliveryAcked",
-                )
+                // Delivery is acknowledged by CNCallConnectionService exactly
+                // when Telecom enters RINGING; do not ACK here, or the network
+                // path would be measured from addNewIncomingCall() instead of
+                // the real native ringing boundary.
             } catch (e: Exception) {
                 println(
                     "[CN CALL][ENGINE] WS incoming launch failed call_id=$callId" +
