@@ -182,16 +182,10 @@ class CallFirebaseService : FirebaseMessagingService() {
                 },
             )
 
-            println("[CN CALL][FCM] Telecom incoming submitted call_id=$callId")
-            val deliveryAcked =
-                CNCallEngine.acknowledgeIncomingCallDelivered(
-                    this,
-                    callId,
-                    callerId,
-                )
             println(
-                "[CN CALL][FCM] delivery ACK" +
-                    " call_id=$callId sent=$deliveryAcked",
+                "[CN CALL][FCM] Telecom incoming submitted call_id=$callId" +
+                    " delivery ACK will be emitted by CNCallConnectionService " +
+                    "at beginRinging",
             )
         } catch (e: Exception) {
             println("[CN CALL][FCM] incoming launch failed call_id=$callId error=$e")
