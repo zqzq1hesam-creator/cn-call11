@@ -42,6 +42,20 @@ class CNCallConnectionService : ConnectionService() {
 
         connection.beginRinging()
 
+        // Telecom is now actually ringing this native Connection. Confirm
+        // delivery immediately from the native lifecycle, before engine/media
+        // setup work can add latency. The caller's NativeWebSocketClient will
+        // start the prewarmed ringback as soon as this frame arrives.
+        val deliveryAcked = CNCallEngine.acknowledgeIncomingCallDelivered(
+            applicationContext,
+            callId,
+            callerId,
+        )
+        println(
+            "[CN CALL][TELECOM] delivery ACK after beginRinging" +
+                " call_id=$callId sent=$deliveryAcked",
+        )
+
         // Score the engine WHILE the call is ringing — not only on answer —
         // and open the native WebSocket (ownership was already reserved by
         // CallFirebaseService before addNewIncomingCall). This is what makes
@@ -54,19 +68,6 @@ class CNCallConnectionService : ConnectionService() {
         // and the answer path retries signaling before sending call_accept.
         if (CNCallEngine.initialize(applicationContext, connection.engineCallbacks)) {
             if (CNCallEngine.startIncoming(callId, callerId, callerName)) {
-                // At this point Telecom is RINGING and the Native engine already
-                // owns this exact call. Emit delivery now, before any additional
-                // signaling/media preparation, so the caller's prewarmed ringback
-                // starts as close as possible to the receiver's ringing boundary.
-                val deliveryAcked = CNCallEngine.acknowledgeIncomingCallDelivered(
-                    applicationContext,
-                    callId,
-                    callerId,
-                )
-                println(
-                    "[CN CALL][TELECOM] delivery ACK at native ringing boundary" +
-                        " call_id=$callId sent=$deliveryAcked",
-                )
                 CNCallEngine.prepareIncomingSignaling(callId)
             }
         }
