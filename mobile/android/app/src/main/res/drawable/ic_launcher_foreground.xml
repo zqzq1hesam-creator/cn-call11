@@ -7,25 +7,18 @@
     <group
         android:pivotX="12"
         android:pivotY="12"
-        android:rotation="-5"
         android:scaleX="0.88"
         android:scaleY="0.88">
-        <path
-            android:fillColor="#00E676"
-            android:pathData="M6.62,10.79
-                C8.06,13.62 10.38,15.93 13.21,17.38
-                L15.41,15.18
-                C15.68,14.91 16.08,14.82 16.43,14.94
-                C17.55,15.31 18.76,15.51 20,15.51
-                C20.55,15.51 21,15.96 21,16.51
-                L21,20
-                C21,20.55 20.55,21 20,21
-                C10.61,21 3,13.39 3,4
-                C3,3.45 3.45,3 4,3
-                L7.5,3
-                C8.05,3 8.5,3.45 8.5,4
-                C8.5,5.25 8.7,6.45 9.07,7.57
-                C9.19,7.92 9.10,8.31 8.82,8.59
-                L6.62,10.79Z" />
+        <path android:fillColor="#18C875" android:pathData="M1.2,10.8h1.5a0.75,0.75 0,0 1,0.75 0.75v0.9a0.75,0.75 0,0 1,-0.75 0.75H1.2z"/>
+        <path android:fillColor="#14C97A" android:pathData="M3.25,9.45h1.5a0.75,0.75 0,0 1,0.75 0.75v3.6a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#10CB7F" android:pathData="M5.3,8.1h1.5a0.75,0.75 0,0 1,0.75 0.75v6.3a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#0DCD84" android:pathData="M7.35,6.7h1.5a0.75,0.75 0,0 1,0.75 0.75v9.1a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#09CE89" android:pathData="M9.4,5.35h1.5a0.75,0.75 0,0 1,0.75 0.75v11.8a0.75,0.75 0, 0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#06D08E" android:pathData="M11.45,3.9h1.5a0.75,0.75 0,0 1,0.75 0.75v14.7a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#09CE89" android:pathData="M13.5,5.35h1.5a0.75,0.75 0,0 1,0.75 0.75v11.8a0.75,0.75 0, 0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#0DCD84" android:pathData="M15.55,6.7h1.5a0.75,0.75 0,0 1,0.75 0.75v9.1a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#10CB7F" android:pathData="M17.6,8.1h1.5a0.75,0.75 0,0 1,0.75 0.75v6.3a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#14C97A" android:pathData="M19.65,9.45h1.5a0.75,0.75 0,0 1,0.75 0.75v3.6a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
+        <path android:fillColor="#18C875" android:pathData="M21.7,10.8h1.5a0.75,0.75 0,0 1,0.75 0.75v0.9a0.75,0.75 0,0 1,-0.75 0.75h-1.5z"/>
     </group>
 </vector>
