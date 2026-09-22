@@ -10,6 +10,8 @@ import os
 import re
 import sqlite3
 import time
+import psycopg
+from psycopg.rows import dict_row
 import shutil
 import uuid
 from datetime import timedelta
@@ -31,15 +33,21 @@ app.add_middleware(
 
 
 BASE_DIR = Path(__file__).resolve().parent
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 VOLUME_DIR = Path("/app/data")
 DB_PATH = VOLUME_DIR / "cn_call.db"
 LEGACY_DB_PATH = BASE_DIR / "cn_call.db"
 
-VOLUME_DIR.mkdir(parents=True, exist_ok=True)
+# PostgreSQL is the preferred persistent database. SQLite/Volume remains as
+# a temporary fallback until DATABASE_URL is configured in Railway.
+if not DATABASE_URL:
+    VOLUME_DIR.mkdir(parents=True, exist_ok=True)
 
-if not DB_PATH.exists() and LEGACY_DB_PATH.exists():
-    shutil.copy2(LEGACY_DB_PATH, DB_PATH)
-    print("[CN CALL][DB] Legacy database migrated to Railway Volume")
+    if not DB_PATH.exists() and LEGACY_DB_PATH.exists():
+        shutil.copy2(LEGACY_DB_PATH, DB_PATH)
+        print("[CN CALL][DB] Legacy database migrated to Railway Volume")
+else:
+    print("[CN CALL][DB] PostgreSQL backend selected via DATABASE_URL")
 
 
 connections: dict[str, WebSocket] = {}
@@ -148,7 +156,7 @@ def transition_call_state(
 
     db = get_db()
     try:
-        db.execute("BEGIN IMMEDIATE")
+        db.execute("BEGIN")
 
         row = db.execute(
             """
@@ -159,6 +167,7 @@ def transition_call_state(
                    state_version
             FROM call_records
             WHERE call_id = ?
+            FOR UPDATE
             """,
             (call_id,),
         ).fetchone()
@@ -341,7 +350,7 @@ def finalize_call_terminal(
     event_ids: list[str] = []
 
     try:
-        db.execute("BEGIN IMMEDIATE")
+        db.execute("BEGIN")
 
         row = db.execute(
             """
@@ -352,6 +361,7 @@ def finalize_call_terminal(
                    state_version
             FROM call_records
             WHERE call_id = ?
+            FOR UPDATE
             """,
             (call_id,),
         ).fetchone()
@@ -796,10 +806,53 @@ if not firebase_admin._apps:
 # DATABASE
 # ============================================================
 
+class DatabaseHandle:
+    """Small compatibility wrapper for PostgreSQL and temporary SQLite fallback."""
+
+    def __init__(self):
+        self.is_postgres = bool(DATABASE_URL)
+
+        if self.is_postgres:
+            self._db = psycopg.connect(
+                DATABASE_URL,
+                row_factory=dict_row,
+                connect_timeout=10,
+            )
+        else:
+            self._db = sqlite3.connect(DB_PATH)
+            self._db.row_factory = sqlite3.Row
+
+    def execute(self, sql, params=None):
+        if self.is_postgres:
+            sql = sql.replace("?", "%s")
+            if re.match(
+                r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
+                sql,
+                flags=re.IGNORECASE,
+            ):
+                sql = re.sub(
+                    r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
+                    "INSERT INTO",
+                    sql,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ).rstrip()
+                sql += "\nON CONFLICT DO NOTHING"
+
+        return self._db.execute(sql, params or ())
+
+    def commit(self):
+        self._db.commit()
+
+    def rollback(self):
+        self._db.rollback()
+
+    def close(self):
+        self._db.close()
+
+
 def get_db():
-    db = sqlite3.connect(DB_PATH)
-    db.row_factory = sqlite3.Row
-    return db
+    return DatabaseHandle()
 
 
 def init_db():
@@ -933,7 +986,7 @@ def rebuild_active_calls_from_db():
             """
         ).fetchall()
 
-        db.execute("BEGIN IMMEDIATE")
+
 
         restored = 0
         recovered_terminals = 0
