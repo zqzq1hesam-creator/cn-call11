@@ -81,11 +81,7 @@ call_expiry_task: asyncio.Task | None = None
 # extended (a real conversation is never auto-cut); if one side's socket stays
 # gone, the call is released after this window and both users are freed.
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
-TERMINAL_EVENT_RETRY_MS = 5000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
-# Do not keep delivering terminal events indefinitely. The call itself is short-lived,
-# so a terminal notification left unacknowledged for hours is stale delivery state.
-TERMINAL_EVENT_MAX_DELIVERY_AGE_MS = 6 * 60 * 60 * 1000
 
 _UNSET = object()
 
@@ -489,11 +485,18 @@ def _mark_terminal_attempt(event_id: str) -> None:
 
 
 async def _deliver_terminal_event(event_id: str) -> bool:
+    """Attempt delivery of a terminal event exactly once.
+
+    A durable terminal event is created once per terminal interaction.
+    Once delivery is attempted (attempt_count becomes 1), the outbox will
+    never attempt that same event again. This avoids duplicate notifications
+    and repeated retries for the same interaction.
+    """
     db = get_db()
     row = db.execute(
         """
         SELECT event_id, call_id, source_user_id, target_user_id,
-               event_type, created_at
+               event_type, created_at, attempt_count
         FROM durable_terminal_events
         WHERE event_id = ? AND acknowledged_at IS NULL
         """,
@@ -504,19 +507,25 @@ async def _deliver_terminal_event(event_id: str) -> bool:
     if row is None:
         return True
 
+    if int(row["attempt_count"] or 0) > 0:
+        return False
+
     target_id = str(row["target_user_id"])
-    payload = {
-        "type": str(row["event_type"]),
-        "call_id": str(row["call_id"]),
-        "target_id": target_id,
-        "from_id": str(row["source_user_id"]),
-        "event_id": str(row["event_id"]),
-    }
+
+    # Consume the one allowed delivery attempt before touching the transport.
+    _mark_terminal_attempt(event_id)
 
     target_socket = connections.get(target_id)
 
     if target_socket is not None:
-        _mark_terminal_attempt(event_id)
+        payload = {
+            "type": str(row["event_type"]),
+            "call_id": str(row["call_id"]),
+            "target_id": target_id,
+            "from_id": str(row["source_user_id"]),
+            "event_id": str(row["event_id"]),
+        }
+
         try:
             await target_socket.send_json(payload)
             print(
@@ -533,21 +542,17 @@ async def _deliver_terminal_event(event_id: str) -> bool:
                 "event_id=", event_id,
                 "error=", exc,
             )
+            return False
 
-    age_ms = int(time.time() * 1000) - int(row["created_at"])
-
-    if age_ms >= TERMINAL_EVENT_FCM_AFTER_MS:
-        _mark_terminal_attempt(event_id)
-        send_call_notification(
-            target_id=target_id,
-            caller_id=str(row["source_user_id"]),
-            caller_name="?????? CN CALL",
-            call_id=str(row["call_id"]),
-            message_type=str(row["event_type"]),
-            event_id=str(row["event_id"]),
-        )
-
-    return False
+    # No live signaling socket: use the single FCM attempt instead.
+    return send_call_notification(
+        target_id=target_id,
+        caller_id=str(row["source_user_id"]),
+        caller_name="مستخدم CN CALL",
+        call_id=str(row["call_id"]),
+        message_type=str(row["event_type"]),
+        event_id=str(row["event_id"]),
+    )
 
 
 async def deliver_pending_terminal_events(target_user_id: str | None = None) -> None:
@@ -561,10 +566,9 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
                 SELECT event_id, last_attempt_at
                 FROM durable_terminal_events
                 WHERE acknowledged_at IS NULL
-                  AND created_at >= ?
+                  AND attempt_count = 0
                 ORDER BY created_at ASC
-                """,
-                (now - TERMINAL_EVENT_MAX_DELIVERY_AGE_MS,),
+                """
             ).fetchall()
         else:
             rows = db.execute(
@@ -573,23 +577,15 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
                 FROM durable_terminal_events
                 WHERE acknowledged_at IS NULL
                   AND target_user_id = ?
-                  AND created_at >= ?
+                  AND attempt_count = 0
                 ORDER BY created_at ASC
                 """,
-                (target_user_id, now - TERMINAL_EVENT_MAX_DELIVERY_AGE_MS),
+                (target_user_id,),
             ).fetchall()
 
         db.close()
 
         for row in rows:
-            last_attempt = row["last_attempt_at"]
-
-            if (
-                last_attempt is not None
-                and now - int(last_attempt) < TERMINAL_EVENT_RETRY_MS
-            ):
-                continue
-
             await _deliver_terminal_event(str(row["event_id"]))
 
 
