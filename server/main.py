@@ -825,6 +825,11 @@ class DatabaseHandle:
     def execute(self, sql, params=None):
         if self.is_postgres:
             sql = sql.replace("?", "%s")
+            sql = re.sub(
+                r"\bCURRENT_TIMESTAMP\b",
+                "CURRENT_TIMESTAMP::text",
+                sql,
+            )
             if re.match(
                 r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
                 sql,
