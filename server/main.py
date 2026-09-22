@@ -170,7 +170,8 @@ def transition_call_state(
 
     db = get_db()
     try:
-        db.execute("BEGIN")
+        if not db.is_postgres:
+            db.execute("BEGIN")
 
         row = db.execute(
             """
