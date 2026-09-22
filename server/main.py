@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pathlib import Path
@@ -32,8 +33,22 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def migration_maintenance_middleware(request, call_next):
+    if CN_CALL_MIGRATION_MODE and request.url.path != "/health":
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "message": "CN CALL is temporarily under maintenance",
+            },
+        )
+    return await call_next(request)
+
+
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+CN_CALL_MIGRATION_MODE = os.getenv("CN_CALL_MIGRATION_MODE", "").strip().lower() in {"1", "true", "yes"}
 VOLUME_DIR = Path("/app/data")
 DB_PATH = VOLUME_DIR / "cn_call.db"
 LEGACY_DB_PATH = BASE_DIR / "cn_call.db"
@@ -1815,6 +1830,14 @@ async def websocket_endpoint(
     websocket: WebSocket,
     user_id: str,
 ):
+    if CN_CALL_MIGRATION_MODE:
+        await websocket.accept()
+        await websocket.send_json({
+            "type": "server_maintenance",
+        })
+        await websocket.close(code=1013)
+        return
+
     token = websocket.query_params.get("token", "").strip()
     if access_tokens.get(token) != user_id:
         await websocket.accept()
