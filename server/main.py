@@ -83,6 +83,9 @@ call_expiry_task: asyncio.Task | None = None
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_RETRY_MS = 5000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
+# Do not keep delivering terminal events indefinitely. The call itself is short-lived,
+# so a terminal notification left unacknowledged for hours is stale delivery state.
+TERMINAL_EVENT_MAX_DELIVERY_AGE_MS = 6 * 60 * 60 * 1000
 
 _UNSET = object()
 
@@ -558,8 +561,10 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
                 SELECT event_id, last_attempt_at
                 FROM durable_terminal_events
                 WHERE acknowledged_at IS NULL
+                  AND created_at >= ?
                 ORDER BY created_at ASC
-                """
+                """,
+                (now - TERMINAL_EVENT_MAX_DELIVERY_AGE_MS,),
             ).fetchall()
         else:
             rows = db.execute(
@@ -568,9 +573,10 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
                 FROM durable_terminal_events
                 WHERE acknowledged_at IS NULL
                   AND target_user_id = ?
+                  AND created_at >= ?
                 ORDER BY created_at ASC
                 """,
-                (target_user_id,),
+                (target_user_id, now - TERMINAL_EVENT_MAX_DELIVERY_AGE_MS),
             ).fetchall()
 
         db.close()
