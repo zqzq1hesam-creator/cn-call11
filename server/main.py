@@ -959,31 +959,46 @@ def init_db():
         """
     )
 
-    # Safe migration for existing call_records table if columns are missing
-    try:
-        db.execute("ALTER TABLE call_records ADD COLUMN negotiation_expires_at INTEGER")
-    except Exception:
-        pass
-    try:
-        db.execute("ALTER TABLE call_records ADD COLUMN connection_expires_at INTEGER")
-    except Exception:
-        pass
-    try:
-        db.execute("ALTER TABLE call_records ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1")
-    except Exception:
-        pass
-    try:
-        db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
-    except Exception:
-        pass
-    try:
-        db.execute("ALTER TABLE durable_terminal_events ADD COLUMN last_attempt_at INTEGER")
-    except Exception:
-        pass
-    try:
-        db.execute("ALTER TABLE durable_terminal_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
-    except Exception:
-        pass
+    # Safe migration for pre-existing schemas.
+    # PostgreSQL supports ADD COLUMN IF NOT EXISTS, so each check is
+    # idempotent and cannot abort the whole transaction when the column
+    # already exists. SQLite keeps the legacy try/except path because its
+    # ALTER TABLE syntax differs.
+    if db.is_postgres:
+        for statement in (
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS negotiation_expires_at INTEGER",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
+            "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
+        ):
+            db.execute(statement)
+    else:
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN negotiation_expires_at INTEGER")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN connection_expires_at INTEGER")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE durable_terminal_events ADD COLUMN last_attempt_at INTEGER")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE durable_terminal_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
 
     db.commit()
     db.close()
