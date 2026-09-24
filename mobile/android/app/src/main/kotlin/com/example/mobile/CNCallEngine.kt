@@ -77,6 +77,7 @@ object CNCallEngine {
         fun onIncomingCallDelivered()
         fun onMediaReady()
         fun onDisconnected()
+        fun onRemoteCallStatus(reason: String)
         fun onError(message: String)
     }
 
@@ -1180,6 +1181,30 @@ object CNCallEngine {
                     }
                 }
 
+                "missed_call" -> {
+                    val context = appContext ?: return@handleSignalingFrame
+                    val callerId = payload["caller_id"]
+                        ?.trim()
+                        ?.ifEmpty { payload["from_id"]?.trim().orEmpty() }
+                        .orEmpty()
+                    val callerName = payload["caller_name"]
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: "مستخدم CN CALL"
+
+                    if (frameCallId.isNotEmpty()) {
+                        CNCallNotification.showMissed(
+                            context,
+                            frameCallId,
+                            callerName,
+                        )
+                        println(
+                            "[CN CALL][ENGINE] missed_call delivered " +
+                                "call_id=$frameCallId caller=$callerId",
+                        )
+                    }
+                }
+
                 "call_reject", "call_cancelled", "hangup", "timeout", "signaling_rejected" -> {
                     val terminalEventId = payload["event_id"].orEmpty().trim()
 
@@ -1187,7 +1212,24 @@ object CNCallEngine {
                         acknowledgeTerminalEvent(terminalEventId)
                     }
 
-                    clearScoredCall(frameCallId, type)
+                    val reason = payload["reason"].orEmpty().trim()
+                    val spokenStatus = when {
+                        type != "call_reject" -> null
+                        reason == "offline" -> "offline"
+                        reason == "busy" -> "busy"
+                        reason == "user_not_found" -> "user_not_found"
+                        else -> null
+                    }
+
+                    if (spokenStatus != null) {
+                        callbacks?.onRemoteCallStatus(spokenStatus)
+                    }
+
+                    clearScoredCall(
+                        frameCallId,
+                        type,
+                        notifyDisconnected = spokenStatus == null,
+                    )
                 }
 
                 "session_invalid" -> {
@@ -1364,7 +1406,11 @@ object CNCallEngine {
             return sent
         }
 
-        private fun clearScoredCall(callId: String, event: String) {
+        private fun clearScoredCall(
+            callId: String,
+            event: String,
+            notifyDisconnected: Boolean = true,
+        ) {
             val cleared: Boolean
             synchronized(lock) {
                 val matchesScored = callId == scoredCallId
@@ -1394,10 +1440,12 @@ object CNCallEngine {
                 if (NativeLiveKit.state != NewNativeLiveKitState.IDLE) {
                     NativeLiveKit.disconnect()
                 }
-                // Surface the end so the Telecom Connection reaches
-                // setDisconnected() (the single terminal path also drives the
-                // app UI via the native events channel).
-                callbacks?.onDisconnected()
+                // For spoken availability statuses, Telecom is disconnected
+                // by CNCallConnection only after the Arabic announcement ends.
+                // Generic terminal events keep the original immediate path.
+                if (notifyDisconnected) {
+                    callbacks?.onDisconnected()
+                }
             }
         }
 
