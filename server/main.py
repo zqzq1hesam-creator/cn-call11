@@ -2268,10 +2268,28 @@ async def websocket_endpoint(
                         )
 
                 if not delivered:
+                    # A socket entry that cannot accept the invite is treated
+                    # as offline. Do not leave the caller ringing against a
+                    # dead/stale socket; persist the attempt as missed and use
+                    # the same offline voice + long-TTL missed notification.
                     print(
-                        "[CN CALL][CALL INITIAL FCM FALLBACK] "
+                        "[CN CALL][CALL INITIAL WS FAILED -> OFFLINE] "
                         f"call_id={call_id} target={target_id}"
                     )
+
+                    finalize_call_terminal(
+                        call_id,
+                        "missed",
+                        [],
+                    )
+
+                    await websocket.send_json({
+                        "type": "call_reject",
+                        "call_id": call_id,
+                        "target_id": target_id,
+                        "reason": "offline",
+                    })
+
                     fcm_sent = send_call_notification(
                         target_id=target_id,
                         caller_id=user_id,
@@ -2279,9 +2297,10 @@ async def websocket_endpoint(
                             message.get("caller_name", "مستخدم CN CALL")
                         ),
                         call_id=call_id,
+                        message_type="missed_call",
                     )
                     print(
-                        "[CN CALL][CALL INITIAL FCM "
+                        "[CN CALL][CALL INITIAL MISSED FCM "
                         f"{'SENT' if fcm_sent else 'FAILED'}] "
                         f"call_id={call_id} target={target_id}"
                     )
