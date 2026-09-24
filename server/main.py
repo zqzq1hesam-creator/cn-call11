@@ -1710,8 +1710,16 @@ def send_call_notification(
             },
             android=messaging.AndroidConfig(
                 priority="high",
-                collapse_key=f"call-{call_id}",
-                ttl=timedelta(seconds=95),
+                collapse_key=(
+                    f"missed-call-{call_id}"
+                    if message_type == "missed_call"
+                    else f"call-{call_id}"
+                ),
+                ttl=timedelta(
+                    seconds=(28 * 24 * 60 * 60)
+                    if message_type == "missed_call"
+                    else 95
+                ),
             ),
         )
 
@@ -1922,6 +1930,36 @@ async def websocket_endpoint(
                         })
                     await websocket.send_json(payload)
 
+        # Missed calls remain durable in call_records. Replay them when an
+        # authenticated user reconnects so the native layer can notify them
+        # even when the original FCM delivery was unavailable.
+        missed_db = get_db()
+        missed_rows = missed_db.execute(
+            """
+            SELECT call_id, caller_id, caller_name, created_at
+            FROM call_records
+            WHERE target_id = ?
+              AND status = 'missed'
+            ORDER BY created_at DESC
+            LIMIT 50
+            """,
+            (user_id,),
+        ).fetchall()
+        missed_db.close()
+
+        for missed_row in missed_rows:
+            await websocket.send_json({
+                "type": "missed_call",
+                "call_id": str(missed_row["call_id"]),
+                "target_id": user_id,
+                "from_id": str(missed_row["caller_id"]),
+                "caller_id": str(missed_row["caller_id"]),
+                "caller_name": str(
+                    missed_row["caller_name"] or "مستخدم CN CALL"
+                ),
+                "created_at": missed_row["created_at"],
+            })
+
     try:
         await websocket.send_json({
             "type": "connected",
@@ -1980,11 +2018,29 @@ async def websocket_endpoint(
                     continue
 
                 db = get_db()
+                target_user = db.execute(
+                    "SELECT user_id FROM users WHERE user_id = ?",
+                    (target_id,),
+                ).fetchone()
                 existing = db.execute(
                     "SELECT status FROM call_records WHERE call_id = ?",
                     (call_id,),
                 ).fetchone()
                 db.close()
+
+                if target_user is None:
+                    await websocket.send_json({
+                        "type": "call_reject",
+                        "call_id": call_id,
+                        "target_id": target_id,
+                        "reason": "user_not_found",
+                    })
+                    print(
+                        "[CN CALL][CALL REJECTED] "
+                        f"call_id={call_id} from={user_id} target={target_id} reason=user_not_found"
+                    )
+                    continue
+
                 if existing is not None:
                     await websocket.send_json({
                         "type": "call_reject",
@@ -2049,18 +2105,85 @@ async def websocket_endpoint(
                         await websocket.send_json({
                             "type": "call_reject",
                             "call_id": call_id,
-                            "target_id": user_id,
-                            "reason": "duplicate_or_busy",
+                            "target_id": target_id,
+                            "reason": "busy",
                         })
+                        print(
+                            "[CN CALL][CALL REJECTED] "
+                            f"call_id={call_id} from={user_id} target={target_id} reason=busy"
+                        )
                         continue
 
                 if user_id in active_call_users:
                     await websocket.send_json({
                         "type": "call_reject",
                         "call_id": call_id,
-                        "target_id": user_id,
-                        "reason": "duplicate_or_busy",
+                        "target_id": target_id,
+                        "reason": "busy",
                     })
+                    print(
+                        "[CN CALL][CALL REJECTED] "
+                        f"call_id={call_id} from={user_id} target={target_id} reason=busy"
+                    )
+                    continue
+
+                target_socket = connections.get(target_id)
+
+                # A registered but offline target is recorded immediately as a
+                # missed call. The caller receives an immediate offline status
+                # instead of a 90-second ringing period.
+                if target_socket is None:
+                    created_at = int(time.time() * 1000)
+                    db = get_db()
+                    db.execute(
+                        """
+                        INSERT INTO call_records
+                        (call_id, caller_id, target_id, caller_name,
+                         created_at, expires_at, status, media_ready_users,
+                         state_version)
+                        VALUES (?, ?, ?, ?, ?, ?, 'missed', '[]', 1)
+                        """,
+                        (
+                            call_id,
+                            user_id,
+                            target_id,
+                            str(message.get("caller_name", "مستخدم CN CALL")),
+                            created_at,
+                            created_at,
+                        ),
+                    )
+                    db.commit()
+                    db.close()
+
+                    await websocket.send_json({
+                        "type": "call_started",
+                        "call_id": call_id,
+                        "target_id": target_id,
+                        "from_id": user_id,
+                        "ring_expires_at": created_at,
+                        "target_online": False,
+                    })
+                    await websocket.send_json({
+                        "type": "call_reject",
+                        "call_id": call_id,
+                        "target_id": target_id,
+                        "reason": "offline",
+                    })
+
+                    fcm_sent = send_call_notification(
+                        target_id=target_id,
+                        caller_id=user_id,
+                        caller_name=str(
+                            message.get("caller_name", "مستخدم CN CALL")
+                        ),
+                        call_id=call_id,
+                        message_type="missed_call",
+                    )
+                    print(
+                        "[CN CALL][CALL OFFLINE] "
+                        f"call_id={call_id} from={user_id} target={target_id} "
+                        f"missed_fcm={'SENT' if fcm_sent else 'FAILED'}"
+                    )
                     continue
 
                 ring_expires_at = message.get("ring_expires_at")
@@ -2108,8 +2231,7 @@ async def websocket_endpoint(
                 _mark_active_user(user_id, call_id, "caller")
                 _mark_active_user(target_id, call_id, "callee")
 
-                target_socket = connections.get(target_id)
-                target_online = target_socket is not None
+                target_online = True
 
                 await websocket.send_json({
                     "type": "call_started",
