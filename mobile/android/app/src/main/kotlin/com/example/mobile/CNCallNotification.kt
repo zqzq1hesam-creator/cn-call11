@@ -16,6 +16,9 @@ import android.os.Build
  */
 object CNCallNotification {
     private const val CHANNEL_ID = "cn_call_incoming"
+    private const val MISSED_CHANNEL_ID = "cn_call_missed"
+    private const val MISSED_PREFS = "CNCallMissedNotifications"
+    private const val MISSED_IDS_KEY = "shown_call_ids"
 
     fun showIncoming(context: Context, callId: String, callerName: String) {
         val manager = context.getSystemService(NotificationManager::class.java) ?: return
@@ -51,9 +54,71 @@ object CNCallNotification {
         manager.notify(notificationId(callId), notification)
     }
 
+    fun showMissed(context: Context, callId: String, callerName: String) {
+        val id = callId.trim()
+        if (id.isEmpty()) return
+        if (!markMissedAsShown(context, id)) return
+
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        ensureMissedChannel(manager)
+
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(context, MISSED_CHANNEL_ID)
+        } else {
+            Notification.Builder(context)
+        }
+
+        builder
+            .setSmallIcon(android.R.mipmap.sym_def_app_icon)
+            .setContentTitle("CN CALL")
+            .setContentText(
+                "مكالمة فائتة من " +
+                    callerName.ifBlank { "مستخدم CN CALL" },
+            )
+            .setCategory(Notification.CATEGORY_MISSED_CALL)
+            .setPriority(Notification.PRIORITY_DEFAULT)
+            .setAutoCancel(true)
+            .build()
+            .also { notification ->
+                manager.notify(missedNotificationId(id), notification)
+            }
+
+        MainActivity.postTelecomEvent(
+            "missedCall",
+            mapOf(
+                "callId" to id,
+                "callerName" to callerName,
+            ),
+        )
+    }
+
     fun cancel(context: Context, callId: String) {
         context.getSystemService(NotificationManager::class.java)
             ?.cancel(notificationId(callId))
+    }
+
+    private fun markMissedAsShown(context: Context, callId: String): Boolean {
+        val prefs = context.getSharedPreferences(MISSED_PREFS, Context.MODE_PRIVATE)
+        synchronized(prefs) {
+            val encoded = prefs.getString(MISSED_IDS_KEY, "").orEmpty()
+            val ids = encoded
+                .split('|')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .toMutableList()
+
+            if (ids.contains(callId)) return false
+
+            ids.add(callId)
+            if (ids.size > 128) {
+                ids.subList(0, ids.size - 128).clear()
+            }
+
+            prefs.edit()
+                .putString(MISSED_IDS_KEY, ids.joinToString("|"))
+                .apply()
+            return true
+        }
     }
 
     private fun ensureChannel(manager: NotificationManager) {
@@ -70,7 +135,24 @@ object CNCallNotification {
         }
     }
 
+    private fun ensureMissedChannel(manager: NotificationManager) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            manager.getNotificationChannel(MISSED_CHANNEL_ID) == null
+        ) {
+            manager.createNotificationChannel(
+                NotificationChannel(
+                    MISSED_CHANNEL_ID,
+                    "CN CALL missed calls",
+                    NotificationManager.IMPORTANCE_DEFAULT,
+                ),
+            )
+        }
+    }
+
     private fun notificationId(callId: String): Int = callId.hashCode()
+
+    private fun missedNotificationId(callId: String): Int =
+        100000 + (callId.hashCode() and 0x7fffffff)
 
     private fun actionIntent(context: Context, action: String, callId: String): PendingIntent {
         val intent = Intent(context, CNCallActionReceiver::class.java)
