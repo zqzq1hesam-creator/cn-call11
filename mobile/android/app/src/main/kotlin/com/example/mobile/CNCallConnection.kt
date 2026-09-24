@@ -66,6 +66,36 @@ class CNCallConnection(
             }
         }
 
+        override fun onRemoteCallStatus(reason: String) {
+            if (terminal || incoming) return
+
+            stopOutgoingRingback()
+            val phrase = when (reason) {
+                "offline" ->
+                    "المستخدم غير متصل"
+                "busy" ->
+                    "المستخدم مشغول"
+                "user_not_found" ->
+                    "المستخدم غير موجود، تأكد من كتابة الرقم بشكل صحيح"
+                else -> return
+            }
+
+            println(
+                "[CN CALL][TELECOM] announcing remote status " +
+                    "call_id=$callId reason=$reason",
+            )
+
+            CNCallStatusSpeaker.speak(
+                appContext,
+                callId,
+                phrase,
+            ) {
+                if (!terminal) {
+                    fail(DisconnectCause.REMOTE)
+                }
+            }
+        }
+
         override fun onError(message: String) {
             if (!terminal) {
                 println("[CN CALL][TELECOM] engine error call_id=$callId message=$message")
