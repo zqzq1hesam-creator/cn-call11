@@ -1182,7 +1182,13 @@ object CNCallEngine {
                 }
 
                 "missed_call" -> {
-                    val context = appContext ?: return@handleSignalingFrame
+                    val context = appContext ?: run {
+                        println(
+                            "[CN CALL][ENGINE] missed_call skipped: missing app context" +
+                                " call_id=$frameCallId",
+                        )
+                        return
+                    }
                     val callerId = payload["caller_id"]
                         ?.trim()
                         ?.ifEmpty { payload["from_id"]?.trim().orEmpty() }
