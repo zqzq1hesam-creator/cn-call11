@@ -98,6 +98,29 @@ class CallFirebaseService : FirebaseMessagingService() {
             return
         }
 
+        if (type == "missed_call") {
+            val callId = message.data["call_id"]?.trim().orEmpty()
+            if (callId.isEmpty()) return
+
+            val callerName =
+                message.data["caller_name"]
+                    ?.trim()
+                    .takeUnless { it.isNullOrEmpty() }
+                    ?: "مستخدم CN CALL"
+
+            CNCallNotification.showMissed(
+                this,
+                callId,
+                callerName,
+            )
+
+            println(
+                "[CN CALL][FCM] missed_call handled " +
+                    "call_id=$callId caller=$callerName",
+            )
+            return
+        }
+
         if (type != "incoming_call") {
             return
         }
