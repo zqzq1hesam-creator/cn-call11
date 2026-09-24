@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Native pre-call status announcer.
@@ -113,21 +114,24 @@ object CNCallStatusSpeaker {
         )
 
         val utteranceId = "cn-call-status-${request.callId}-${System.nanoTime()}"
+        val completed = AtomicBoolean(false)
+
+        fun completeOnce() {
+            if (completed.compareAndSet(false, true)) {
+                request.onComplete()
+            }
+        }
 
         engine.setOnUtteranceProgressListener(
             object : UtteranceProgressListener() {
-                private fun finish() {
-                    request.onComplete()
-                }
-
                 override fun onStart(utteranceId: String?) = Unit
 
                 override fun onDone(utteranceId: String?) {
-                    finish()
+                    completeOnce()
                 }
 
                 override fun onError(utteranceId: String?) {
-                    finish()
+                    completeOnce()
                 }
             },
         )
@@ -146,7 +150,7 @@ object CNCallStatusSpeaker {
                 utteranceId,
             ) == TextToSpeech.ERROR
         ) {
-            request.onComplete()
+            completeOnce()
         }
     }
 }
