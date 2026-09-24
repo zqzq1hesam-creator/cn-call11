@@ -3,6 +3,8 @@ package com.example.mobile
 import android.content.Context
 import android.media.AudioManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import java.util.Locale
@@ -117,7 +119,8 @@ object CNCallStatusSpeaker {
         val completed = AtomicBoolean(false)
 
         fun completeOnce() {
-            if (completed.compareAndSet(false, true)) {
+            if (!completed.compareAndSet(false, true)) return
+            Handler(Looper.getMainLooper()).post {
                 request.onComplete()
             }
         }
