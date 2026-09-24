@@ -70,25 +70,22 @@ class CNCallConnection(
             if (terminal || incoming) return
 
             stopOutgoingRingback()
-            val phrase = when (reason) {
-                "offline" ->
-                    "المستخدم غير متصل"
-                "busy" ->
-                    "المستخدم مشغول"
-                "user_not_found" ->
-                    "المستخدم غير موجود، تأكد من كتابة الرقم بشكل صحيح"
+            val assetFileName = when (reason) {
+                "offline" -> "offline.mp3"
+                "busy" -> "busy.mp3"
+                "user_not_found" -> "user_not_found.mp3"
                 else -> return
             }
 
             println(
                 "[CN CALL][TELECOM] announcing remote status " +
-                    "call_id=$callId reason=$reason",
+                    "call_id=$callId reason=$reason asset=$assetFileName",
             )
 
             CNCallStatusSpeaker.speak(
                 appContext,
                 callId,
-                phrase,
+                assetFileName,
             ) {
                 if (!terminal) {
                     fail(DisconnectCause.REMOTE)
