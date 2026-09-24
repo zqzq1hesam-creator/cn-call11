@@ -127,7 +127,9 @@ object CNCallStatusSpeaker {
 
         engine.setOnUtteranceProgressListener(
             object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {\n                    println("[CN CALL][STATUS TTS] onStart call_id=${request.callId}")\n                }
+                override fun onStart(utteranceId: String?) {
+                    println("[CN CALL][STATUS TTS] onStart call_id=${request.callId}")
+                }
 
                 override fun onDone(utteranceId: String?) {
                     completeOnce()
