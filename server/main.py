@@ -1,3 +1,4 @@
+# Railway deploy marker: keep runtime behavior unchanged; force GitHub source refresh.
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
