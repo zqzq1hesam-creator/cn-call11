@@ -110,7 +110,7 @@ object CNCallStatusSpeaker {
 
         engine.setAudioAttributes(
             android.media.AudioAttributes.Builder()
-                .setUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                .setUsage(android.media.AudioAttributes.USAGE_MEDIA)
                 .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build(),
         )
@@ -127,7 +127,7 @@ object CNCallStatusSpeaker {
 
         engine.setOnUtteranceProgressListener(
             object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
+                override fun onStart(utteranceId: String?) {\n                    println("[CN CALL][STATUS TTS] onStart call_id=${request.callId}")\n                }
 
                 override fun onDone(utteranceId: String?) {
                     completeOnce()
@@ -142,7 +142,7 @@ object CNCallStatusSpeaker {
         val params = Bundle().apply {
             putInt(
                 TextToSpeech.Engine.KEY_PARAM_STREAM,
-                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.STREAM_MUSIC,
             )
         }
 
