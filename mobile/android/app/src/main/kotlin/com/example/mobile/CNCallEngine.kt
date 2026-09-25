@@ -694,7 +694,11 @@ object CNCallEngine {
             // automatically.
             if (released) {
                 stopCallAudioService(callId)
-                releaseNativeOwnershipIfOwned()
+                // The native WebSocket is a login/session transport, not a
+                // per-call resource. Keep it alive after a call ends so the
+                // account remains online and can receive the next call
+                // immediately. Ownership is released only by explicit logout
+                // or session invalidation.
                 // Phase 2.3 (E1): call finished; no queued frame may be flushed.
                 NativeWebSocketClient.clearPendingFrames()
             }
@@ -736,7 +740,10 @@ object CNCallEngine {
                 outgoingTargetId = null
             }
             stopCallAudioService(endedCallId)
-            releaseNativeOwnershipIfOwned()
+            // Keep the authenticated native signaling session alive across
+            // calls. A call ending must not make this user appear offline to
+            // the server; explicit logout/session invalidation owns the socket
+            // shutdown.
             // Phase 2.3 (E1): hard end; no queued frame may be flushed after
             // the call is over.
             NativeWebSocketClient.clearPendingFrames()
