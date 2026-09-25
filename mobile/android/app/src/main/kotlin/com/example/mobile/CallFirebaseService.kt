@@ -137,6 +137,19 @@ class CallFirebaseService : FirebaseMessagingService() {
             return
         }
 
+        // Never let a logged-out app present an incoming Telecom call from a
+        // stale FCM message. Native credentials are the authoritative local
+        // session marker for this background path.
+        val nativeUserId = NativeCallTokenHelper.restoreUserId(this)
+        val nativeAccessToken = NativeCallTokenHelper.restoreAccessToken(this)
+        if (nativeUserId.isNullOrBlank() || nativeAccessToken.isNullOrBlank()) {
+            println(
+                "[CN CALL][FCM] ignored incoming_call: no authenticated session" +
+                    " call_id=" + (message.data["call_id"] ?: ""),
+            )
+            return
+        }
+
         val callerName =
             message.data["caller_name"]
                 ?: "CN CALL"
