@@ -147,44 +147,6 @@ async def _send_ws_with_current_socket(
                 )
 
     return True
-
-
-async def _close_terminal_sockets(
-    user_ids: set[str],
-    reason: str,
-) -> None:
-    """Close current server-side sockets after an explicit call terminal action.
-
-    Terminal signaling is delivered first; only then are the current sockets
-    closed. This change is server-side only.
-    """
-    for raw_user_id in user_ids:
-        terminal_user_id = str(raw_user_id)
-        terminal_socket = connections.get(terminal_user_id)
-        if terminal_socket is None:
-            continue
-
-        try:
-            await terminal_socket.close(code=1000, reason=reason)
-            print(
-                "[CN CALL][WS TERMINAL CLOSE]",
-                "user=", terminal_user_id,
-                "reason=", reason,
-            )
-        except Exception as exc:
-            print(
-                "[CN CALL][WS TERMINAL CLOSE FAILED]",
-                "user=", terminal_user_id,
-                "reason=", reason,
-                "error=", exc,
-            )
-        finally:
-            # Never remove a replacement socket that took over while close()
-            # yielded control.
-            if connections.get(terminal_user_id) is terminal_socket:
-                connections.pop(terminal_user_id, None)
-
-
 active_calls: dict[str, dict[str, object]] = {}
 active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
@@ -2840,14 +2802,6 @@ async def websocket_endpoint(
 
                 for event_id in event_ids:
                     await _deliver_terminal_event(event_id)
-
-                # Close both currently registered server-side sockets only
-                # after terminal signaling has been delivered.
-                if message_type in {"call_cancelled", "call_reject", "hangup"}:
-                    await _close_terminal_sockets(
-                        {user_id, expected_target},
-                        f"call_{message_type}",
-                    )
 
             elif message_type == "call_accept":
                 # Design C: call_accept and its credentials were already forwarded
