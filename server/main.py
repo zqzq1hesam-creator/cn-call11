@@ -534,6 +534,25 @@ async def _deliver_terminal_event(event_id: str) -> bool:
             "event_id": str(row["event_id"]),
         }
 
+        # Offline-after-grace is represented by a durable terminal
+        # call_reject event plus a missed call record. Preserve the reason in
+        # the delivered frame so Android can select offline.mp3.
+        if str(row["event_type"]) == "call_reject":
+            status_row = get_db().execute(
+                "SELECT status FROM call_records WHERE call_id = ?",
+                (str(row["call_id"]),),
+            ).fetchone()
+            status_db = get_db()
+        else:
+            status_row = None
+            status_db = None
+
+        if status_db is not None:
+            status_db.close()
+
+        if status_row is not None and str(status_row["status"]) == "missed":
+            payload["reason"] = "offline"
+
         try:
             await target_socket.send_json(payload)
             print(
