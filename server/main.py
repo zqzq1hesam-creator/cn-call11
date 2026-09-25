@@ -784,7 +784,7 @@ async def expire_active_calls():
         if status == "ringing":
             target_id = str(record["target_id"])
             if (
-                target_id not in connections
+                not record.get("delivery_confirmed", False)
                 and int(record["created_at"]) + OFFLINE_DELIVERY_CONFIRM_TIMEOUT_MS <= now
             ):
                 expired_ids.add(call_id)
@@ -1028,7 +1028,8 @@ def init_db():
             negotiation_expires_at INTEGER,
             connection_expires_at INTEGER,
             media_ready_users TEXT NOT NULL DEFAULT '[]',
-            state_version INTEGER NOT NULL DEFAULT 1
+            state_version INTEGER NOT NULL DEFAULT 1,
+            delivery_confirmed INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -1074,6 +1075,7 @@ def init_db():
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS reason TEXT",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
@@ -1094,6 +1096,10 @@ def init_db():
             pass
         try:
             db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN delivery_confirmed INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
         try:
@@ -1126,7 +1132,8 @@ def rebuild_active_calls_from_db():
             """
             SELECT call_id, caller_id, target_id, caller_name, created_at,
                    expires_at, status, negotiation_expires_at,
-                   connection_expires_at, media_ready_users, state_version
+                   connection_expires_at, media_ready_users,
+                   state_version, delivery_confirmed
             FROM call_records
             WHERE status IN ('ringing', 'accepted', 'negotiating', 'connected')
             """
@@ -1257,6 +1264,7 @@ def rebuild_active_calls_from_db():
                 "media_ready_users": _ready_users_from_json(
                     row["media_ready_users"]
                 ),
+                "delivery_confirmed": bool(row["delivery_confirmed"]),
                 "state_version": current_version,
             })
             restored += 1
@@ -2325,6 +2333,7 @@ async def websocket_endpoint(
                         "caller_token": token,
                         "target_token": user_access_tokens.get(target_id),
                         "media_ready_users": set(),
+                        "delivery_confirmed": False,
                         "state_version": 1,
                     }
                     _mark_active_user(user_id, call_id, "caller")
@@ -2420,6 +2429,7 @@ async def websocket_endpoint(
                     "caller_token": token,
                     "target_token": user_access_tokens.get(target_id),
                     "media_ready_users": set(),
+                    "delivery_confirmed": False,
                     "state_version": 1,
                 }
                 _mark_active_user(user_id, call_id, "caller")
@@ -2543,10 +2553,26 @@ async def websocket_endpoint(
             terminal = False
             if message_type == "call_delivered":
                 # Target confirms that Android Telecom accepted the incoming
-                # call presentation. Keep the call ringing and forward the
-                # delivery ACK to the caller.
+                # call presentation. Persist that confirmation so a stale
+                # WebSocket entry cannot keep the caller waiting indefinitely.
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "ringing"
+                if allowed:
+                    record["delivery_confirmed"] = True
+                    delivery_db = get_db()
+                    try:
+                        delivery_db.execute(
+                            """
+                            UPDATE call_records
+                            SET delivery_confirmed = 1
+                            WHERE call_id = ?
+                              AND status = 'ringing'
+                            """,
+                            (call_id,),
+                        )
+                        delivery_db.commit()
+                    finally:
+                        delivery_db.close()
             elif message_type == "call_accept":
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "accepted"
