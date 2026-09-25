@@ -2128,64 +2128,11 @@ async def websocket_endpoint(
                     )
                     continue
 
+                # Do not convert a temporarily missing callee socket into an
+                # immediate offline/missed call. The FCM path can wake a killed
+                # or reconnecting app, and the active ringing call is replayed
+                # by reconcile_user_calls_on_connect() when its WebSocket returns.
                 target_socket = connections.get(target_id)
-
-                # A registered but offline target is recorded immediately as a
-                # missed call. The caller receives an immediate offline status
-                # instead of a 90-second ringing period.
-                if target_socket is None:
-                    created_at = int(time.time() * 1000)
-                    db = get_db()
-                    db.execute(
-                        """
-                        INSERT INTO call_records
-                        (call_id, caller_id, target_id, caller_name,
-                         created_at, expires_at, status, media_ready_users,
-                         state_version)
-                        VALUES (?, ?, ?, ?, ?, ?, 'missed', '[]', 1)
-                        """,
-                        (
-                            call_id,
-                            user_id,
-                            target_id,
-                            str(message.get("caller_name", "مستخدم CN CALL")),
-                            created_at,
-                            created_at,
-                        ),
-                    )
-                    db.commit()
-                    db.close()
-
-                    await websocket.send_json({
-                        "type": "call_started",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "from_id": user_id,
-                        "ring_expires_at": created_at,
-                        "target_online": False,
-                    })
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "offline",
-                    })
-
-                    fcm_sent = send_call_notification(
-                        target_id=target_id,
-                        caller_id=user_id,
-                        caller_name=str(
-                            message.get("caller_name", "مستخدم CN CALL")
-                        ),
-                        call_id=call_id,
-                        message_type="missed_call",
-                    )
-                    print(
-                        "[CN CALL][CALL OFFLINE] "
-                        f"call_id={call_id} from={user_id} target={target_id} "
-                        f"missed_fcm={'SENT' if fcm_sent else 'FAILED'}"
-                    )
-                    continue
 
                 ring_expires_at = message.get("ring_expires_at")
                 if not ring_expires_at:
@@ -2232,7 +2179,7 @@ async def websocket_endpoint(
                 _mark_active_user(user_id, call_id, "caller")
                 _mark_active_user(target_id, call_id, "callee")
 
-                target_online = True
+                target_online = target_socket is not None
 
                 await websocket.send_json({
                     "type": "call_started",
@@ -2269,28 +2216,9 @@ async def websocket_endpoint(
                         )
 
                 if not delivered:
-                    # A socket entry that cannot accept the invite is treated
-                    # as offline. Do not leave the caller ringing against a
-                    # dead/stale socket; persist the attempt as missed and use
-                    # the same offline voice + long-TTL missed notification.
-                    print(
-                        "[CN CALL][CALL INITIAL WS FAILED -> OFFLINE] "
-                        f"call_id={call_id} target={target_id}"
-                    )
-
-                    finalize_call_terminal(
-                        call_id,
-                        "missed",
-                        [],
-                    )
-
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "offline",
-                    })
-
+                    # Keep the call in the active 90-second ringing state and
+                    # use FCM as the wake-up/delivery path. A later WebSocket
+                    # reconnect will replay the active ringing call.
                     fcm_sent = send_call_notification(
                         target_id=target_id,
                         caller_id=user_id,
@@ -2298,12 +2226,13 @@ async def websocket_endpoint(
                             message.get("caller_name", "مستخدم CN CALL")
                         ),
                         call_id=call_id,
-                        message_type="missed_call",
+                        message_type="incoming_call",
                     )
                     print(
-                        "[CN CALL][CALL INITIAL MISSED FCM "
+                        "[CN CALL][CALL INITIAL FCM FALLBACK "
                         f"{'SENT' if fcm_sent else 'FAILED'}] "
-                        f"call_id={call_id} target={target_id}"
+                        f"call_id={call_id} target={target_id} "
+                        f"socket_present={target_socket is not None}"
                     )
                 continue
 
