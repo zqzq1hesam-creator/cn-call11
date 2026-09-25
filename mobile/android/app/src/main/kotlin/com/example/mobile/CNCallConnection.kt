@@ -67,30 +67,7 @@ class CNCallConnection(
         }
 
         override fun onRemoteCallStatus(reason: String) {
-            if (terminal || incoming) return
-
-            stopOutgoingRingback()
-            val assetFileName = when (reason) {
-                "offline" -> "offline.mp3"
-                "busy" -> "busy.mp3"
-                "user_not_found" -> "user_not_found.mp3"
-                else -> return
-            }
-
-            println(
-                "[CN CALL][TELECOM] announcing remote status " +
-                    "call_id=$callId reason=$reason asset=$assetFileName",
-            )
-
-            CNCallStatusSpeaker.speak(
-                appContext,
-                callId,
-                assetFileName,
-            ) {
-                if (!terminal) {
-                    fail(DisconnectCause.REMOTE)
-                }
-            }
+            announceRemoteStatus(reason)
         }
 
         override fun onError(message: String) {
@@ -123,6 +100,35 @@ class CNCallConnection(
         if (!terminal) {
             setDialing()
         }
+    }
+
+    fun announceRemoteStatus(reason: String): Boolean {
+        if (terminal || incoming) return false
+
+        val assetFileName = when (reason.trim()) {
+            "offline" -> "offline.mp3"
+            "busy" -> "busy.mp3"
+            "user_not_found" -> "user_not_found.mp3"
+            else -> return false
+        }
+
+        stopOutgoingRingback()
+
+        println(
+            "[CN CALL][TELECOM] announcing remote status " +
+                "call_id=$callId reason=$reason asset=$assetFileName",
+        )
+
+        CNCallStatusSpeaker.speak(
+            appContext,
+            callId,
+            assetFileName,
+        ) {
+            if (!terminal) {
+                fail(DisconnectCause.REMOTE)
+            }
+        }
+        return true
     }
 
     fun announceLocalStatus(assetFileName: String) {
@@ -161,7 +167,7 @@ class CNCallConnection(
         try {
             player.setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build(),
             )
