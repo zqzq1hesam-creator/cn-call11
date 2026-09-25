@@ -66,6 +66,44 @@ else:
 
 
 connections: dict[str, WebSocket] = {}
+
+async def _send_ws_with_current_socket(
+    user_id: str,
+    payload: dict,
+    label: str,
+) -> bool:
+    first_socket = connections.get(str(user_id))
+    if first_socket is None:
+        return False
+
+    try:
+        await first_socket.send_json(payload)
+        return True
+    except Exception as first_exc:
+        current_socket = connections.get(str(user_id))
+        if current_socket is not None and current_socket is not first_socket:
+            try:
+                await current_socket.send_json(payload)
+                print(
+                    "[CN CALL][WS REPLACEMENT RETRY SENT]",
+                    label,
+                    "user=", user_id,
+                )
+                return True
+            except Exception as retry_exc:
+                print(
+                    "[CN CALL][WS REPLACEMENT RETRY FAILED]",
+                    label,
+                    "user=", user_id,
+                    "error=", retry_exc,
+                )
+        print(
+            "[CN CALL][WS SEND FAILED]",
+            label,
+            "user=", user_id,
+            "error=", first_exc,
+        )
+        return False
 active_calls: dict[str, dict[str, object]] = {}
 active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
@@ -527,8 +565,12 @@ async def _deliver_terminal_event(event_id: str) -> bool:
             "event_id": str(row["event_id"]),
         }
 
-        try:
-            await target_socket.send_json(payload)
+        sent = await _send_ws_with_current_socket(
+            target_id,
+            payload,
+            "durable_terminal",
+        )
+        if sent:
             print(
                 "[CN CALL][DURABLE TERMINAL WS SENT]",
                 row["event_type"],
@@ -536,14 +578,14 @@ async def _deliver_terminal_event(event_id: str) -> bool:
                 "event_id=", event_id,
             )
             return True
-        except Exception as exc:
-            print(
-                "[CN CALL][DURABLE TERMINAL WS ERROR]",
-                "call_id=", row["call_id"],
-                "event_id=", event_id,
-                "error=", exc,
-            )
-            return False
+
+        print(
+            "[CN CALL][DURABLE TERMINAL WS ERROR]",
+            "call_id=", row["call_id"],
+            "event_id=", event_id,
+            "error=socket_send_failed",
+        )
+        return False
 
     # No live signaling socket: use the single FCM attempt instead.
     return send_call_notification(
@@ -2249,22 +2291,25 @@ async def websocket_endpoint(
                 )
                 delivered = False
                 if target_socket is not None:
-                    try:
-                        await target_socket.send_json({
+                    delivered = await _send_ws_with_current_socket(
+                        target_id,
+                        {
                             **message,
                             "call_id": call_id,
                             "ring_expires_at": ring_expires_at,
                             "from_id": user_id,
-                        })
-                        delivered = True
+                        },
+                        "initial_call",
+                    )
+                    if delivered:
                         print(
                             "[CN CALL][CALL INITIAL WS SENT] "
                             f"call_id={call_id} target={target_id}"
                         )
-                    except Exception as exc:
+                    else:
                         print(
                             "[CN CALL][CALL INITIAL WS FAILED] "
-                            f"call_id={call_id} target={target_id} error={exc}"
+                            f"call_id={call_id} target={target_id}"
                         )
 
                 if not delivered:
@@ -2363,7 +2408,13 @@ async def websocket_endpoint(
                 next_status = "rejected"
                 terminal = True
             elif message_type == "call_cancelled":
-                allowed = sender_role == "caller" and status == "ringing"
+                # The caller may cancel during the tiny acceptance race:
+                # the callee can already have moved the DB state to accepted
+                # before the caller receives call_accept. Treat caller
+                # cancellation as terminal across all pre-media states.
+                allowed = sender_role == "caller" and status in {
+                    "ringing", "accepted", "negotiating"
+                }
                 next_status = "cancelled"
                 terminal = True
             elif message_type == "hangup":
@@ -2426,16 +2477,20 @@ async def websocket_endpoint(
                         "room": callee_creds["room"],
                     })
 
-                try:
-                    await websocket.send_json(callee_ack_payload)
+                ack_sent = await _send_ws_with_current_socket(
+                    user_id,
+                    callee_ack_payload,
+                    "call_accept_ack",
+                )
+                if ack_sent:
                     print(
                         "[CN CALL][CALL_ACCEPT ACK SENT] "
                         f"call_id={call_id} target={user_id} embedded_creds={callee_creds is not None}"
                     )
-                except Exception as exc:
+                else:
                     print(
                         "[CN CALL][CALL_ACCEPT ACK FAILED] "
-                        f"call_id={call_id} target={user_id} error={exc}"
+                        f"call_id={call_id} target={user_id}"
                     )
 
                 # 2. Forward call_accept to caller (caller_id) with caller's token
@@ -2453,16 +2508,20 @@ async def websocket_endpoint(
                             "livekit_token": caller_creds["token"],
                             "room": caller_creds["room"],
                         })
-                    try:
-                        await caller_socket.send_json(caller_accept_payload)
+                    forward_sent = await _send_ws_with_current_socket(
+                        caller_id,
+                        caller_accept_payload,
+                        "call_accept",
+                    )
+                    if forward_sent:
                         print(
                             "[CN CALL][CALL_ACCEPT FORWARDED TO CALLER] "
                             f"call_id={call_id} caller={caller_id} embedded_creds={caller_creds is not None}"
                         )
-                    except Exception as exc:
+                    else:
                         print(
                             "[CN CALL][CALL_ACCEPT FORWARD FAILED] "
-                            f"call_id={call_id} caller={caller_id} error={exc}"
+                            f"call_id={call_id} caller={caller_id}"
                         )
             elif message_type in {"offer", "answer"}:
                 transition_call_state(
