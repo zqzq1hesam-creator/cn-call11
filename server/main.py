@@ -1725,6 +1725,7 @@ def send_call_notification(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    reason: str | None = None,
 ) -> bool:
     token = FCM_TOKENS.get(target_id)
 
@@ -1769,6 +1770,11 @@ def send_call_notification(
                 **(
                     {"event_id": event_id}
                     if event_id
+                    else {}
+                ),
+                **(
+                    {"reason": reason}
+                    if reason
                     else {}
                 ),
             },
@@ -2068,6 +2074,33 @@ async def websocket_endpoint(
                 if not call_id:
                     call_id = str(uuid.uuid4())
 
+                async def send_local_reject(reason: str) -> None:
+                    payload = {
+                        "type": "call_reject",
+                        "call_id": call_id,
+                        "target_id": target_id or user_id,
+                        "reason": reason,
+                    }
+                    sent = await _send_ws_with_current_socket(
+                        user_id,
+                        payload,
+                        "local_reject",
+                    )
+                    if not sent:
+                        fcm_sent = send_call_notification(
+                            target_id=user_id,
+                            caller_id=user_id,
+                            caller_name="مستخدم CN CALL",
+                            call_id=call_id,
+                            message_type="call_reject",
+                            reason=reason,
+                        )
+                        print(
+                            "[CN CALL][LOCAL REJECT FCM "
+                            f"{'SENT' if fcm_sent else 'FAILED'}] "
+                            f"call_id={call_id} user={user_id} reason={reason}"
+                        )
+
                 if not target_id or target_id == user_id:
                     await websocket.send_json({
                         "type": "call_reject",
@@ -2093,12 +2126,7 @@ async def websocket_endpoint(
                 db.close()
 
                 if target_user is None:
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "user_not_found",
-                    })
+                    await send_local_reject("user_not_found")
                     print(
                         "[CN CALL][CALL REJECTED] "
                         f"call_id={call_id} from={user_id} target={target_id} reason=user_not_found"
@@ -2106,12 +2134,7 @@ async def websocket_endpoint(
                     continue
 
                 if existing is not None:
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": user_id,
-                        "reason": "duplicate_or_busy",
-                    })
+                    await send_local_reject("busy")
                     print(
                         "[CN CALL][CALL REJECTED] "
                         f"call_id={call_id} from={user_id} target={target_id} reason=duplicate_or_busy existing_call_id={active_call_users.get(target_id) if target_id in active_call_users else 'none'}"
@@ -2166,12 +2189,7 @@ async def websocket_endpoint(
                         for event_id in event_ids:
                             await _deliver_terminal_event(event_id)
                     else:
-                        await websocket.send_json({
-                            "type": "call_reject",
-                            "call_id": call_id,
-                            "target_id": target_id,
-                            "reason": "busy",
-                        })
+                        await send_local_reject("busy")
                         print(
                             "[CN CALL][CALL REJECTED] "
                             f"call_id={call_id} from={user_id} target={target_id} reason=busy"
@@ -2179,12 +2197,7 @@ async def websocket_endpoint(
                         continue
 
                 if user_id in active_call_users:
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "busy",
-                    })
+                    await send_local_reject("busy")
                     print(
                         "[CN CALL][CALL REJECTED] "
                         f"call_id={call_id} from={user_id} target={target_id} reason=busy"
@@ -2392,12 +2405,7 @@ async def websocket_endpoint(
                         [],
                     )
 
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "offline",
-                    })
+                    await send_local_reject("offline")
 
                     fcm_sent = send_call_notification(
                         target_id=target_id,
