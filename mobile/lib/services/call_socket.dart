@@ -10,6 +10,7 @@ class CallSocket {
   String? _userId;
   String? _token;
   Timer? _reconnectTimer;
+  Timer? _presenceTimer;
   bool _connecting = false;
   Completer<void>? _readyCompleter;
   bool _reconnectEnabled = true;
@@ -106,6 +107,7 @@ class CallSocket {
       _ready = true;
       _connecting = false;
       _reconnectAttempt = 0;
+      _startPresenceHeartbeat();
       _readyCompleter?.complete();
       _readyCompleter = null;
 
@@ -140,6 +142,8 @@ class CallSocket {
           print('SOCKET CLOSED');
 
           if (identical(_channel, channel)) {
+            _presenceTimer?.cancel();
+            _presenceTimer = null;
             _channel = null;
             _ready = false;
             if (_reconnectEnabled) unawaited(_scheduleReconnect());
@@ -149,6 +153,8 @@ class CallSocket {
           print('SOCKET ERROR: $error');
 
           if (identical(_channel, channel)) {
+            _presenceTimer?.cancel();
+            _presenceTimer = null;
             _channel = null;
             _ready = false;
             if (_reconnectEnabled) unawaited(_scheduleReconnect());
@@ -242,6 +248,22 @@ class CallSocket {
     channel.sink.add(jsonEncode(data));
   }
 
+  static const Duration _presenceHeartbeatInterval = Duration(seconds: 3);
+
+  void _startPresenceHeartbeat() {
+    _presenceTimer?.cancel();
+    _presenceTimer = Timer.periodic(_presenceHeartbeatInterval, (_) {
+      final channel = _channel;
+      if (channel == null || !_ready) return;
+
+      try {
+        channel.sink.add(jsonEncode({'type': 'heartbeat'}));
+      } catch (e) {
+        print('SOCKET HEARTBEAT FAILED: $e');
+      }
+    });
+  }
+
   /// Non-critical callers may deliberately use best-effort signalling.
   void send(Map<String, dynamic> data) {
     sendGuaranteed(data).catchError((Object error) {
@@ -250,6 +272,8 @@ class CallSocket {
   }
 
   void disconnect() {
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _connectionGeneration++;
     _connecting = false;
     _readyCompleter?.complete();
@@ -270,6 +294,8 @@ class CallSocket {
   /// connect() can re-establish Flutter ownership once the marker is freed
   /// (at native call teardown) without requiring a full re-login.
   void _disableReconnect() {
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _connectionGeneration++;
     _connecting = false;
     _readyCompleter?.complete();
@@ -285,6 +311,8 @@ class CallSocket {
   }
 
   Future<void> dispose() async {
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _connectionGeneration++;
     _connecting = false;
     _reconnectEnabled = false;
@@ -299,6 +327,8 @@ class CallSocket {
   }
 
   void _handleSessionInvalid() {
+    _presenceTimer?.cancel();
+    _presenceTimer = null;
     _connectionGeneration++;
     _reconnectEnabled = false;
     _reconnectScheduling = false;

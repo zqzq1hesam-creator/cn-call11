@@ -66,6 +66,27 @@ else:
 
 
 connections: dict[str, WebSocket] = {}
+presence_last_seen: dict[str, int] = {}
+
+# Client heartbeats are the normal online-presence signal. A socket that goes
+# silent is considered stale only after this grace period.
+PRESENCE_STALE_TIMEOUT_MS = 9000
+# FCM can cold-start a device that has no existing socket. That path keeps a
+# separate bounded delivery-confirmation fallback.
+FCM_DELIVERY_FALLBACK_TIMEOUT_MS = 10000
+
+
+def _touch_presence(user_id: str) -> None:
+    presence_last_seen[str(user_id)] = int(time.time() * 1000)
+
+
+def _has_recent_presence(user_id: str, now: int | None = None) -> bool:
+    last_seen = presence_last_seen.get(str(user_id))
+    if last_seen is None:
+        return False
+    current = int(time.time() * 1000) if now is None else int(now)
+    return current - int(last_seen) <= PRESENCE_STALE_TIMEOUT_MS
+
 
 async def _send_ws_with_current_socket(
     user_id: str,
@@ -142,12 +163,6 @@ call_expiry_task: asyncio.Task | None = None
 # gone, the call is released after this window and both users are freed.
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
-
-# A missing WebSocket does not prove the target is offline because the FCM
-# cold-start path can still deliver the incoming call. Give the target a short
-# window to establish signaling and emit call_delivered before classifying the
-# call as offline.
-OFFLINE_DELIVERY_CONFIRM_TIMEOUT_MS = 20000
 
 _UNSET = object()
 
@@ -783,13 +798,24 @@ async def expire_active_calls():
 
         if status == "ringing":
             target_id = str(record["target_id"])
-            if (
-                not record.get("delivery_confirmed", False)
-                and int(record["created_at"]) + OFFLINE_DELIVERY_CONFIRM_TIMEOUT_MS <= now
-            ):
-                expired_ids.add(call_id)
-                offline_ringing_ids.add(call_id)
-                continue
+            if not record.get("delivery_confirmed", False):
+                target_was_online = bool(record.get("target_online_at_call", False))
+                if target_was_online:
+                    # The target had live presence when the call started.
+                    # Heartbeat loss is the offline detector; no fixed 20s wait.
+                    offline = not _has_recent_presence(target_id, now)
+                else:
+                    # This may be the FCM cold-start path, so give call_delivered
+                    # a bounded fallback.
+                    offline = (
+                        int(record["created_at"])
+                        + FCM_DELIVERY_FALLBACK_TIMEOUT_MS
+                        <= now
+                    )
+                if offline:
+                    expired_ids.add(call_id)
+                    offline_ringing_ids.add(call_id)
+                    continue
             if int(record["ring_expires_at"]) <= now:
                 expired_ids.add(call_id)
             continue
@@ -2041,6 +2067,7 @@ async def websocket_endpoint(
     await websocket.accept()
 
     connections[user_id] = websocket
+    _touch_presence(user_id)
     print("[CN CALL][SOCKET READY] user_id=", user_id)
 
     # Reconcile active calls on WebSocket reconnect
@@ -2144,6 +2171,13 @@ async def websocket_endpoint(
             message_type = str(message.get("type", "")).strip()
             call_id = str(message.get("call_id", "")).strip()
             target_id = str(message.get("target_id", "")).strip()
+
+            # Every received frame proves the signaling path is alive.
+            # Heartbeats keep that proof alive while the app is otherwise idle.
+            _touch_presence(user_id)
+            if message_type == "heartbeat":
+                continue
+
             print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id, "target=", target_id)
 
             await expire_active_calls()
@@ -2334,6 +2368,7 @@ async def websocket_endpoint(
                         "target_token": user_access_tokens.get(target_id),
                         "media_ready_users": set(),
                         "delivery_confirmed": False,
+                        "target_online_at_call": _has_recent_presence(target_id),
                         "state_version": 1,
                     }
                     _mark_active_user(user_id, call_id, "caller")
@@ -2430,6 +2465,9 @@ async def websocket_endpoint(
                     "target_token": user_access_tokens.get(target_id),
                     "media_ready_users": set(),
                     "delivery_confirmed": False,
+                    "target_online_at_call": (
+                        target_socket is not None and _has_recent_presence(target_id)
+                    ),
                     "state_version": 1,
                 }
                 _mark_active_user(user_id, call_id, "caller")
@@ -2781,6 +2819,10 @@ async def websocket_endpoint(
     finally:
         if connections.get(user_id) is websocket:
             del connections[user_id]
+            # Retain the last heartbeat briefly after disconnect so a caller can
+            # distinguish a just-lost connection from a long-offline user.
+            # A later connection overwrites this timestamp immediately.
+            print("[CN CALL][PRESENCE LAST SEEN RETAINED] user_id=", user_id)
             # A network reconnect is not a call hangup.  Keep ownership and
             # let the call's explicit terminal signal or its expiry timer end
             # it; the next socket for this logical user can safely resume.

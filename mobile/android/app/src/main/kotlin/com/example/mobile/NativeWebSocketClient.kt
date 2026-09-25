@@ -68,6 +68,7 @@ object NativeWebSocketClient {
     private const val RECONNECT_DELAY_MAX_SHIFT = 5
     private const val CLOSE_NORMAL = 1000
     private const val CLOSE_SESSION_INVALID = 1008
+    private const val PRESENCE_HEARTBEAT_INTERVAL_SECONDS = 3L
 
     // Phase 2: shared signaling-owner marker. Same SharedPreferences file and
     // fully-qualified key that the Flutter side writes ("flutter." prefix is
@@ -100,6 +101,7 @@ object NativeWebSocketClient {
      */
     private val pendingFrames = ArrayDeque<PendingFrame>()
     @Volatile private var reconnectFuture: ScheduledFuture<*>? = null
+    @Volatile private var presenceHeartbeatFuture: ScheduledFuture<*>? = null
     @Volatile private var generation = 0
     @Volatile private var currentUserId: String? = null
     @Volatile private var currentToken: String? = null
@@ -198,6 +200,29 @@ object NativeWebSocketClient {
      * The ownership check, transport teardown, and marker removal are kept
      * together under the native-side ownership lock.
      */
+    private fun cancelPresenceHeartbeat() {
+        presenceHeartbeatFuture?.cancel(false)
+        presenceHeartbeatFuture = null
+    }
+
+    private fun startPresenceHeartbeat() {
+        cancelPresenceHeartbeat()
+        presenceHeartbeatFuture = scheduler.scheduleAtFixedRate(
+            {
+                val ws = webSocket
+                if (ws == null || !ready || !connected) return@scheduleAtFixedRate
+                try {
+                    ws.send(JSONObject().put("type", "heartbeat").toString())
+                } catch (t: Throwable) {
+                    notifyError(t)
+                }
+            },
+            PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
+            PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
+            TimeUnit.SECONDS,
+        )
+    }
+
     fun disconnectAndReleaseNativeOwnership(context: Context): Boolean {
         val prefs =
             context.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
@@ -213,6 +238,7 @@ object NativeWebSocketClient {
             generation++
             reconnectEnabled = false
             cancelPendingReconnect()
+            cancelPresenceHeartbeat()
             connecting.set(false)
 
             synchronized(this) {
@@ -270,6 +296,7 @@ object NativeWebSocketClient {
             currentToken = token
             reconnectEnabled = true
             cancelPendingReconnect()
+            cancelPresenceHeartbeat()
             closeQuietly()
         }
 
@@ -306,6 +333,7 @@ object NativeWebSocketClient {
                             ready = true
                             connected = true
                             reconnectAttempt.set(0)
+                            startPresenceHeartbeat()
                             flushPendingFrames()
                             dispatch(type, payload)
                         }
@@ -333,6 +361,7 @@ object NativeWebSocketClient {
                 connecting.set(false)
                 ready = false
                 connected = false
+                cancelPresenceHeartbeat()
                 notifyClosed(code, reason)
                 if (reconnectEnabled && code != CLOSE_SESSION_INVALID) {
                     scheduleReconnect()
@@ -345,6 +374,7 @@ object NativeWebSocketClient {
                 connecting.set(false)
                 ready = false
                 connected = false
+                cancelPresenceHeartbeat()
                 notifyError(t)
                 if (reconnectEnabled) scheduleReconnect()
             }
@@ -415,6 +445,7 @@ object NativeWebSocketClient {
         generation++
         reconnectEnabled = false
         cancelPendingReconnect()
+        cancelPresenceHeartbeat()
         connecting.set(false)
         synchronized(this) { pendingFrames.clear() }
         closeQuietly()
