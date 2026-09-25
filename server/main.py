@@ -804,9 +804,17 @@ async def expire_active_calls():
                     # The target had live presence when the call started.
                     # Heartbeat loss is the offline detector; no fixed 20s wait.
                     offline = not _has_recent_presence(target_id, now)
+                elif record.get("fcm_delivery_sent", False):
+                    # FCM accepted the incoming-call push. Telecom may already
+                    # be displaying the call while the native signaling socket
+                    # is still starting/reconnecting. Do not turn a successful
+                    # FCM delivery into an offline rejection just because the
+                    # call_delivered frame has not arrived yet. Normal ring
+                    # expiry remains the terminal fallback.
+                    offline = False
                 else:
-                    # This may be the FCM cold-start path, so give call_delivered
-                    # a bounded fallback.
+                    # No live presence and no successful FCM delivery: retain
+                    # the bounded offline fallback for this case.
                     offline = (
                         int(record["created_at"])
                         + FCM_DELIVERY_FALLBACK_TIMEOUT_MS
@@ -2368,6 +2376,7 @@ async def websocket_endpoint(
                         "target_token": user_access_tokens.get(target_id),
                         "media_ready_users": set(),
                         "delivery_confirmed": False,
+                        "fcm_delivery_sent": False,
                         "target_online_at_call": _has_recent_presence(target_id),
                         "state_version": 1,
                     }
@@ -2398,6 +2407,7 @@ async def websocket_endpoint(
                             message_type="incoming_call",
                         )
 
+                    active_calls[call_id]["fcm_delivery_sent"] = bool(fcm_sent)
                     print(
                         "[CN CALL][CALL NO SOCKET -> FCM] "
                         f"call_id={call_id} from={user_id} target={target_id} "
