@@ -1222,8 +1222,21 @@ object CNCallEngine {
                         acknowledgeTerminalEvent(terminalEventId)
                     }
 
+                    // A durable terminal event may arrive after the original
+                    // call has already ended or after a newer call has started.
+                    // It must still be ACKed, but a spoken status such as
+                    // "offline" must only affect the CURRENT native call.
+                    val isCurrentCall = synchronized(lock) {
+                        frameCallId.isNotEmpty() &&
+                            (
+                                frameCallId == scoredCallId ||
+                                    frameCallId == pendingIncomingCall?.callId
+                            )
+                    }
+
                     val reason = payload["reason"].orEmpty().trim()
                     val spokenStatus = when {
+                        !isCurrentCall -> null
                         type != "call_reject" -> null
                         reason == "offline" -> "offline"
                         reason == "busy" -> "busy"
