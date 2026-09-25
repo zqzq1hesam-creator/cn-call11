@@ -43,15 +43,27 @@ class CallFirebaseService : FirebaseMessagingService() {
                     ?.connection as? CNCallConnection
 
                 if (connection != null) {
-                    connection.terminateFromRemote(
-                        when (type) {
-                            "call_reject" -> DisconnectCause.REJECTED
-                            "call_cancelled", "hangup", "disconnected" ->
-                                DisconnectCause.REMOTE
-                            "timeout" -> DisconnectCause.CANCELED
-                            else -> DisconnectCause.REMOTE
-                        },
-                    )
+                    val remoteStatusReason = message.data["reason"]?.trim().orEmpty()
+                    val statusSpoken =
+                        type == "call_reject" &&
+                            remoteStatusReason in setOf(
+                                "offline",
+                                "busy",
+                                "user_not_found",
+                            ) &&
+                            connection.announceRemoteStatus(remoteStatusReason)
+
+                    if (!statusSpoken) {
+                        connection.terminateFromRemote(
+                            when (type) {
+                                "call_reject" -> DisconnectCause.REJECTED
+                                "call_cancelled", "hangup", "disconnected" ->
+                                    DisconnectCause.REMOTE
+                                "timeout" -> DisconnectCause.CANCELED
+                                else -> DisconnectCause.REMOTE
+                            },
+                        )
+                    }
                 }
 
                 // The tombstone is already durably committed above.  A missing
