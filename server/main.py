@@ -89,6 +89,7 @@ TERMINAL_EVENT_FCM_AFTER_MS = 30000
 # genuinely offline recipient. We wait before producing the spoken "offline"
 # status; returning online during this window cancels the offline outcome.
 OFFLINE_PRESENCE_GRACE_MS = 3000
+# Offline presence grace: allow brief native signaling reconnects before finalizing as offline.
 
 _UNSET = object()
 
