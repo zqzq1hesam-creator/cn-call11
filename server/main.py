@@ -72,6 +72,7 @@ active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
 user_access_tokens: dict[str, str] = {}
 call_expiry_task: asyncio.Task | None = None
+offline_grace_tasks: dict[str, asyncio.Task] = {}
 
 # Once the media leg is usable (status "connected") the signaling socket may
 # legitimately drop (network blip, app backgrounded) without ending the call,
@@ -83,6 +84,11 @@ call_expiry_task: asyncio.Task | None = None
 # gone, the call is released after this window and both users are freed.
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
+
+# A short presence grace distinguishes a transient WebSocket reconnect from a
+# genuinely offline recipient. We wait before producing the spoken "offline"
+# status; returning online during this window cancels the offline outcome.
+OFFLINE_PRESENCE_GRACE_MS = 8000
 
 _UNSET = object()
 
@@ -589,6 +595,60 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
 
         for row in rows:
             await _deliver_terminal_event(str(row["event_id"]))
+
+
+async def _finalize_offline_after_grace(call_id: str) -> None:
+    """After a short grace, finalize ringing as missed only if target is still offline.
+
+    A transient WebSocket gap after a previous call must not immediately produce
+    the spoken offline status. If the callee reconnects during the grace window,
+    the normal active-call reconciliation path delivers the ringing call.
+    """
+    try:
+        await asyncio.sleep(OFFLINE_PRESENCE_GRACE_MS / 1000)
+
+        record = active_calls.get(call_id)
+        if record is None or str(record.get("status")) != "ringing":
+            return
+
+        caller_id = str(record["caller_id"])
+        target_id = str(record["target_id"])
+
+        if connections.get(target_id) is not None:
+            print(
+                "[CN CALL][OFFLINE GRACE] target reconnected "
+                f"call_id={call_id} target={target_id}"
+            )
+            return
+
+        event_ids = finalize_call_terminal(
+            call_id,
+            "missed",
+            [
+                (caller_id, "call_reject", target_id),
+                (target_id, "missed_call", caller_id),
+            ],
+        )
+
+        print(
+            "[CN CALL][OFFLINE GRACE EXPIRED] "
+            f"call_id={call_id} caller={caller_id} target={target_id}"
+        )
+
+        for event_id in event_ids:
+            await _deliver_terminal_event(event_id)
+
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:
+        print(
+            "[CN CALL][OFFLINE GRACE ERROR] "
+            f"call_id={call_id} error={exc}"
+        )
+    finally:
+        task = offline_grace_tasks.get(call_id)
+        if task is asyncio.current_task():
+            offline_grace_tasks.pop(call_id, None)
 
 
 async def _terminal_outbox_loop():
@@ -2233,6 +2293,16 @@ async def websocket_endpoint(
                         f"{'SENT' if fcm_sent else 'FAILED'}] "
                         f"call_id={call_id} target={target_id} "
                         f"socket_present={target_socket is not None}"
+                    )
+
+                    # Give a reconnecting callee a short grace period. Only if
+                    # it is still absent afterwards do we generate the caller's
+                    # spoken offline status and finalize the call as missed.
+                    previous_task = offline_grace_tasks.pop(call_id, None)
+                    if previous_task is not None:
+                        previous_task.cancel()
+                    offline_grace_tasks[call_id] = asyncio.create_task(
+                        _finalize_offline_after_grace(call_id)
                     )
                 continue
 
