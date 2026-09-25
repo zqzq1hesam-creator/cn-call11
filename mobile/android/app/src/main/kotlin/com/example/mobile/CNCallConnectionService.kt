@@ -1,5 +1,7 @@
 package com.example.mobile
 
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.telecom.Connection
 import android.telecom.ConnectionRequest
@@ -153,6 +155,15 @@ class CNCallConnectionService : ConnectionService() {
 
         connection.beginDialing()
 
+        if (!hasValidatedInternet(applicationContext)) {
+            println(
+                "[CN CALL][TELECOM] outgoing refused: caller has no validated internet" +
+                    " call_id=$callId",
+            )
+            connection.announceLocalStatus("caller_offline.mp3")
+            return connection
+        }
+
         // Native signaling path only: CNCallEngine.startOutgoing acquires native
         // WS ownership first, then sends the single "call" frame over
         // NativeWebSocketClient → server → callee, and only the callee's
@@ -173,6 +184,19 @@ class CNCallConnectionService : ConnectionService() {
     }
 
     companion object {
+        private fun hasValidatedInternet(context: android.content.Context): Boolean {
+            val manager =
+                context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                    as? ConnectivityManager
+                    ?: return false
+
+            val network = manager.activeNetwork ?: return false
+            val capabilities = manager.getNetworkCapabilities(network) ?: return false
+
+            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        }
+
         const val EXTRA_CALL_ID = "com.example.mobile.extra.CALL_ID"
         const val EXTRA_CALLER_ID = "com.example.mobile.extra.CALLER_ID"
         const val EXTRA_CALLER_NAME = "com.example.mobile.extra.CALLER_NAME"
