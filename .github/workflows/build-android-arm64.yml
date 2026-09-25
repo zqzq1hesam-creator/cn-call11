@@ -52,7 +52,7 @@ jobs:
 
           echo "UNIVERSAL_APK_ZIP_OK"
           ls -lh "$APK" "$ZIP"
-          unzip -Z1 "$APK" | grep '^lib/.*\.so | sort
+          unzip -Z1 "$APK" | grep '^lib/.*\\.so$' | sort
           unzip -l "$ZIP"
 
       - name: Upload universal APK
