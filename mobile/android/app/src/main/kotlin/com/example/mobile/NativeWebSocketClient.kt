@@ -59,6 +59,10 @@ interface NativeWebSocketListener {
  * is invoked. Inactive in the current phase unless an external caller drives it.
  */
 object NativeWebSocketClient {
+    private data class PendingFrame(
+        val encoded: String,
+        val terminal: Boolean,
+    )
     private const val WS_HOST = "cn-call11-production-79ea.up.railway.app"
     private const val WS_SCHEME = "wss"
     private const val RECONNECT_DELAY_MAX_SHIFT = 5
@@ -94,7 +98,7 @@ object NativeWebSocketClient {
      * "connected" frame and cleared only on terminal teardown so the first
      * frame of a call-operation is delivered exactly once.
      */
-    private val pendingFrames = ArrayDeque<String>()
+    private val pendingFrames = ArrayDeque<PendingFrame>()
     @Volatile private var reconnectFuture: ScheduledFuture<*>? = null
     @Volatile private var generation = 0
     @Volatile private var currentUserId: String? = null
@@ -370,7 +374,14 @@ object NativeWebSocketClient {
         // Mid-handshake, either before onOpen (connecting) or between onOpen
         // and the server "connected" frame (socket present but not ready).
         if (connecting.get() || ws != null) {
-            synchronized(this) { pendingFrames.addLast(encoded) }
+            synchronized(this) {
+                pendingFrames.addLast(
+                    PendingFrame(
+                        encoded = encoded,
+                        terminal = isTerminalFrameType(type),
+                    ),
+                )
+            }
             return true
         }
         return false
@@ -385,7 +396,18 @@ object NativeWebSocketClient {
      * Frames already handed to OkHttp are unaffected; safe to call anytime.
      */
     fun clearPendingFrames() {
-        synchronized(this) { pendingFrames.clear() }
+        synchronized(this) {
+            if (pendingFrames.isEmpty()) return
+
+            // Drop stale non-terminal control frames, but keep a terminal
+            // call frame that was already queued by disconnect()/reject().
+            val terminalFrames = ArrayDeque<PendingFrame>()
+            for (frame in pendingFrames) {
+                if (frame.terminal) terminalFrames.addLast(frame)
+            }
+            pendingFrames.clear()
+            pendingFrames.addAll(terminalFrames)
+        }
     }
 
     /** Disables reconnect, drops any unsent queued frames and closes the socket for good. */
@@ -407,6 +429,10 @@ object NativeWebSocketClient {
     fun recalcBackoffMs(attempt: Int): Long {
         val shifted = attempt.coerceIn(0, RECONNECT_DELAY_MAX_SHIFT)
         return (1L shl shifted) * 1000L
+    }
+
+    private fun isTerminalFrameType(type: String): Boolean {
+        return type == "call_cancelled" || type == "call_reject" || type == "hangup"
     }
 
     // ------------------------------------------------------------
@@ -479,7 +505,7 @@ object NativeWebSocketClient {
                 // (ws.send == true). On failure leave it at the queue head so
                 // the next "connected" (after a reconnect) retries it — a
                 // failed send is never silently reported as delivered.
-                if (!ws.send(next)) return
+                if (!ws.send(next.encoded)) return
                 pendingFrames.removeFirst()
             }
         }
