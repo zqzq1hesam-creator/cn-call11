@@ -384,12 +384,7 @@ object CNCallEngine {
             }
             shutdownPending = false
             releaseNativeOwnershipIfOwned()
-            val credentialsCleared =
-                NativeCallTokenHelper.clearStoredCredentials(appCtx)
-            println(
-                "[CN CALL][ENGINE] shutdownSignaling executed" +
-                    " credentials_cleared=$credentialsCleared",
-            )
+            println("[CN CALL][ENGINE] shutdownSignaling executed")
             return true
         }
 
