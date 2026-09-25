@@ -1,156 +1,174 @@
 package com.example.mobile
 
 import android.content.Context
-import android.media.AudioManager
-import android.os.Bundle
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import java.util.Locale
+import android.media.AudioAttributes
+import android.media.MediaPlayer
+import android.os.Handler
+import android.os.Looper
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Native pre-call status announcer.
  *
- * It does not change Telecom state or manually route call audio. It asks the
- * Android TTS engine to use the voice-communication audio attributes.
+ * The status messages are fixed recordings bundled inside the APK.
+ * This avoids any dependency on Google TTS, Samsung TTS, language packs,
+ * or network access. Actual call audio remains fully controlled by
+ * Telecom/LiveKit.
  */
 object CNCallStatusSpeaker {
+    private const val TAG = "[CN CALL][STATUS AUDIO]"
+    private const val ASSET_PREFIX = "sounds/"
+
     private val lock = Any()
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     @Volatile
-    private var tts: TextToSpeech? = null
+    private var currentPlayer: MediaPlayer? = null
 
-    private var initializing = false
-    private var pending: PendingRequest? = null
-
-    private data class PendingRequest(
-        val callId: String,
-        val text: String,
-        val onComplete: () -> Unit,
-    )
-
+    /**
+     * Play one of the bundled status recordings:
+     *   offline.mp3
+     *   busy.mp3
+     *   user_not_found.mp3
+     */
     fun speak(
         context: Context,
         callId: String,
-        text: String,
+        assetFileName: String,
         onComplete: () -> Unit,
     ) {
         val id = callId.trim()
-        val phrase = text.trim()
-        if (id.isEmpty() || phrase.isEmpty()) {
+        val fileName = assetFileName.trim()
+
+        if (id.isEmpty() || fileName.isEmpty()) {
+            println("$TAG skip empty request call_id=$id")
             onComplete()
             return
         }
 
-        var shouldInitialize = false
-        synchronized(lock) {
-            pending = PendingRequest(id, phrase, onComplete)
+        val player = MediaPlayer()
+        val completed = AtomicBoolean(false)
 
-            val current = tts
-            if (current != null) {
-                speakNowLocked(current, pending!!)
-                return
+        fun finishOnce() {
+            if (!completed.compareAndSet(false, true)) return
+
+            synchronized(lock) {
+                if (currentPlayer === player) {
+                    currentPlayer = null
+                }
             }
 
-            if (!initializing) {
-                initializing = true
-                shouldInitialize = true
+            try {
+                player.stop()
+            } catch (_: IllegalStateException) {
+            } catch (_: Exception) {
+            }
+
+            try {
+                player.reset()
+            } catch (_: Exception) {
+            }
+
+            try {
+                player.release()
+            } catch (_: Exception) {
+            }
+
+            mainHandler.post(onComplete)
+        }
+
+        fun failPlayback(message: String) {
+            println("$TAG error call_id=$id file=$fileName message=$message")
+            finishOnce()
+        }
+
+        synchronized(lock) {
+            val previous = currentPlayer
+            currentPlayer = player
+
+            if (previous != null) {
+                println("$TAG replacing previous playback call_id=$id")
+                try {
+                    previous.stop()
+                } catch (_: Exception) {
+                }
+                try {
+                    previous.reset()
+                } catch (_: Exception) {
+                }
+                try {
+                    previous.release()
+                } catch (_: Exception) {
+                }
             }
         }
 
-        if (!shouldInitialize) return
+        try {
+            player.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build(),
+            )
+            player.setVolume(1.0f, 1.0f)
 
-        lateinit var created: TextToSpeech
-        created = TextToSpeech(context.applicationContext) { status ->
-            val request: PendingRequest?
-            val engine: TextToSpeech?
+            player.setOnPreparedListener { preparedPlayer ->
+                if (completed.get()) return@setOnPreparedListener
 
-            synchronized(lock) {
-                initializing = false
-                engine = if (status == TextToSpeech.SUCCESS) created else null
-                tts = engine
-                request = pending
-                pending = null
-            }
-
-            if (status != TextToSpeech.SUCCESS || request == null || engine == null) {
                 try {
-                    created.shutdown()
-                } catch (_: Exception) {
+                    println("$TAG onPrepared call_id=$id file=$fileName")
+                    preparedPlayer.start()
+                    println("$TAG onStart call_id=$id file=$fileName")
+                } catch (error: Exception) {
+                    failPlayback(error.toString())
                 }
-                request?.onComplete?.invoke()
-                return@TextToSpeech
             }
 
-            synchronized(lock) {
-                speakNowLocked(engine, request)
+            player.setOnCompletionListener {
+                println("$TAG onDone call_id=$id file=$fileName")
+                finishOnce()
             }
+
+            player.setOnErrorListener { _, what, extra ->
+                failPlayback("what=$what extra=$extra")
+                true
+            }
+
+            context.applicationContext.assets.openFd(ASSET_PREFIX + fileName).use { asset ->
+                player.setDataSource(
+                    asset.fileDescriptor,
+                    asset.startOffset,
+                    asset.length,
+                )
+            }
+
+            println("$TAG prepare call_id=$id file=$fileName")
+            player.prepareAsync()
+        } catch (error: Exception) {
+            failPlayback(error.toString())
         }
     }
 
-    private fun speakNowLocked(
-        engine: TextToSpeech,
-        request: PendingRequest,
-    ) {
-        var language = engine.setLanguage(Locale("ar", "SA"))
-        if (language == TextToSpeech.LANG_MISSING_DATA ||
-            language == TextToSpeech.LANG_NOT_SUPPORTED
-        ) {
-            language = engine.setLanguage(Locale("ar"))
+    fun stop() {
+        val player: MediaPlayer?
+        synchronized(lock) {
+            player = currentPlayer
+            currentPlayer = null
         }
 
-        if (language == TextToSpeech.LANG_MISSING_DATA ||
-            language == TextToSpeech.LANG_NOT_SUPPORTED
-        ) {
-            request.onComplete()
-            return
+        if (player == null) return
+
+        try {
+            player.stop()
+        } catch (_: Exception) {
         }
-
-        engine.setAudioAttributes(
-            android.media.AudioAttributes.Builder()
-                .setUsage(android.media.AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                .setContentType(android.media.AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build(),
-        )
-
-        val utteranceId = "cn-call-status-${request.callId}-${System.nanoTime()}"
-        val completed = AtomicBoolean(false)
-
-        fun completeOnce() {
-            if (completed.compareAndSet(false, true)) {
-                request.onComplete()
-            }
+        try {
+            player.reset()
+        } catch (_: Exception) {
         }
-
-        engine.setOnUtteranceProgressListener(
-            object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) = Unit
-
-                override fun onDone(utteranceId: String?) {
-                    completeOnce()
-                }
-
-                override fun onError(utteranceId: String?) {
-                    completeOnce()
-                }
-            },
-        )
-
-        val params = Bundle().apply {
-            putInt(
-                TextToSpeech.Engine.KEY_PARAM_STREAM,
-                AudioManager.STREAM_VOICE_CALL,
-            )
-        }
-
-        if (engine.speak(
-                request.text,
-                TextToSpeech.QUEUE_FLUSH,
-                params,
-                utteranceId,
-            ) == TextToSpeech.ERROR
-        ) {
-            completeOnce()
+        try {
+            player.release()
+        } catch (_: Exception) {
         }
     }
 }

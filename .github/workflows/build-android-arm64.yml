@@ -1,4 +1,4 @@
-name: CN CALL Android Universal Release
+name: CN CALL Android arm64 Release
 
 on:
   push:
@@ -20,45 +20,44 @@ jobs:
         working-directory: mobile
         run: flutter pub get
 
-      - name: Build universal release APK
+      - name: Build arm64-v8a release APK
         working-directory: mobile
-        run: flutter build apk --release
+        run: flutter build apk --release --split-per-abi --target-platform android-arm64
 
-      - name: Verify and package universal APK
+      - name: Verify and package arm64-v8a only
         working-directory: mobile
         shell: bash
         run: |
           set -euo pipefail
           OUT="build/app/outputs/flutter-apk"
-          APK="$OUT/app-release.apk"
-          ZIP="$OUT/cn-call11-universal-release.zip"
+          APK="$OUT/app-arm64-v8a-release.apk"
+          ZIP="$OUT/cn-call11-arm64-v8a-release.zip"
 
           test -f "$APK"
           APK_COUNT="$(find "$OUT" -maxdepth 1 -type f -name '*.apk' | wc -l)"
           test "$APK_COUNT" -eq 1
-          test "$(find "$OUT" -maxdepth 1 -type f -name '*.apk' -printf '%f\n')" = "app-release.apk"
 
           rm -f "$ZIP"
           zip -9 -j "$ZIP" "$APK"
 
           test "$(unzip -Z1 "$ZIP" | wc -l)" -eq 1
-          test "$(unzip -Z1 "$ZIP")" = "app-release.apk"
+          test "$(unzip -Z1 "$ZIP")" = "app-arm64-v8a-release.apk"
 
-          echo "UNIVERSAL_APK_OK"
+          echo "ARM64_V8A_ONLY_OK"
           unzip -l "$ZIP"
 
-      - name: Upload universal APK
+      - name: Upload arm64-v8a APK
         uses: actions/upload-artifact@v4
         with:
-          name: cn-call11-universal-release-apk
-          path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          name: cn-call11-arm64-v8a-release-apk
+          path: mobile/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload universal ZIP
+      - name: Upload arm64-v8a ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: cn-call11-universal-release-zip
-          path: mobile/build/app/outputs/flutter-apk/cn-call11-universal-release.zip
+          name: cn-call11-arm64-v8a-release-zip
+          path: mobile/build/app/outputs/flutter-apk/cn-call11-arm64-v8a-release.zip
           if-no-files-found: error
           compression-level: 0
