@@ -88,7 +88,7 @@ TERMINAL_EVENT_FCM_AFTER_MS = 30000
 # A short presence grace distinguishes a transient WebSocket reconnect from a
 # genuinely offline recipient. We wait before producing the spoken "offline"
 # status; returning online during this window cancels the offline outcome.
-OFFLINE_PRESENCE_GRACE_MS = 8000
+OFFLINE_PRESENCE_GRACE_MS = 3000
 
 _UNSET = object()
 
