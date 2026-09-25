@@ -1,4 +1,4 @@
-name: CN CALL Android arm64 Release
+name: CN CALL Android All Architectures Release
 
 on:
   push:
@@ -20,44 +20,52 @@ jobs:
         working-directory: mobile
         run: flutter pub get
 
-      - name: Build arm64-v8a release APK
+      - name: Build all supported Android ABIs
         working-directory: mobile
-        run: flutter build apk --release --split-per-abi --target-platform android-arm64
+        run: flutter build apk --release --split-per-abi
 
-      - name: Verify and package arm64-v8a only
+      - name: Verify and package all ABIs
         working-directory: mobile
         shell: bash
         run: |
           set -euo pipefail
           OUT="build/app/outputs/flutter-apk"
-          APK="$OUT/app-arm64-v8a-release.apk"
-          ZIP="$OUT/cn-call11-arm64-v8a-release.zip"
+          ZIP="$OUT/cn-call11-all-architectures-release.zip"
 
-          test -f "$APK"
+          for apk in             "$OUT/app-armeabi-v7a-release.apk"             "$OUT/app-arm64-v8a-release.apk"             "$OUT/app-x86_64-release.apk"
+          do
+            test -f "$apk"
+          done
+
           APK_COUNT="$(find "$OUT" -maxdepth 1 -type f -name '*.apk' | wc -l)"
-          test "$APK_COUNT" -eq 1
+          test "$APK_COUNT" -eq 3
 
           rm -f "$ZIP"
-          zip -9 -j "$ZIP" "$APK"
+          zip -9 -j "$ZIP"             "$OUT/app-armeabi-v7a-release.apk"             "$OUT/app-arm64-v8a-release.apk"             "$OUT/app-x86_64-release.apk"
 
-          test "$(unzip -Z1 "$ZIP" | wc -l)" -eq 1
-          test "$(unzip -Z1 "$ZIP")" = "app-arm64-v8a-release.apk"
+          test "$(unzip -Z1 "$ZIP" | wc -l)" -eq 3
+          unzip -Z1 "$ZIP" | sort | diff -u - <(
+            printf '%s\n'               "app-arm64-v8a-release.apk"               "app-armeabi-v7a-release.apk"               "app-x86_64-release.apk" | sort
+          )
 
-          echo "ARM64_V8A_ONLY_OK"
+          echo "ALL_SUPPORTED_ABIS_OK"
           unzip -l "$ZIP"
 
-      - name: Upload arm64-v8a APK
+      - name: Upload all-architectures APKs
         uses: actions/upload-artifact@v4
         with:
-          name: cn-call11-arm64-v8a-release-apk
-          path: mobile/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+          name: cn-call11-all-architectures-release-apks
+          path: |
+            mobile/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+            mobile/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            mobile/build/app/outputs/flutter-apk/app-x86_64-release.apk
           if-no-files-found: error
           compression-level: 0
 
-      - name: Upload arm64-v8a ZIP
+      - name: Upload all-architectures ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: cn-call11-arm64-v8a-release-zip
-          path: mobile/build/app/outputs/flutter-apk/cn-call11-arm64-v8a-release.zip
+          name: cn-call11-all-architectures-release-zip
+          path: mobile/build/app/outputs/flutter-apk/cn-call11-all-architectures-release.zip
           if-no-files-found: error
           compression-level: 0
