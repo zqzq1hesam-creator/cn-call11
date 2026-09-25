@@ -1444,7 +1444,11 @@ object CNCallEngine {
             )
             if (cleared) {
                 stopCallAudioService(callId)
-                releaseNativeOwnershipIfOwned()
+                // Keep the authenticated native signaling session alive after a
+                // remote terminal frame, exactly like local call teardown.
+                // This user must remain online for the next incoming call.
+                // Explicit logout/session invalidation is responsible for
+                // closing the session.
                 // Phase 2.3 (E1): an inbound terminal frame ended this call;
                 // nothing queued for it may be flushed afterwards.
                 NativeWebSocketClient.clearPendingFrames()
