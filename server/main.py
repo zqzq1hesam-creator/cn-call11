@@ -143,6 +143,12 @@ call_expiry_task: asyncio.Task | None = None
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
 
+# A missing WebSocket does not prove the target is offline because the FCM
+# cold-start path can still deliver the incoming call. Give the target a short
+# window to establish signaling and emit call_delivered before classifying the
+# call as offline.
+OFFLINE_DELIVERY_CONFIRM_TIMEOUT_MS = 20000
+
 _UNSET = object()
 
 terminal_outbox_task: asyncio.Task | None = None
@@ -325,11 +331,13 @@ def _insert_terminal_event_in_db(
     message_type: str,
     from_id: str,
     state_version: int,
+    reason: str | None = None,
 ) -> str:
     call_id = str(record["call_id"])
     target_id = str(target_id)
     message_type = str(message_type)
     from_id = str(from_id)
+    reason = str(reason or "").strip() or None
 
     existing = db.execute(
         """
@@ -358,13 +366,14 @@ def _insert_terminal_event_in_db(
             source_user_id,
             target_user_id,
             event_type,
+            reason,
             created_at,
             acknowledged_at,
             state_version,
             last_attempt_at,
             attempt_count
         )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, NULL, 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 0)
         """,
         (
             event_id,
@@ -372,6 +381,7 @@ def _insert_terminal_event_in_db(
             from_id,
             target_id,
             message_type,
+            reason,
             int(time.time() * 1000),
             state_version,
         ),
@@ -404,7 +414,7 @@ def _insert_terminal_event_in_db(
 def finalize_call_terminal(
     call_id: str,
     new_status: str,
-    terminal_events: list[tuple[str, str, str]],
+    terminal_events: list[tuple[str, str, str] | tuple[str, str, str, str]],
 ) -> list[str]:
     """
     Atomically:
@@ -478,7 +488,13 @@ def finalize_call_terminal(
         durable_record = dict(record)
         durable_record["state_version"] = next_version
 
-        for target_id, message_type, from_id in terminal_events:
+        for terminal_event in terminal_events:
+            target_id, message_type, from_id = terminal_event[:3]
+            event_reason = (
+                str(terminal_event[3]).strip()
+                if len(terminal_event) >= 4 and terminal_event[3]
+                else None
+            )
             event_ids.append(
                 _insert_terminal_event_in_db(
                     db,
@@ -487,6 +503,7 @@ def finalize_call_terminal(
                     message_type,
                     from_id,
                     next_version,
+                    reason=event_reason,
                 )
             )
 
@@ -557,7 +574,7 @@ async def _deliver_terminal_event(event_id: str) -> bool:
     row = db.execute(
         """
         SELECT event_id, call_id, source_user_id, target_user_id,
-               event_type, created_at, attempt_count
+               event_type, reason, created_at, attempt_count
         FROM durable_terminal_events
         WHERE event_id = ? AND acknowledged_at IS NULL
         """,
@@ -585,6 +602,11 @@ async def _deliver_terminal_event(event_id: str) -> bool:
             "target_id": target_id,
             "from_id": str(row["source_user_id"]),
             "event_id": str(row["event_id"]),
+            **(
+                {"reason": str(row["reason"])}
+                if row["reason"]
+                else {}
+            ),
         }
 
         sent = await _send_ws_with_current_socket(
@@ -617,6 +639,7 @@ async def _deliver_terminal_event(event_id: str) -> bool:
         call_id=str(row["call_id"]),
         message_type=str(row["event_type"]),
         event_id=str(row["event_id"]),
+        reason=(str(row["reason"]) if row["reason"] else None),
     )
 
 
@@ -753,11 +776,20 @@ async def release_calls_for_user(user_id: str, token: str | None = None):
 async def expire_active_calls():
     now = int(time.time() * 1000)
     expired_ids = set()
+    offline_ringing_ids = set()
 
     for call_id, record in active_calls.items():
         status = str(record["status"])
 
         if status == "ringing":
+            target_id = str(record["target_id"])
+            if (
+                target_id not in connections
+                and int(record["created_at"]) + OFFLINE_DELIVERY_CONFIRM_TIMEOUT_MS <= now
+            ):
+                expired_ids.add(call_id)
+                offline_ringing_ids.add(call_id)
+                continue
             if int(record["ring_expires_at"]) <= now:
                 expired_ids.add(call_id)
             continue
@@ -815,16 +847,22 @@ async def expire_active_calls():
             else "timeout"
         )
 
-        terminal_events = (
-            [
+        if terminal_status == "missed" and call_id in offline_ringing_ids:
+            terminal_events = [
+                (caller_id, "call_reject", target_id, "offline"),
                 (target_id, "call_cancelled", caller_id),
             ]
-            if terminal_status == "missed"
-            else [
-                (target_id, "hangup", caller_id),
-                (caller_id, "hangup", target_id),
-            ]
-        )
+        else:
+            terminal_events = (
+                [
+                    (target_id, "call_cancelled", caller_id),
+                ]
+                if terminal_status == "missed"
+                else [
+                    (target_id, "hangup", caller_id),
+                    (caller_id, "hangup", target_id),
+                ]
+            )
 
         event_ids = finalize_call_terminal(
             call_id,
@@ -1003,6 +1041,7 @@ def init_db():
             source_user_id TEXT NOT NULL,
             target_user_id TEXT NOT NULL,
             event_type TEXT NOT NULL,
+            reason TEXT,
             created_at INTEGER NOT NULL,
             acknowledged_at INTEGER,
             state_version INTEGER NOT NULL DEFAULT 1,
@@ -1035,6 +1074,7 @@ def init_db():
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS reason TEXT",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
         ):
@@ -1054,6 +1094,10 @@ def init_db():
             pass
         try:
             db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE durable_terminal_events ADD COLUMN reason TEXT")
         except Exception:
             pass
         try:
@@ -1171,7 +1215,13 @@ def rebuild_active_calls_from_db():
                         ),
                     ]
 
-                for event_target, event_type, event_source in terminal_events:
+                for terminal_event in terminal_events:
+                    event_target, event_type, event_source = terminal_event[:3]
+                    event_reason = (
+                        str(terminal_event[3]).strip()
+                        if len(terminal_event) >= 4 and terminal_event[3]
+                        else None
+                    )
                     event_id = _insert_terminal_event_in_db(
                         db,
                         durable_record,
@@ -1179,6 +1229,7 @@ def rebuild_active_calls_from_db():
                         event_type,
                         event_source,
                         next_version,
+                        reason=event_reason,
                     )
                     print(
                         "[CN CALL][DB RECOVERY TERMINAL]",
@@ -1798,6 +1849,30 @@ def send_call_notification(
         return True
 
     except Exception as e:
+        error_text = str(e)
+        if "NotRegistered" in error_text or "UNREGISTERED" in error_text.upper():
+            # Firebase can retain a stale token after an app uninstall/data reset.
+            # Remove only the exact token that failed so another current token for
+            # the same user is never deleted accidentally.
+            if FCM_TOKENS.get(target_id) == token:
+                FCM_TOKENS.pop(target_id, None)
+            try:
+                db = get_db()
+                db.execute(
+                    "DELETE FROM fcm_tokens WHERE user_id = ? AND token = ?",
+                    (target_id, token),
+                )
+                db.commit()
+                db.close()
+                print(
+                    "[CN CALL][FCM TOKEN REMOVED] "
+                    f"target={target_id} reason=NotRegistered"
+                )
+            except Exception as cleanup_error:
+                print(
+                    "[CN CALL][FCM TOKEN CLEANUP FAILED] "
+                    f"target={target_id} error={cleanup_error}"
+                )
         print(f"FCM send error: {e}")
         print(
             "[CN CALL][FCM FAILED] "
