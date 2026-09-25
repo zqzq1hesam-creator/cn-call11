@@ -25,6 +25,20 @@ class CNCallConnectionService : ConnectionService() {
             )
         }
 
+        // Enforce the same single-call policy for incoming Telecom calls.
+        // Without this guard, a reconnect/FCM duplicate could create a second
+        // native Connection even though CNCallEngine is already handling another
+        // call, causing inconsistent reject/answer/ringback state.
+        if (CNCallRegistry.hasActiveCall()) {
+            println(
+                "[CN CALL][TELECOM] incoming refused: another native call is active" +
+                    " call_id=$callId",
+            )
+            return Connection.createFailedConnection(
+                DisconnectCause(DisconnectCause.BUSY),
+            )
+        }
+
         val connection = CNCallConnection(
             appContext = applicationContext,
             callId = callId,
