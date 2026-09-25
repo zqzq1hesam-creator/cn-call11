@@ -71,9 +71,6 @@ presence_last_seen: dict[str, int] = {}
 # Client heartbeats are the normal online-presence signal. A socket that goes
 # silent is considered stale only after this grace period.
 PRESENCE_STALE_TIMEOUT_MS = 9000
-# FCM can cold-start a device that has no existing socket. That path keeps a
-# separate bounded delivery-confirmation fallback.
-FCM_DELIVERY_FALLBACK_TIMEOUT_MS = 10000
 
 
 def _touch_presence(user_id: str) -> None:
@@ -791,39 +788,16 @@ async def release_calls_for_user(user_id: str, token: str | None = None):
 async def expire_active_calls():
     now = int(time.time() * 1000)
     expired_ids = set()
-    offline_ringing_ids = set()
 
     for call_id, record in active_calls.items():
         status = str(record["status"])
 
         if status == "ringing":
-            target_id = str(record["target_id"])
-            if not record.get("delivery_confirmed", False):
-                target_was_online = bool(record.get("target_online_at_call", False))
-                if target_was_online:
-                    # The target had live presence when the call started.
-                    # Heartbeat loss is the offline detector; no fixed 20s wait.
-                    offline = not _has_recent_presence(target_id, now)
-                elif record.get("fcm_delivery_sent", False):
-                    # FCM accepted the incoming-call push. Telecom may already
-                    # be displaying the call while the native signaling socket
-                    # is still starting/reconnecting. Do not turn a successful
-                    # FCM delivery into an offline rejection just because the
-                    # call_delivered frame has not arrived yet. Normal ring
-                    # expiry remains the terminal fallback.
-                    offline = False
-                else:
-                    # No live presence and no successful FCM delivery: retain
-                    # the bounded offline fallback for this case.
-                    offline = (
-                        int(record["created_at"])
-                        + FCM_DELIVERY_FALLBACK_TIMEOUT_MS
-                        <= now
-                    )
-                if offline:
-                    expired_ids.add(call_id)
-                    offline_ringing_ids.add(call_id)
-                    continue
+            # Do not infer "offline" from elapsed time or missing delivery ACK.
+            # A successful FCM push can already have produced the Telecom
+            # incoming-call UI while the signaling socket is still starting or
+            # reconnecting. The call remains ringing until an explicit terminal
+            # action arrives or the normal ring expiry is reached.
             if int(record["ring_expires_at"]) <= now:
                 expired_ids.add(call_id)
             continue
@@ -881,22 +855,16 @@ async def expire_active_calls():
             else "timeout"
         )
 
-        if terminal_status == "missed" and call_id in offline_ringing_ids:
-            terminal_events = [
-                (caller_id, "call_reject", target_id, "offline"),
+        terminal_events = (
+            [
                 (target_id, "call_cancelled", caller_id),
             ]
-        else:
-            terminal_events = (
-                [
-                    (target_id, "call_cancelled", caller_id),
-                ]
-                if terminal_status == "missed"
-                else [
-                    (target_id, "hangup", caller_id),
-                    (caller_id, "hangup", target_id),
-                ]
-            )
+            if terminal_status == "missed"
+            else [
+                (target_id, "hangup", caller_id),
+                (caller_id, "hangup", target_id),
+            ]
+        )
 
         event_ids = finalize_call_terminal(
             call_id,
