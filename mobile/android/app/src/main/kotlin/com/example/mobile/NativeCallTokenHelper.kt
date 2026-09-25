@@ -92,19 +92,6 @@ object NativeCallTokenHelper {
     }
 
     /**
-     * Clears the authenticated CN CALL session from the shared Flutter
-     * preferences store during logout. This must be persisted before logout
-     * returns so an FCM cold-start cannot resurrect a session using stale
-     * native credentials.
-     */
-    fun clearStoredCredentials(context: Context): Boolean {
-        return prefs(context).edit()
-            .remove(KEY_USER_ID)
-            .remove(KEY_ACCESS_TOKEN)
-            .commit()
-    }
-
-    /**
      * Fetches a LiveKit token for [userId]/[callId] exactly like the Dart path:
      * GET /livekit/token?user_id=<userId>&call_id=<callId> with the stored
      * access token in "Authorization: Bearer <token>".
