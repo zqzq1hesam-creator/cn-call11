@@ -61,7 +61,7 @@ jobs:
           name: cn-call11-universal-release-apk
           path: mobile/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 9
 
       - name: Upload universal ZIP
         uses: actions/upload-artifact@v4
@@ -69,4 +69,4 @@ jobs:
           name: cn-call11-universal-release-zip
           path: mobile/build/app/outputs/flutter-apk/cn-call11-universal-release.zip
           if-no-files-found: error
-          compression-level: 0
+          compression-level: 9
