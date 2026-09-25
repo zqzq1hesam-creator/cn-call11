@@ -125,6 +125,27 @@ class CNCallConnection(
         }
     }
 
+    fun announceLocalStatus(assetFileName: String) {
+        if (terminal || incoming) return
+
+        stopOutgoingRingback()
+
+        println(
+            "[CN CALL][TELECOM] announcing local status " +
+                "call_id=$callId asset=$assetFileName",
+        )
+
+        CNCallStatusSpeaker.speak(
+            appContext,
+            callId,
+            assetFileName,
+        ) {
+            if (!terminal) {
+                fail(DisconnectCause.LOCAL)
+            }
+        }
+    }
+
     private fun prepareOutgoingRingback() {
         val generation: Long
         synchronized(ringbackLock) {
