@@ -78,7 +78,6 @@ async def _send_ws_with_current_socket(
 
     try:
         await first_socket.send_json(payload)
-        return True
     except Exception as first_exc:
         current_socket = connections.get(str(user_id))
         if current_socket is not None and current_socket is not first_socket:
@@ -104,6 +103,29 @@ async def _send_ws_with_current_socket(
             "error=", first_exc,
         )
         return False
+
+    # The first send can succeed just before the active socket is replaced.
+    # For the initial ringing invite, immediately replay on the replacement
+    # socket so a second-call/reconnect race cannot lose the incoming call.
+    if label == "initial_call":
+        current_socket = connections.get(str(user_id))
+        if current_socket is not None and current_socket is not first_socket:
+            try:
+                await current_socket.send_json(payload)
+                print(
+                    "[CN CALL][WS REPLACEMENT FOLLOW-UP SENT]",
+                    label,
+                    "user=", user_id,
+                )
+            except Exception as followup_exc:
+                print(
+                    "[CN CALL][WS REPLACEMENT FOLLOW-UP FAILED]",
+                    label,
+                    "user=", user_id,
+                    "error=", followup_exc,
+                )
+
+    return True
 active_calls: dict[str, dict[str, object]] = {}
 active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
