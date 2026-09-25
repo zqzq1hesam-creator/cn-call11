@@ -24,13 +24,14 @@ jobs:
         working-directory: mobile
         run: flutter build apk --release
 
-      - name: Verify universal APK
+      - name: Verify and package universal APK
         working-directory: mobile
         shell: bash
         run: |
           set -euo pipefail
           OUT="build/app/outputs/flutter-apk"
           APK="$OUT/app-release.apk"
+          ZIP="$OUT/cn-call11-universal-release.zip"
 
           test -f "$APK"
 
@@ -43,14 +44,29 @@ jobs:
           grep -Fx 'lib/arm64-v8a/libflutter.so' /tmp/apk-files.txt
           grep -Fx 'lib/x86_64/libflutter.so' /tmp/apk-files.txt
 
-          echo "UNIVERSAL_APK_OK"
-          ls -lh "$APK"
-          unzip -Z1 "$APK" | grep '^lib/.*\.so$' | sort
+          rm -f "$ZIP"
+          zip -9 -j "$ZIP" "$APK"
+
+          test "$(unzip -Z1 "$ZIP" | wc -l)" -eq 1
+          test "$(unzip -Z1 "$ZIP")" = "app-release.apk"
+
+          echo "UNIVERSAL_APK_ZIP_OK"
+          ls -lh "$APK" "$ZIP"
+          unzip -Z1 "$APK" | grep '^lib/.*\.so | sort
+          unzip -l "$ZIP"
 
       - name: Upload universal APK
         uses: actions/upload-artifact@v4
         with:
           name: cn-call11-universal-release-apk
           path: mobile/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload universal ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: cn-call11-universal-release-zip
+          path: mobile/build/app/outputs/flutter-apk/cn-call11-universal-release.zip
           if-no-files-found: error
           compression-level: 0
