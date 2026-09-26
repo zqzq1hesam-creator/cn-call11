@@ -2294,6 +2294,27 @@ async def websocket_endpoint(
                         f"fcm={'SENT' if fcm_sent else 'FAILED'}"
                     )
 
+                    if not fcm_sent:
+                        # FCM failed, so this is the only case where the server
+                        # has positive evidence that the fallback delivery path
+                        # is unavailable. Restore the caller-side offline voice
+                        # without classifying a missing WebSocket alone as offline.
+                        finalize_call_terminal(
+                            call_id,
+                            "missed",
+                            [],
+                        )
+                        await websocket.send_json({
+                            "type": "call_reject",
+                            "call_id": call_id,
+                            "target_id": target_id,
+                            "reason": "offline",
+                        })
+                        print(
+                            "[CN CALL][CALL OFFLINE ANNOUNCEMENT] "
+                            f"call_id={call_id} target={target_id}"
+                        )
+
                 continue
 
             record = active_calls.get(call_id)
