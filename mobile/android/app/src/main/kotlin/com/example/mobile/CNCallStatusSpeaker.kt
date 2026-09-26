@@ -2,6 +2,7 @@ package com.example.mobile
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.net.Uri
 import android.media.MediaPlayer
 import android.os.Handler
 import android.os.Looper
@@ -134,13 +135,17 @@ object CNCallStatusSpeaker {
                 true
             }
 
-            context.applicationContext.assets.openFd(ASSET_PREFIX + fileName).use { asset ->
-                player.setDataSource(
-                    asset.fileDescriptor,
-                    asset.startOffset,
-                    asset.length,
-                )
-            }
+            // Use the Android-asset URI instead of openFd(). MP3 files may be
+            // compressed by aapt2, in which case AssetManager.openFd() fails because
+            // a compressed asset has no stable file descriptor/offset range. The URI
+            // data source lets MediaPlayer read the packaged asset directly.
+            val assetUri = Uri.parse(
+                "file:///android_asset/$ASSET_PREFIX$fileName",
+            )
+            player.setDataSource(
+                context.applicationContext,
+                assetUri,
+            )
 
             println("$TAG prepare call_id=$id file=$fileName")
             player.prepareAsync()
