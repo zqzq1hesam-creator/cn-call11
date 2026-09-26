@@ -1495,8 +1495,6 @@ async def save_fcm_token(
     if user_id is None or not token:
         raise HTTPException(status_code=401, detail="غير مصرح")
 
-    FCM_TOKENS[user_id] = token
-
     db = get_db()
     try:
         # A registration token identifies an app instance, so it must have one
@@ -1543,6 +1541,8 @@ async def save_fcm_token(
         previous_user_id = str(previous_user["user_id"]).strip()
         if FCM_TOKENS.get(previous_user_id) == token:
             FCM_TOKENS.pop(previous_user_id, None)
+
+    FCM_TOKENS[user_id] = token
 
     return {
         "success": True,
