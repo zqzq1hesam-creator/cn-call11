@@ -124,6 +124,12 @@ class CNCallConnectionService : ConnectionService() {
             UUID.randomUUID().toString()
         }
 
+        println(
+            "[CN CALL][DIAG][OUTGOING CREATE] " +
+                "call_id=${callId} target_id=${targetId} scheme=${scheme} " +
+                "extra_call_id_present=${extraCallId.isNotEmpty()}",
+        )
+
         // Single-call policy: no native Telecom call may be created while
         // another native connection is live (same or different callId).
         if (CNCallRegistry.hasActiveCall()) {
@@ -159,13 +165,40 @@ class CNCallConnectionService : ConnectionService() {
         // call_accept starts LiveKit. No Flutter WebSocket, no RtcCallManager.
         val callbacks = connection.engineCallbacks
 
-        if (!CNCallEngine.initialize(applicationContext, callbacks) ||
-            !CNCallEngine.startOutgoing(callId, address.toString())
-        ) {
+        val initialized = CNCallEngine.initialize(applicationContext, callbacks)
+        println(
+            "[CN CALL][DIAG][OUTGOING INIT] " +
+                "call_id=${callId} initialized=${initialized}",
+        )
+
+        val started = initialized &&
+            CNCallEngine.startOutgoing(callId, address.toString())
+
+        println(
+            "[CN CALL][DIAG][OUTGOING START RESULT] " +
+                "call_id=${callId} started=${started}",
+        )
+
+        if (!started) {
+            println(
+                "[CN CALL][DIAG][OUTGOING CREATE FAILED] " +
+                    "call_id=${callId} -> Connection.fail(ERROR)",
+            )
             connection.fail(DisconnectCause.ERROR)
         }
 
         return connection
+    }
+
+    override fun onCreateOutgoingConnectionFailed(
+        connectionManagerPhoneAccount: android.telecom.PhoneAccountHandle,
+        request: ConnectionRequest,
+    ) {
+        println(
+            "[CN CALL][DIAG][TELECOM OUTGOING CREATE FAILED] " +
+                "address=${request.address}",
+        )
+        super.onCreateOutgoingConnectionFailed(connectionManagerPhoneAccount, request)
     }
 
     override fun onDestroy() {
