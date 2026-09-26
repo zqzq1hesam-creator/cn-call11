@@ -344,6 +344,10 @@ object CNCallEngine {
             }
 
             override fun onError(t: Throwable) {
+                println(
+                    "[CN CALL][DIAG][LIVEKIT onError] " +
+                        "message=${t.message}",
+                )
                 val current: String? = synchronized(lock) { scoredCallId }
                 if (current == null) return
                 // Surface the media error only when a call is actually scored;
@@ -657,7 +661,10 @@ object CNCallEngine {
         }
 
         override fun disconnect(callId: String): Boolean {
-            println("[CN CALL][DIAG][ENGINE disconnect ENTER] call_id=$callId")
+            println(
+                "[CN CALL][DIAG][ENGINE disconnect ENTER] " +
+                    "call_id=$callId native_thread=${Thread.currentThread().name}",
+            )
             val current: Boolean
             val targetId: String?
             val callerStillRinging: Boolean
