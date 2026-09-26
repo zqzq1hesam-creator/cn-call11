@@ -460,12 +460,34 @@ object CNCallEngine {
         }
 
         override fun startOutgoing(callId: String, address: String): Boolean {
-            if (callId.isBlank() || address.isBlank()) return false
+            println(
+                "[CN CALL][DIAG][ENGINE startOutgoing] " +
+                    "call_id=$callId address=$address",
+            )
+            if (callId.isBlank() || address.isBlank()) {
+                println(
+                    "[CN CALL][DIAG][ENGINE startOutgoing REJECT] " +
+                        "call_id=$callId reason=blank_identity",
+                )
+                return false
+            }
             val targetId = parseTargetId(address)
-            if (targetId.isBlank()) return false
+            if (targetId.isBlank()) {
+                println(
+                    "[CN CALL][DIAG][ENGINE startOutgoing REJECT] " +
+                        "call_id=$callId reason=blank_target address=$address",
+                )
+                return false
+            }
 
             val context = appContext ?: return false
-            val ownUserId = NativeCallTokenHelper.restoreUserId(context) ?: return false
+            val ownUserId = NativeCallTokenHelper.restoreUserId(context) ?: run {
+                println(
+                    "[CN CALL][DIAG][ENGINE startOutgoing REJECT] " +
+                        "call_id=$callId reason=missing_user_id",
+                )
+                return false
+            }
             if (targetId == ownUserId) {
                 println("[CN CALL][ENGINE] outgoing refused self-call call_id=$callId")
                 return false
@@ -490,7 +512,12 @@ object CNCallEngine {
                 acceptedCallId = null
             }
 
-            if (!ensureSignalingConnected()) return false
+            val signalingReady = ensureSignalingConnected()
+            println(
+                "[CN CALL][DIAG][ENGINE signaling] " +
+                    "call_id=$callId ready=$signalingReady",
+            )
+            if (!signalingReady) return false
 
             val callerName = context
                 .getSharedPreferences("FlutterSharedPreferences", Context.MODE_PRIVATE)
@@ -507,6 +534,10 @@ object CNCallEngine {
                     "from_id" to ownUserId,
                     "caller_name" to callerName,
                 ),
+            )
+            println(
+                "[CN CALL][DIAG][ENGINE call SEND RESULT] " +
+                    "call_id=$callId sent=$sent target=$targetId",
             )
             return sent
         }
@@ -626,6 +657,7 @@ object CNCallEngine {
         }
 
         override fun disconnect(callId: String): Boolean {
+            println("[CN CALL][DIAG][ENGINE disconnect ENTER] call_id=$callId")
             val current: Boolean
             val targetId: String?
             val callerStillRinging: Boolean
@@ -634,8 +666,25 @@ object CNCallEngine {
                 targetId = if (isCaller) outgoingTargetId else pendingIncomingCall?.callerId
                 callerStillRinging = isCaller && acceptedCallId != callId
             }
-            if (!current) return false
-            if (targetId.isNullOrBlank()) return false
+            if (!current) {
+                println(
+                    "[CN CALL][DIAG][ENGINE disconnect REJECT] " +
+                        "call_id=$callId reason=not_scored",
+                )
+                return false
+            }
+            if (targetId.isNullOrBlank()) {
+                println(
+                    "[CN CALL][DIAG][ENGINE disconnect REJECT] " +
+                        "call_id=$callId reason=missing_target",
+                )
+                return false
+            }
+
+            println(
+                "[CN CALL][DIAG][ENGINE disconnect DECISION] " +
+                    "call_id=$callId target=$targetId callerStillRinging=$callerStillRinging",
+            )
 
             // Verified: rtc_call_manager.dart hangup() (lines 551-559) —
             // caller cancels while still ringing → "call_cancelled",
@@ -646,9 +695,14 @@ object CNCallEngine {
             // being cancelled before the socket connected (ghost-ring fix); the
             // terminal frame below is the only frame that may still go out.
             NativeWebSocketClient.clearPendingFrames()
+            val terminalType = if (callerStillRinging) "call_cancelled" else "hangup"
             val sent = NativeWebSocketClient.send(
-                if (callerStillRinging) "call_cancelled" else "hangup",
+                terminalType,
                 mapOf("call_id" to callId, "target_id" to targetId),
+            )
+            println(
+                "[CN CALL][DIAG][ENGINE terminal SEND RESULT] " +
+                    "call_id=$callId type=$terminalType sent=$sent",
             )
 
             // Media leg end (NativeLiveKit.disconnect is media-only and can
