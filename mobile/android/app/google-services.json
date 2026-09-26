@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "323933536547",
+    "project_id": "cn-call11",
+    "storage_bucket": "cn-call11.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:323933536547:android:c8d0ab0cb298887c6dcc96",
+        "android_client_info": {
+          "package_name": "com.example.mobile"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDck0ai439uyXQZ8Oxjxd3JKa2So7jj-4c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

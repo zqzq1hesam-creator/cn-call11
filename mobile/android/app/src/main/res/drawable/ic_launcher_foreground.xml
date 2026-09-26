@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <group
+        android:pivotX="12"
+        android:pivotY="12"
+        android:scaleX="0.82"
+        android:scaleY="0.82">
+
+        <!-- Left rounded bar -->
+        <path
+            android:fillColor="#19C878"
+            android:pathData="M4.15,8.15
+                A1.15,1.15 0,0 1,5.3 7
+                H5.8
+                A1.15,1.15 0,0 1,6.95 8.15
+                V15.85
+                A1.15,1.15 0,0 1,5.8 17
+                H5.3
+                A1.15,1.15 0,0 1,4.15 15.85
+                Z" />
+
+        <!-- Center tall rounded bar -->
+        <path
+            android:fillColor="#0BA977"
+            android:pathData="M10.45,4.7
+                A1.2,1.2 0,0 1,11.65 3.5
+                H12.35
+                A1.2,1.2 0,0 1,13.55 4.7
+                V19.3
+                A1.2,1.2 0,0 1,12.35 20.5
+                H11.65
+                A1.2,1.2 0,0 1,10.45 19.3
+                Z" />
+
+        <!-- Right rounded bar -->
+        <path
+            android:fillColor="#19C878"
+            android:pathData="M17.05,8.15
+                A1.15,1.15 0,0 1,18.2 7
+                H18.7
+                A1.15,1.15 0,0 1,19.85 8.15
+                V15.85
+                A1.15,1.15 0,0 1,18.7 17
+                H18.2
+                A1.15,1.15 0,0 1,17.05 15.85
+                Z" />
+    </group>
+</vector>
