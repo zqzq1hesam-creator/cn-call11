@@ -2303,12 +2303,28 @@ async def websocket_endpoint(
                             pass
 
                 if delivered:
-                    # WS delivered the invitation; never send a second FCM copy for
-                    # the same initial call. The Android presentation ticket on the
-                    # recipient still protects against an already-in-flight FCM copy.
+                    # The WebSocket delivery remains the primary low-latency path.
+                    # Also send one FCM copy for the same call_id. Android's native
+                    # presentation ticket makes the duplicate transport idempotent,
+                    # so an FCM wake-up cannot create a second Telecom call.
                     print(
                         "[CN CALL][CALL DELIVERY MODE] "
                         f"call_id={call_id} mode=websocket"
+                    )
+
+                    fcm_sent = await send_call_notification_async(
+                        target_id=target_id,
+                        caller_id=user_id,
+                        caller_name=str(
+                            message.get("caller_name", "مستخدم CN CALL")
+                        ),
+                        call_id=call_id,
+                        message_type="incoming_call",
+                    )
+                    print(
+                        "[CN CALL][PARALLEL FCM] "
+                        f"call_id={call_id} target={target_id} "
+                        f"sent={'SENT' if fcm_sent else 'FAILED'}"
                     )
                 else:
                     # No usable live socket: FCM is the fallback. If the token is
