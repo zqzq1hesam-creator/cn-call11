@@ -35,6 +35,19 @@ jobs:
 
           test -f "$APK"
 
+          # Verify the final merged/built APK has exactly one FCM receiver
+          # for com.google.firebase.MESSAGING_EVENT. This catches manifest
+          # merge regressions that source-file inspection cannot see.
+          APKANALYZER="$(find "$ANDROID_HOME" -type f -name apkanalyzer -perm -111 2>/dev/null | head -n 1)"
+          test -n "$APKANALYZER"
+          "$APKANALYZER" manifest print "$APK" > /tmp/merged-manifest.txt
+          MESSAGING_EVENT_COUNT="$(grep -c 'com.google.firebase.MESSAGING_EVENT' /tmp/merged-manifest.txt || true)"
+          test "$MESSAGING_EVENT_COUNT" -eq 1
+          grep -F 'com.example.mobile.CallFirebaseService' /tmp/merged-manifest.txt
+          ! grep -F 'io.flutter.plugins.firebase.messaging.FlutterFirebaseMessagingService' /tmp/merged-manifest.txt
+          ! grep -F 'com.google.firebase.messaging.FirebaseMessagingService' /tmp/merged-manifest.txt
+          echo "FCM_SINGLE_RECEIVER_OK"
+
           APK_COUNT="$(find "$OUT" -maxdepth 1 -type f -name '*.apk' | wc -l)"
           test "$APK_COUNT" -eq 1
 
