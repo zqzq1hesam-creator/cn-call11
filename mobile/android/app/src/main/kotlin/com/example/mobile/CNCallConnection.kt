@@ -389,7 +389,7 @@ class CNCallConnection(
         CNCallRegistry.markTerminated(callId)
         val disconnected = CNCallEngine.disconnect(callId)
         println(
-            "[CN CALL][DIAG][CONNECTION fail -> ENGINE disconnect] " +
+            "[CN CALL][DIAG][CONNECTION onDisconnect -> ENGINE disconnect] " +
                 "call_id=$callId sent=$disconnected",
         )
         CNCallEngine.release(callId)
