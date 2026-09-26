@@ -1,0 +1,467 @@
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from pathlib import Path
+import hashlib
+import hmac
+import os
+import re
+import sqlite3
+
+import firebase_admin
+from firebase_admin import credentials, messaging
+
+
+app = FastAPI(title="CN CALL Server")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "cn_call.db"
+
+
+connections: dict[str, WebSocket] = {}
+
+FCM_TOKENS: dict[str, str] = {}
+
+firebase_key = BASE_DIR / "secrets" / "firebase-service-account.json"
+firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+
+if not firebase_admin._apps:
+    if firebase_json:
+        cred = credentials.Certificate(
+            __import__("json").loads(firebase_json)
+        )
+        firebase_admin.initialize_app(cred)
+    elif firebase_key.exists():
+        cred = credentials.Certificate(str(firebase_key))
+        firebase_admin.initialize_app(cred)
+
+
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def get_db():
+    db = sqlite3.connect(DB_PATH)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def init_db():
+    db = get_db()
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            password_hash TEXT NOT NULL,
+            password_salt TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS fcm_tokens (
+            user_id TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    db.commit()
+    db.close()
+
+
+init_db()
+
+
+# ============================================================
+# PASSWORD SECURITY
+# ============================================================
+
+def hash_password(password: str, salt: bytes | None = None):
+    if salt is None:
+        salt = os.urandom(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        200_000,
+    )
+
+    return (
+        password_hash.hex(),
+        salt.hex(),
+    )
+
+
+def verify_password(
+    password: str,
+    password_hash: str,
+    password_salt: str,
+):
+    try:
+        salt = bytes.fromhex(password_salt)
+    except ValueError:
+        return False
+
+    calculated, _ = hash_password(password, salt)
+
+    return hmac.compare_digest(
+        calculated,
+        password_hash,
+    )
+
+
+# ============================================================
+# MODELS
+# ============================================================
+
+class RegisterRequest(BaseModel):
+    user_id: str
+    username: str
+    password: str
+
+
+class LoginRequest(BaseModel):
+    user_id: str
+    password: str
+
+
+class FcmTokenRequest(BaseModel):
+    user_id: str
+    token: str
+
+
+
+# ============================================================
+# FCM TOKEN
+# ============================================================
+
+@app.post("/fcm-token")
+async def save_fcm_token(request: FcmTokenRequest):
+    user_id = request.user_id.strip()
+    token = request.token.strip()
+
+    if not user_id or not token:
+        return {
+            "success": False,
+            "message": "بيانات FCM غير صالحة",
+        }
+
+    FCM_TOKENS[user_id] = token
+
+    return {
+        "success": True,
+        "message": "تم حفظ FCM Token",
+    }
+
+
+# ============================================================
+# BASIC
+# ============================================================
+
+@app.get("/")
+async def root():
+    return {
+        "app": "CN CALL",
+        "status": "online",
+    }
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "users": len(connections),
+    }
+
+
+# ============================================================
+# REGISTER
+# ============================================================
+
+@app.post("/register")
+async def register(request: RegisterRequest):
+    user_id = request.user_id.strip()
+    username = request.username.strip()
+    password = request.password
+
+    if not user_id:
+        return {
+            "success": False,
+            "message": "ID المستخدم مطلوب",
+        }
+
+    if not re.fullmatch(r"\d+", user_id):
+        return {
+            "success": False,
+            "message": "ID المستخدم يجب أن يكون أرقامًا فقط",
+        }
+
+    if len(username) < 3:
+        return {
+            "success": False,
+            "message": "اسم المستخدم يجب أن يكون 3 أحرف على الأقل",
+        }
+
+    if len(password) < 6:
+        return {
+            "success": False,
+            "message": "كلمة المرور يجب أن تكون 6 أحرف على الأقل",
+        }
+
+    db = get_db()
+
+    existing = db.execute(
+        "SELECT user_id FROM users WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+
+    if existing is not None:
+        db.close()
+
+        return {
+            "success": False,
+            "message": "ID المستخدم مستخدم بالفعل",
+        }
+
+    password_hash, password_salt = hash_password(password)
+
+    db.execute(
+        """
+        INSERT INTO users (
+            user_id,
+            username,
+            password_hash,
+            password_salt
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            username,
+            password_hash,
+            password_salt,
+        ),
+    )
+
+    db.commit()
+    db.close()
+
+    return {
+        "success": True,
+        "message": "تم إنشاء الحساب بنجاح",
+        "user": {
+            "user_id": user_id,
+            "username": username,
+        },
+    }
+
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+@app.post("/login")
+async def login(request: LoginRequest):
+    user_id = request.user_id.strip()
+    password = request.password
+
+    db = get_db()
+
+    user = db.execute(
+        """
+        SELECT
+            user_id,
+            username,
+            password_hash,
+            password_salt
+        FROM users
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    db.close()
+
+    if user is None:
+        return {
+            "success": False,
+            "message": "ID المستخدم أو كلمة المرور غير صحيحة",
+        }
+
+    if not verify_password(
+        password,
+        user["password_hash"],
+        user["password_salt"],
+    ):
+        return {
+            "success": False,
+            "message": "ID المستخدم أو كلمة المرور غير صحيحة",
+        }
+
+    return {
+        "success": True,
+        "message": "تم تسجيل الدخول بنجاح",
+        "user": {
+            "user_id": user["user_id"],
+            "username": user["username"],
+        },
+    }
+
+
+# ============================================================
+# USER LOOKUP
+# ============================================================
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: str):
+    db = get_db()
+
+    user = db.execute(
+        """
+        SELECT user_id, username, created_at
+        FROM users
+        WHERE user_id = ?
+        """,
+        (user_id.strip(),),
+    ).fetchone()
+
+    db.close()
+
+    if user is None:
+        return {
+            "success": False,
+            "message": "المستخدم غير موجود",
+        }
+
+    return {
+        "success": True,
+        "user": {
+            "user_id": user["user_id"],
+            "username": user["username"],
+            "online": user["user_id"] in connections,
+        },
+    }
+
+
+
+# ============================================================
+# FCM NOTIFICATIONS
+# ============================================================
+
+def send_call_notification(
+    target_id: str,
+    caller_id: str,
+    caller_name: str,
+):
+    token = FCM_TOKENS.get(target_id)
+
+    if not token:
+        return
+
+    if not firebase_admin._apps:
+        return
+
+    try:
+        message = messaging.Message(
+            token=token,
+            notification=messaging.Notification(
+                title="CN CALL",
+                body=f"مكالمة واردة من {caller_name}",
+            ),
+            data={
+                "type": "incoming_call",
+                "caller_id": caller_id,
+                "caller_name": caller_name,
+            },
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="cn_call_calls",
+                    sound="default",
+                ),
+            ),
+        )
+
+        messaging.send(message)
+
+    except Exception as e:
+        print(f"FCM send error: {e}")
+
+
+# ============================================================
+# WEBSOCKET / CALLS
+# ============================================================
+
+@app.websocket("/ws/{user_id}")
+async def websocket_endpoint(
+    websocket: WebSocket,
+    user_id: str,
+):
+    await websocket.accept()
+
+    old = connections.get(user_id)
+
+    if old is not None:
+        try:
+            await old.close()
+        except Exception:
+            pass
+
+    connections[user_id] = websocket
+
+    try:
+        await websocket.send_json({
+            "type": "connected",
+            "user_id": user_id,
+        })
+
+        while True:
+            message = await websocket.receive_json()
+
+            target_id = str(
+                message.get("target_id", "")
+            ).strip()
+
+            if target_id and target_id in connections:
+                await connections[target_id].send_json({
+                    **message,
+                    "from_id": user_id,
+                })
+
+            if (
+                message.get("type") == "call"
+                and target_id
+            ):
+                caller_name = str(
+                    message.get("caller_name", "مستخدم CN CALL")
+                )
+
+                send_call_notification(
+                    target_id=target_id,
+                    caller_id=user_id,
+                    caller_name=caller_name,
+                )
+
+    except WebSocketDisconnect:
+        pass
+
+    finally:
+        if connections.get(user_id) is websocket:
+            del connections[user_id]
