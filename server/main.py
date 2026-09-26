@@ -816,7 +816,6 @@ async def _call_expiry_loop():
 @app.on_event("startup")
 async def start_call_expiry_loop():
     global call_expiry_task, terminal_outbox_task, fcm_token_cleanup_task
-    cleanup_fcm_tokens()
     load_fcm_tokens()
     load_access_tokens()
     rebuild_active_calls_from_db()
@@ -1134,19 +1133,29 @@ def init_db():
         except Exception:
             pass
 
+    # Commit the schema first. The cleanup opens its own connection, so it
+    # must not run while the current schema transaction is still uncommitted.
+    db.commit()
+    db.close()
+
     # Repair any legacy duplicate/stale registrations before enforcing the
     # unique-token index on the active database.
     cleanup_fcm_tokens()
 
     db = get_db()
-    db.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_fcm_tokens_token_unique
-        ON fcm_tokens (token)
-        """
-    )
-    db.commit()
-    db.close()
+    try:
+        db.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fcm_tokens_token_unique
+            ON fcm_tokens (token)
+            """
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 init_db()
