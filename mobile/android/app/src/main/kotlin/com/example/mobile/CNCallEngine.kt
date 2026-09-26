@@ -3,6 +3,8 @@ package com.example.mobile
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.telecom.TelecomManager
@@ -189,6 +191,15 @@ object CNCallEngine {
         @Volatile
         private var lastSignalingError: Throwable? = null
 
+        /**
+         * Caller-local offline announcement guard.
+         *
+         * This is deliberately call-scoped and caller-only. It is not a
+         * signaling/status frame and never changes the server call state.
+         */
+        @Volatile
+        private var callerOfflineAnnouncedCallId: String? = null
+
         @Volatile
         private var wsListenerRegistered = false
 
@@ -227,11 +238,17 @@ object CNCallEngine {
 
             override fun onClosed(code: Int, reason: String) {
                 // Transport-only: NativeWebSocketClient owns reconnect, socket
-                // closure is NOT call termination.
+                // closure is NOT call termination. A caller-local offline
+                // announcement is only considered when this exact call is
+                // still scored and Android reports no validated Internet.
+                maybeAnnounceCallerOffline()
             }
 
             override fun onError(t: Throwable) {
                 lastSignalingError = t
+                // Same narrow guard as onClosed: caller + exact active call +
+                // no validated Internet. No server frame is sent.
+                maybeAnnounceCallerOffline()
             }
         }
 
@@ -598,6 +615,7 @@ object CNCallEngine {
                     scoredCallId = null
                     pendingIncomingCall = null
                     acceptedCallId = null
+                    callerOfflineAnnouncedCallId = null
                 }
             }
             stopCallAudioService(callId)
@@ -645,6 +663,7 @@ object CNCallEngine {
                     scoredCallId = null
                     pendingIncomingCall = null
                     acceptedCallId = null
+                    callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
                 }
@@ -745,6 +764,64 @@ object CNCallEngine {
         // ------------------------------------------------------------
         // Internal orchestration
         // ------------------------------------------------------------
+
+        /**
+         * Plays the caller-offline recording locally only when the native
+         * engine is still handling an outgoing call and the device has no
+         * currently validated Internet connection.
+         *
+         * This intentionally does NOT send call_reject/offline to the peer,
+         * does not terminate the call, and does not affect incoming calls.
+         */
+        private fun maybeAnnounceCallerOffline() {
+            val context = appContext ?: return
+
+            val callId: String
+            synchronized(lock) {
+                callId = scoredCallId ?: return
+                if (!isCaller) return
+                if (callerOfflineAnnouncedCallId == callId) return
+            }
+
+            val connectivityManager =
+                context.getSystemService(ConnectivityManager::class.java)
+                    ?: return
+
+            val network = connectivityManager.activeNetwork
+            val capabilities =
+                network?.let { connectivityManager.getNetworkCapabilities(it) }
+
+            val hasValidatedInternet =
+                capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+                    capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+
+            if (hasValidatedInternet) return
+
+            var shouldAnnounce = false
+            synchronized(lock) {
+                if (
+                    callId == scoredCallId &&
+                    isCaller &&
+                    callerOfflineAnnouncedCallId != callId
+                ) {
+                    callerOfflineAnnouncedCallId = callId
+                    shouldAnnounce = true
+                }
+            }
+
+            if (!shouldAnnounce) return
+
+            println(
+                "[CN CALL][CALLER OFFLINE AUDIO] " +
+                    "call_id=$callId internet_validated=false",
+            )
+
+            CNCallStatusSpeaker.speak(
+                context,
+                callId,
+                "caller_offline.mp3",
+            ) {}
+        }
 
         private fun isScored(callId: String): Boolean {
             synchronized(lock) {
@@ -1476,6 +1553,7 @@ object CNCallEngine {
                     scoredCallId = null
                     pendingIncomingCall = null
                     acceptedCallId = null
+                    callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
                 } else {
