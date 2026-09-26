@@ -487,12 +487,11 @@ def _mark_terminal_attempt(event_id: str) -> None:
 
 
 async def _deliver_terminal_event(event_id: str) -> bool:
-    """Attempt delivery of a terminal event exactly once.
+    """Attempt delivery of a terminal event once, with WS -> FCM fallback.
 
-    A durable terminal event is created once per terminal interaction.
-    Once delivery is attempted (attempt_count becomes 1), the outbox will
-    never attempt that same event again. This avoids duplicate notifications
-    and repeated retries for the same interaction.
+    The durable event is marked attempted before transport so the same event
+    cannot be emitted repeatedly. If a socket disappears between lookup and
+    send(), the exact same event falls back to one FCM delivery attempt.
     """
     db = get_db()
     row = db.execute(
@@ -514,7 +513,7 @@ async def _deliver_terminal_event(event_id: str) -> bool:
 
     target_id = str(row["target_user_id"])
 
-    # Consume the one allowed delivery attempt before touching the transport.
+    # Consume the single durable delivery attempt before touching transport.
     _mark_terminal_attempt(event_id)
 
     target_socket = connections.get(target_id)
@@ -544,10 +543,29 @@ async def _deliver_terminal_event(event_id: str) -> bool:
                 "event_id=", event_id,
                 "error=", exc,
             )
-            return False
 
-    # No live signaling socket: use the single FCM attempt instead.
-    return send_call_notification(
+            # The socket may have died between lookup and send(). Remove only
+            # this exact stale socket so a replacement connection is untouched.
+            if connections.get(target_id) is target_socket:
+                connections.pop(target_id, None)
+            try:
+                await target_socket.close()
+            except Exception:
+                pass
+
+            # Critical reliability fix: a terminal reject/cancel/hangup must
+            # still reach an offline/stale-socket peer through FCM.
+            return await send_call_notification_async(
+                target_id=target_id,
+                caller_id=str(row["source_user_id"]),
+                caller_name="مستخدم CN CALL",
+                call_id=str(row["call_id"]),
+                message_type=str(row["event_type"]),
+                event_id=str(row["event_id"]),
+            )
+
+    # No live signaling socket: FCM is the transport fallback.
+    return await send_call_notification_async(
         target_id=target_id,
         caller_id=str(row["source_user_id"]),
         caller_name="مستخدم CN CALL",
@@ -1737,6 +1755,27 @@ def send_call_notification(
         return False
 
 
+async def send_call_notification_async(
+    *,
+    target_id: str,
+    caller_id: str,
+    caller_name: str,
+    call_id: str,
+    message_type: str = "incoming_call",
+    event_id: str | None = None,
+) -> bool:
+    """Run the blocking Firebase Admin SDK send outside FastAPI's event loop."""
+    return await asyncio.to_thread(
+        send_call_notification,
+        target_id=target_id,
+        caller_id=caller_id,
+        caller_name=caller_name,
+        call_id=call_id,
+        message_type=message_type,
+        event_id=event_id,
+    )
+
+
 # ============================================================
 # WEBSOCKET / CALLS
 # ============================================================
@@ -2130,69 +2169,20 @@ async def websocket_endpoint(
 
                 target_socket = connections.get(target_id)
 
-                # A registered but offline target is recorded immediately as a
-                # missed call. The caller receives an immediate offline status
-                # instead of a 90-second ringing period.
-                if target_socket is None:
-                    created_at = int(time.time() * 1000)
-                    db = get_db()
-                    db.execute(
-                        """
-                        INSERT INTO call_records
-                        (call_id, caller_id, target_id, caller_name,
-                         created_at, expires_at, status, media_ready_users,
-                         state_version)
-                        VALUES (?, ?, ?, ?, ?, ?, 'missed', '[]', 1)
-                        """,
-                        (
-                            call_id,
-                            user_id,
-                            target_id,
-                            str(message.get("caller_name", "مستخدم CN CALL")),
-                            created_at,
-                            created_at,
-                        ),
-                    )
-                    db.commit()
-                    db.close()
-
-                    await websocket.send_json({
-                        "type": "call_started",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "from_id": user_id,
-                        "ring_expires_at": created_at,
-                        "target_online": False,
-                    })
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "offline",
-                    })
-
-                    fcm_sent = send_call_notification(
-                        target_id=target_id,
-                        caller_id=user_id,
-                        caller_name=str(
-                            message.get("caller_name", "مستخدم CN CALL")
-                        ),
-                        call_id=call_id,
-                        message_type="missed_call",
-                    )
-                    print(
-                        "[CN CALL][CALL OFFLINE] "
-                        f"call_id={call_id} from={user_id} target={target_id} "
-                        f"missed_fcm={'SENT' if fcm_sent else 'FAILED'}"
-                    )
-                    continue
-
+                # A missing WebSocket is not proof that the recipient is
+                # offline. Keep one authoritative ringing call alive and use
+                # FCM as wake-up/fallback. The caller must NOT be told
+                # "offline" here: caller_offline.mp3 is a caller-local signal
+                # emitted only by Android when the caller loses Internet.
                 ring_expires_at = message.get("ring_expires_at")
                 if not ring_expires_at:
                     ring_expires_at = int(time.time() * 1000) + 90000
+                try:
+                    ring_expires_at = int(ring_expires_at)
+                except (TypeError, ValueError):
+                    ring_expires_at = int(time.time() * 1000) + 90000
 
                 created_at = int(time.time() * 1000)
-                status = "ringing"
                 db = get_db()
                 db.execute(
                     """
@@ -2200,7 +2190,7 @@ async def websocket_endpoint(
                     (call_id, caller_id, target_id, caller_name,
                      created_at, expires_at, status, media_ready_users,
                      state_version)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, '[]', 1)
+                    VALUES (?, ?, ?, ?, ?, ?, 'ringing', '[]', 1)
                     """,
                     (
                         call_id,
@@ -2209,7 +2199,6 @@ async def websocket_endpoint(
                         str(message.get("caller_name", "مستخدم CN CALL")),
                         created_at,
                         ring_expires_at,
-                        status,
                     ),
                 )
                 db.commit()
@@ -2228,28 +2217,29 @@ async def websocket_endpoint(
                     "target_token": user_access_tokens.get(target_id),
                     "media_ready_users": set(),
                     "state_version": 1,
+                    "delivery_confirmed": False,
                 }
                 _mark_active_user(user_id, call_id, "caller")
                 _mark_active_user(target_id, call_id, "callee")
 
-                target_online = True
-
+                # This confirms server-side call creation only. It is NOT a
+                # delivery confirmation; call_delivered is the real ACK.
                 await websocket.send_json({
                     "type": "call_started",
                     "call_id": call_id,
                     "target_id": target_id,
                     "from_id": user_id,
                     "ring_expires_at": ring_expires_at,
-                    "target_online": target_online,
+                    "target_online": target_socket is not None,
                 })
 
-                print(
-                    "[CN CALL][CALL INITIAL WS ATTEMPT] "
-                    f"call_id={call_id} target={target_id} "
-                    f"socket_present={target_socket is not None}"
-                )
                 delivered = False
                 if target_socket is not None:
+                    print(
+                        "[CN CALL][CALL INITIAL WS ATTEMPT] "
+                        f"call_id={call_id} target={target_id} "
+                        "socket_present=True"
+                    )
                     try:
                         await target_socket.send_json({
                             **message,
@@ -2268,43 +2258,55 @@ async def websocket_endpoint(
                             f"call_id={call_id} target={target_id} error={exc}"
                         )
 
-                if not delivered:
-                    # A socket entry that cannot accept the invite is treated
-                    # as offline. Do not leave the caller ringing against a
-                    # dead/stale socket; persist the attempt as missed and use
-                    # the same offline voice + long-TTL missed notification.
-                    print(
-                        "[CN CALL][CALL INITIAL WS FAILED -> OFFLINE] "
-                        f"call_id={call_id} target={target_id}"
-                    )
+                        # Remove only the exact dead socket. The call remains
+                        # authoritative/ringing and can be delivered by FCM or
+                        # replayed when the user reconnects.
+                        if connections.get(target_id) is target_socket:
+                            connections.pop(target_id, None)
+                        try:
+                            await target_socket.close()
+                        except Exception:
+                            pass
 
-                    finalize_call_terminal(
-                        call_id,
-                        "missed",
-                        [],
-                    )
-
-                    await websocket.send_json({
-                        "type": "call_reject",
-                        "call_id": call_id,
-                        "target_id": target_id,
-                        "reason": "offline",
-                    })
-
-                    fcm_sent = send_call_notification(
+                if delivered:
+                    # The WS path stays primary for latency. A single FCM copy
+                    # is also sent for the same call_id as a wake-up/fallback.
+                    # Android's Telecom presentation claim makes the duplicate
+                    # transport idempotent.
+                    fcm_sent = await send_call_notification_async(
                         target_id=target_id,
                         caller_id=user_id,
                         caller_name=str(
                             message.get("caller_name", "مستخدم CN CALL")
                         ),
                         call_id=call_id,
-                        message_type="missed_call",
+                        message_type="incoming_call",
                     )
                     print(
-                        "[CN CALL][CALL INITIAL MISSED FCM "
-                        f"{'SENT' if fcm_sent else 'FAILED'}] "
-                        f"call_id={call_id} target={target_id}"
+                        "[CN CALL][PARALLEL FCM] "
+                        f"call_id={call_id} target={target_id} "
+                        f"sent={'SENT' if fcm_sent else 'FAILED'}"
                     )
+                else:
+                    # No usable live socket: FCM is the wake-up path. Even if
+                    # FCM fails, do NOT classify the target as offline. The
+                    # ringing record remains authoritative until its normal
+                    # expiry/reconciliation path resolves it.
+                    fcm_sent = await send_call_notification_async(
+                        target_id=target_id,
+                        caller_id=user_id,
+                        caller_name=str(
+                            message.get("caller_name", "مستخدم CN CALL")
+                        ),
+                        call_id=call_id,
+                        message_type="incoming_call",
+                    )
+                    print(
+                        "[CN CALL][CALL DELIVERY MODE] "
+                        f"call_id={call_id} mode=fcm "
+                        f"fcm={'SENT' if fcm_sent else 'FAILED'}"
+                    )
+
                 continue
 
             record = active_calls.get(call_id)
