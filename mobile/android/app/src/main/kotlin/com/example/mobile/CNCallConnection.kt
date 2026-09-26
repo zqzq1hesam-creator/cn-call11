@@ -374,6 +374,11 @@ class CNCallConnection(
     }
 
     override fun onDisconnect() {
+        println(
+            "[CN CALL][DIAG][CONNECTION onDisconnect] " +
+                "call_id=$callId incoming=$incoming answering=$answering " +
+                "active=$active terminal=$terminal",
+        )
         synchronized(terminalLock) {
             if (terminal || !CNCallRegistry.claimDisconnect(callId)) return
             terminal = true
@@ -382,13 +387,22 @@ class CNCallConnection(
         answering = false
         active = false
         CNCallRegistry.markTerminated(callId)
-        CNCallEngine.disconnect(callId)
+        val disconnected = CNCallEngine.disconnect(callId)
+        println(
+            "[CN CALL][DIAG][CONNECTION fail -> ENGINE disconnect] " +
+                "call_id=$callId sent=$disconnected",
+        )
         CNCallEngine.release(callId)
         setDisconnected(DisconnectCause(DisconnectCause.LOCAL))
         destroyAndRemove()
     }
 
     override fun onAbort() {
+        println(
+            "[CN CALL][DIAG][CONNECTION onAbort] " +
+                "call_id=$callId incoming=$incoming answering=$answering " +
+                "active=$active terminal=$terminal",
+        )
         onDisconnect()
     }
 
@@ -424,6 +438,11 @@ class CNCallConnection(
     }
 
     fun fail(code: Int) {
+        println(
+            "[CN CALL][DIAG][CONNECTION fail] " +
+                "call_id=$callId incoming=$incoming answering=$answering " +
+                "active=$active terminal=$terminal code=$code",
+        )
         synchronized(terminalLock) {
             if (terminal) return
             terminal = true
