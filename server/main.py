@@ -16,7 +16,7 @@ import psycopg
 from psycopg.rows import dict_row
 import shutil
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import firebase_admin
 from firebase_admin import credentials, messaging
@@ -72,6 +72,7 @@ active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
 user_access_tokens: dict[str, str] = {}
 call_expiry_task: asyncio.Task | None = None
+fcm_token_cleanup_task: asyncio.Task | None = None
 
 # Once the media leg is usable (status "connected") the signaling socket may
 # legitimately drop (network blip, app backgrounded) without ending the call,
@@ -83,6 +84,7 @@ call_expiry_task: asyncio.Task | None = None
 # gone, the call is released after this window and both users are freed.
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
+FCM_TOKEN_STALE_AFTER_DAYS = 30
 
 _UNSET = object()
 
@@ -609,6 +611,15 @@ async def deliver_pending_terminal_events(target_user_id: str | None = None) -> 
             await _deliver_terminal_event(str(row["event_id"]))
 
 
+async def _fcm_token_cleanup_loop():
+    while True:
+        try:
+            cleanup_fcm_tokens()
+        except Exception as exc:
+            print("[CN CALL][FCM CLEANUP ERROR]", exc)
+        await asyncio.sleep(3600)
+
+
 async def _terminal_outbox_loop():
     while True:
         try:
@@ -804,23 +815,28 @@ async def _call_expiry_loop():
 
 @app.on_event("startup")
 async def start_call_expiry_loop():
-    global call_expiry_task, terminal_outbox_task
+    global call_expiry_task, terminal_outbox_task, fcm_token_cleanup_task
+    cleanup_fcm_tokens()
     load_fcm_tokens()
     load_access_tokens()
     rebuild_active_calls_from_db()
     call_expiry_task = asyncio.create_task(_call_expiry_loop())
     terminal_outbox_task = asyncio.create_task(_terminal_outbox_loop())
+    fcm_token_cleanup_task = asyncio.create_task(_fcm_token_cleanup_loop())
 
 
 @app.on_event("shutdown")
 async def stop_call_expiry_loop():
-    global call_expiry_task, terminal_outbox_task
+    global call_expiry_task, terminal_outbox_task, fcm_token_cleanup_task
     if call_expiry_task is not None:
         call_expiry_task.cancel()
         call_expiry_task = None
     if terminal_outbox_task is not None:
         terminal_outbox_task.cancel()
         terminal_outbox_task = None
+    if fcm_token_cleanup_task is not None:
+        fcm_token_cleanup_task.cancel()
+        fcm_token_cleanup_task = None
 
 FCM_TOKENS: dict[str, str] = {}
 
@@ -895,6 +911,104 @@ class DatabaseHandle:
 
 def get_db():
     return DatabaseHandle()
+
+
+def _parse_fcm_updated_at(value) -> datetime | None:
+    """Parse stored UTC timestamps without deleting unparseable records."""
+    if value is None:
+        return None
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def cleanup_fcm_tokens() -> tuple[int, int]:
+    """Remove stale registrations and duplicate ownership before enforcing uniqueness.
+
+    For duplicate tokens, the newest valid row keeps ownership. This is safe for
+    the current one-token-per-user model and repairs databases created before the
+    unique-token constraint existed.
+    """
+    db = get_db()
+    try:
+        rows = db.execute(
+            """
+            SELECT user_id, token, updated_at
+            FROM fcm_tokens
+            ORDER BY updated_at DESC, user_id ASC
+            """
+        ).fetchall()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            days=FCM_TOKEN_STALE_AFTER_DAYS
+        )
+        seen_tokens: set[str] = set()
+        delete_user_ids: set[str] = set()
+        duplicate_count = 0
+        stale_count = 0
+
+        for row in rows:
+            user_id = str(row["user_id"]).strip()
+            token = str(row["token"]).strip()
+            updated_at = _parse_fcm_updated_at(row["updated_at"])
+
+            if not user_id:
+                continue
+
+            if not token:
+                delete_user_ids.add(user_id)
+                stale_count += 1
+                continue
+
+            if updated_at is not None and updated_at < cutoff:
+                delete_user_ids.add(user_id)
+                stale_count += 1
+                continue
+
+            if token in seen_tokens:
+                delete_user_ids.add(user_id)
+                duplicate_count += 1
+                continue
+
+            seen_tokens.add(token)
+
+        for user_id in delete_user_ids:
+            db.execute(
+                "DELETE FROM fcm_tokens WHERE user_id = ?",
+                (user_id,),
+            )
+
+        db.commit()
+
+        if delete_user_ids:
+            print(
+                "[CN CALL][FCM CLEANUP]",
+                "deleted=", len(delete_user_ids),
+                "duplicate=", duplicate_count,
+                "stale_or_empty=", stale_count,
+            )
+
+        return duplicate_count, stale_count
+
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def init_db():
@@ -1020,6 +1134,17 @@ def init_db():
         except Exception:
             pass
 
+    # Repair any legacy duplicate/stale registrations before enforcing the
+    # unique-token index on the active database.
+    cleanup_fcm_tokens()
+
+    db = get_db()
+    db.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fcm_tokens_token_unique
+        ON fcm_tokens (token)
+        """
+    )
     db.commit()
     db.close()
 
@@ -1364,19 +1489,51 @@ async def save_fcm_token(
     FCM_TOKENS[user_id] = token
 
     db = get_db()
-    db.execute(
-        """
-        INSERT INTO fcm_tokens (user_id, token, updated_at)
-        VALUES (?, ?, CURRENT_TIMESTAMP)
-        ON CONFLICT(user_id)
-        DO UPDATE SET
-            token=excluded.token,
-            updated_at=CURRENT_TIMESTAMP
-        """,
-        (user_id, token),
-    )
-    db.commit()
-    db.close()
+    try:
+        # A registration token identifies an app instance, so it must have one
+        # CN CALL owner. Reassigning the same token to a new login removes any
+        # previous user binding before the per-user upsert.
+        previous_users = db.execute(
+            """
+            SELECT user_id
+            FROM fcm_tokens
+            WHERE token = ?
+              AND user_id <> ?
+            """,
+            (token, user_id),
+        ).fetchall()
+
+        db.execute(
+            """
+            DELETE FROM fcm_tokens
+            WHERE token = ?
+              AND user_id <> ?
+            """,
+            (token, user_id),
+        )
+
+        db.execute(
+            """
+            INSERT INTO fcm_tokens (user_id, token, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(user_id)
+            DO UPDATE SET
+                token=excluded.token,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (user_id, token),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    for previous_user in previous_users:
+        previous_user_id = str(previous_user["user_id"]).strip()
+        if FCM_TOKENS.get(previous_user_id) == token:
+            FCM_TOKENS.pop(previous_user_id, None)
 
     return {
         "success": True,
@@ -1673,6 +1830,39 @@ async def get_missed_calls(
 # FCM NOTIFICATIONS
 # ============================================================
 
+def remove_fcm_token_if_matches(user_id: str, token: str, reason: str) -> bool:
+    """Delete only the exact token still owned by this user."""
+    db = get_db()
+    try:
+        cursor = db.execute(
+            """
+            DELETE FROM fcm_tokens
+            WHERE user_id = ?
+              AND token = ?
+            """,
+            (user_id, token),
+        )
+        db.commit()
+        removed = cursor.rowcount == 1
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    if removed and FCM_TOKENS.get(user_id) == token:
+        FCM_TOKENS.pop(user_id, None)
+
+    if removed:
+        print(
+            "[CN CALL][FCM TOKEN REMOVED]",
+            "user=", user_id,
+            "reason=", reason,
+        )
+
+    return removed
+
+
 def send_call_notification(
     target_id: str,
     caller_id: str,
@@ -1746,6 +1936,19 @@ def send_call_notification(
         print('FCM SENT:', response)
         return True
 
+    except messaging.UnregisteredError:
+        # Firebase confirms that this registration is no longer valid.
+        # Delete it only if it is still the token currently owned by target_id.
+        remove_fcm_token_if_matches(
+            target_id,
+            token,
+            "unregistered",
+        )
+        print(
+            "[CN CALL][FCM FAILED] "
+            f"call_id={call_id} target={target_id} reason=unregistered"
+        )
+        return False
     except Exception as e:
         print(f"FCM send error: {e}")
         print(
