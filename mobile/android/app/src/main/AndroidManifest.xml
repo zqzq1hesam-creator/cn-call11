@@ -1,4 +1,4 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
@@ -34,16 +34,6 @@
                 <category android:name="android.intent.category.LAUNCHER"/>
             </intent-filter>
         </activity>
-        <!-- CN CALL owns all FCM data-message delivery natively.
-             Remove library-declared messaging services so Android has one
-             deterministic MESSAGING_EVENT target. FlutterFire still provides
-             token registration/refresh through FirebaseMessaging. -->
-        <service
-            android:name="io.flutter.plugins.firebase.messaging.FlutterFirebaseMessagingService"
-            tools:node="remove" />
-        <service
-            android:name="com.google.firebase.messaging.FirebaseMessagingService"
-            tools:node="remove" />
         <service
             android:name=".CallFirebaseService"
             android:exported="false">
