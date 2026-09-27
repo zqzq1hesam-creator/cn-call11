@@ -12,7 +12,10 @@ import io.livekit.android.audio.NoAudioHandler
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.LocalVideoTrack
+import io.livekit.android.room.track.RemoteVideoTrack
 import io.livekit.android.room.track.Track
+import livekit.org.webrtc.VideoSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +56,12 @@ interface NativeLiveKitListener {
 
     /** Raised on a LiveKit/transport error. */
     fun onError(t: Throwable)
+
+    /** Raised when the local camera track changes. */
+    fun onLocalVideoTrackChanged(track: LocalVideoTrack?) {}
+
+    /** Raised when the remote camera track changes. */
+    fun onRemoteVideoTrackChanged(track: RemoteVideoTrack?) {}
 }
 
 enum class NewNativeLiveKitState {
@@ -99,6 +108,18 @@ object NativeLiveKit {
     /** The Room owned by the current generation, if any. */
     @Volatile
     private var room: Room? = null
+
+    @Volatile
+    private var localVideoTrack: LocalVideoTrack? = null
+
+    @Volatile
+    private var remoteVideoTrack: RemoteVideoTrack? = null
+
+    @Volatile
+    private var localVideoRenderer: VideoSink? = null
+
+    @Volatile
+    private var remoteVideoRenderer: VideoSink? = null
 
     private var eventCollectJob: Job? = null
 
@@ -218,6 +239,132 @@ object NativeLiveKit {
             }
         }
         return true
+    }
+
+    /**
+     * Enables/disables the local camera and publishes the camera track.
+     *
+     * Camera permission is intentionally checked by Android before this call;
+     * LiveKit owns camera capture and publication after Telecom requests video.
+     */
+    fun setCameraEnabled(
+        enabled: Boolean,
+        onComplete: ((Throwable?) -> Unit)? = null,
+    ) {
+        val target = room
+        val attempt = generation
+
+        if (target == null || state != NewNativeLiveKitState.CONNECTED) {
+            onComplete?.invoke(
+                IllegalStateException("LiveKit room is not connected"),
+            )
+            return
+        }
+
+        scope.launch {
+            if (attempt != generation ||
+                state != NewNativeLiveKitState.CONNECTED
+            ) {
+                onComplete?.invoke(
+                    IllegalStateException("LiveKit call became stale"),
+                )
+                return@launch
+            }
+
+            try {
+                val changed = target.localParticipant.setCameraEnabled(enabled)
+                if (!changed) {
+                    throw IllegalStateException(
+                        "LiveKit camera enable failed",
+                    )
+                }
+
+                if (attempt != generation ||
+                    state != NewNativeLiveKitState.CONNECTED
+                ) {
+                    onComplete?.invoke(
+                        IllegalStateException("LiveKit call became stale"),
+                    )
+                    return@launch
+                }
+
+                val publication =
+                    target.localParticipant.getTrackPublication(
+                        Track.Source.CAMERA,
+                    )
+                val track =
+                    publication?.track as? LocalVideoTrack
+                if (enabled && track == null) {
+                    throw IllegalStateException(
+                        "LiveKit camera track was not published",
+                    )
+                }
+
+                updateLocalVideoTrack(if (enabled) track else null)
+                onComplete?.invoke(null)
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                onComplete?.invoke(t)
+            }
+        }
+    }
+
+    fun setLocalVideoRenderer(renderer: VideoSink?) {
+        val oldTrack: LocalVideoTrack?
+        val oldRenderer: VideoSink?
+        val newTrack: LocalVideoTrack?
+        synchronized(lock) {
+            oldTrack = localVideoTrack
+            oldRenderer = localVideoRenderer
+            localVideoRenderer = renderer
+            newTrack = localVideoTrack
+        }
+        if (oldTrack != null && oldRenderer != null) {
+            oldTrack.removeRenderer(oldRenderer)
+        }
+        if (newTrack != null && renderer != null) {
+            newTrack.addRenderer(renderer)
+        }
+    }
+
+    fun setRemoteVideoRenderer(renderer: VideoSink?) {
+        val oldTrack: RemoteVideoTrack?
+        val oldRenderer: VideoSink?
+        val newTrack: RemoteVideoTrack?
+        synchronized(lock) {
+            oldTrack = remoteVideoTrack
+            oldRenderer = remoteVideoRenderer
+            remoteVideoRenderer = renderer
+            newTrack = remoteVideoTrack
+        }
+        if (oldTrack != null && oldRenderer != null) {
+            oldTrack.removeRenderer(oldRenderer)
+        }
+        if (newTrack != null && renderer != null) {
+            newTrack.addRenderer(renderer)
+        }
+    }
+
+    fun switchCamera(
+        cameraId: String,
+        onComplete: ((Throwable?) -> Unit)? = null,
+    ) {
+        val track = localVideoTrack
+        if (track == null || cameraId.isBlank()) {
+            onComplete?.invoke(
+                IllegalStateException("Local camera track is not active"),
+            )
+            return
+        }
+        scope.launch {
+            try {
+                track.setDeviceId(cameraId)
+                onComplete?.invoke(null)
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                onComplete?.invoke(t)
+            }
+        }
     }
 
     /**
@@ -430,7 +577,65 @@ object NativeLiveKit {
         }
     }
 
+    private fun clearVideoTracks() {
+        val localTrack: LocalVideoTrack?
+        val remoteTrack: RemoteVideoTrack?
+        val localRenderer: VideoSink?
+        val remoteRenderer: VideoSink?
+        synchronized(lock) {
+            localTrack = localVideoTrack
+            remoteTrack = remoteVideoTrack
+            localRenderer = localVideoRenderer
+            remoteRenderer = remoteVideoRenderer
+            localVideoTrack = null
+            remoteVideoTrack = null
+        }
+        if (localTrack != null && localRenderer != null) {
+            localTrack.removeRenderer(localRenderer)
+        }
+        if (remoteTrack != null && remoteRenderer != null) {
+            remoteTrack.removeRenderer(remoteRenderer)
+        }
+        listener?.onLocalVideoTrackChanged(null)
+        listener?.onRemoteVideoTrackChanged(null)
+    }
+
+    private fun updateLocalVideoTrack(track: LocalVideoTrack?) {
+        val oldTrack: LocalVideoTrack?
+        val renderer: VideoSink?
+        synchronized(lock) {
+            oldTrack = localVideoTrack
+            localVideoTrack = track
+            renderer = localVideoRenderer
+        }
+        if (oldTrack != null && renderer != null) {
+            oldTrack.removeRenderer(renderer)
+        }
+        if (track != null && renderer != null) {
+            track.addRenderer(renderer)
+        }
+        listener?.onLocalVideoTrackChanged(track)
+    }
+
+    private fun updateRemoteVideoTrack(track: RemoteVideoTrack?) {
+        val oldTrack: RemoteVideoTrack?
+        val renderer: VideoSink?
+        synchronized(lock) {
+            oldTrack = remoteVideoTrack
+            remoteVideoTrack = track
+            renderer = remoteVideoRenderer
+        }
+        if (oldTrack != null && oldTrack !== track && renderer != null) {
+            oldTrack.removeRenderer(renderer)
+        }
+        if (track != null && renderer != null) {
+            track.addRenderer(renderer)
+        }
+        listener?.onRemoteVideoTrackChanged(track)
+    }
+
     private fun tearDownLocked() {
+        clearVideoTracks()
         eventCollectJob?.cancel()
         eventCollectJob = null
         val old = room
@@ -456,15 +661,36 @@ object NativeLiveKit {
                     if (attempt != generation) {
                         return@collect
                     }
-                    if (event is RoomEvent.Disconnected) {
-                        // Only the disconnect edge is needed to keep the
-                        // transport state in sync. FailedToConnect/Connected/
-                        // Reconnecting/Reconnected and participant/track
-                        // events are deliberately ignored here.
-                        if (state != NewNativeLiveKitState.DISCONNECTED) {
-                            state = NewNativeLiveKitState.DISCONNECTED
-                            notifyDisconnected()
+                    when (event) {
+                        is RoomEvent.TrackSubscribed -> {
+                            val track = event.track as? RemoteVideoTrack
+                            if (track != null &&
+                                event.publication.source == Track.Source.CAMERA
+                            ) {
+                                updateRemoteVideoTrack(track)
+                            }
                         }
+
+                        is RoomEvent.TrackUnsubscribed -> {
+                            val track = event.track as? RemoteVideoTrack
+                            if (track != null && track === remoteVideoTrack) {
+                                updateRemoteVideoTrack(null)
+                            }
+                        }
+
+                        is RoomEvent.Disconnected -> {
+                            // Only the disconnect edge is needed to keep the
+                            // transport state in sync. FailedToConnect/Connected/
+                            // Reconnecting/Reconnected and unrelated track
+                            // events do not change call state.
+                            clearVideoTracks()
+                            if (state != NewNativeLiveKitState.DISCONNECTED) {
+                                state = NewNativeLiveKitState.DISCONNECTED
+                                notifyDisconnected()
+                            }
+                        }
+
+                        else -> {}
                     }
                 }
             } catch (t: CancellationException) {
