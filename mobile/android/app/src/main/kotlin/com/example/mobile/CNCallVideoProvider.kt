@@ -6,7 +6,6 @@ import android.os.Looper
 import android.telecom.Connection
 import android.telecom.VideoProfile
 import android.view.Surface
-import java.util.concurrent.CountDownLatch
 import livekit.org.webrtc.EglBase
 import livekit.org.webrtc.GlRectDrawer
 import livekit.org.webrtc.SurfaceEglRenderer
@@ -138,7 +137,6 @@ class CNCallVideoProvider(
     }
 
     fun release() {
-        val latch = CountDownLatch(1)
         mainHandler.post {
             val oldPreview: SurfaceEglRenderer?
             val oldDisplay: SurfaceEglRenderer?
@@ -156,12 +154,6 @@ class CNCallVideoProvider(
                 listener.onDisplayRendererChanged(null)
                 releaseRenderer(oldDisplay)
             }
-            latch.countDown()
-        }
-        try {
-            latch.await()
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
         }
     }
 
