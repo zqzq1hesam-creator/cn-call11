@@ -728,19 +728,16 @@ def _mark_terminal_attempt(event_id: str) -> None:
 
 
 async def _deliver_terminal_event(event_id: str) -> bool:
-    """Attempt delivery of a terminal event once, with WS -> FCM fallback.
-
-    The durable event is marked attempted before transport so the same event
-    cannot be emitted repeatedly. If a socket disappears between lookup and
-    send(), the exact same event falls back to one FCM delivery attempt.
-    """
+    """Attempt one durable terminal delivery over WS, then FCM."""
     db = get_db()
     row = db.execute(
         """
-        SELECT event_id, call_id, source_user_id, target_user_id,
-               event_type, created_at, attempt_count
-        FROM durable_terminal_events
-        WHERE event_id = ? AND acknowledged_at IS NULL
+        SELECT d.event_id, d.call_id, d.source_user_id, d.target_user_id,
+               d.event_type, d.created_at, d.attempt_count,
+               c.status AS call_status
+        FROM durable_terminal_events d
+        LEFT JOIN call_records c ON c.call_id = d.call_id
+        WHERE d.event_id = ? AND d.acknowledged_at IS NULL
         """,
         (event_id,),
     ).fetchone()
@@ -753,12 +750,16 @@ async def _deliver_terminal_event(event_id: str) -> bool:
         return False
 
     target_id = str(row["target_user_id"])
+    terminal_reason = None
+    if (
+        str(row["event_type"]) == "call_reject"
+        and str(row["call_status"] or "") == "missed"
+    ):
+        terminal_reason = "offline"
 
-    # Consume the single durable delivery attempt before touching transport.
     _mark_terminal_attempt(event_id)
 
     target_socket = connections.get(target_id)
-
     if target_socket is not None:
         payload = {
             "type": str(row["event_type"]),
@@ -766,8 +767,12 @@ async def _deliver_terminal_event(event_id: str) -> bool:
             "target_id": target_id,
             "from_id": str(row["source_user_id"]),
             "event_id": str(row["event_id"]),
+            **(
+                {"reason": terminal_reason}
+                if terminal_reason
+                else {}
+            ),
         }
-
         try:
             await target_socket.send_json(payload)
             print(
@@ -775,6 +780,7 @@ async def _deliver_terminal_event(event_id: str) -> bool:
                 row["event_type"],
                 "call_id=", row["call_id"],
                 "event_id=", event_id,
+                "reason=", terminal_reason or "(none)",
             )
             return True
         except Exception as exc:
@@ -784,9 +790,6 @@ async def _deliver_terminal_event(event_id: str) -> bool:
                 "event_id=", event_id,
                 "error=", exc,
             )
-
-            # The socket may have died between lookup and send(). Remove only
-            # this exact stale socket so a replacement connection is untouched.
             if connections.get(target_id) is target_socket:
                 connections.pop(target_id, None)
             try:
@@ -794,18 +797,6 @@ async def _deliver_terminal_event(event_id: str) -> bool:
             except Exception:
                 pass
 
-            # Critical reliability fix: a terminal reject/cancel/hangup must
-            # still reach an offline/stale-socket peer through FCM.
-            return await send_call_notification_async(
-                target_id=target_id,
-                caller_id=str(row["source_user_id"]),
-                caller_name="مستخدم CN CALL",
-                call_id=str(row["call_id"]),
-                message_type=str(row["event_type"]),
-                event_id=str(row["event_id"]),
-            )
-
-    # No live signaling socket: FCM is the transport fallback.
     return await send_call_notification_async(
         target_id=target_id,
         caller_id=str(row["source_user_id"]),
@@ -813,7 +804,9 @@ async def _deliver_terminal_event(event_id: str) -> bool:
         call_id=str(row["call_id"]),
         message_type=str(row["event_type"]),
         event_id=str(row["event_id"]),
+        reason=terminal_reason,
     )
+
 
 
 async def deliver_pending_terminal_events(target_user_id: str | None = None) -> None:
