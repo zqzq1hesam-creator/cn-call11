@@ -23,6 +23,8 @@ class CallSession {
   String? userId;
   String? displayName;
   String? accessToken;
+  bool isDeveloper = false;
+  String? developerBadge;
 
   bool get loggedIn => userId != null;
 
@@ -97,15 +99,27 @@ class CallSession {
     required String id,
     required String name,
     required String token,
+    bool isDeveloper = false,
+    String? developerBadge,
   }) async {
     userId = id;
     displayName = name;
     accessToken = token;
+    this.isDeveloper = isDeveloper;
+    final normalizedBadge = developerBadge?.trim();
+    this.developerBadge =
+        normalizedBadge?.isNotEmpty == true ? normalizedBadge : null;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('cn_call_user_id', id);
     await prefs.setString('cn_call_display_name', name);
     await prefs.setString('cn_call_access_token', token);
+    await prefs.setBool('cn_call_is_developer', this.isDeveloper);
+    if (this.developerBadge != null) {
+      await prefs.setString('cn_call_developer_badge', this.developerBadge!);
+    } else {
+      await prefs.remove('cn_call_developer_badge');
+    }
 
     try {
       await const MethodChannel('cn_call/call').invokeMethod('syncCredentials');
@@ -188,11 +202,15 @@ class CallSession {
     userId = null;
     displayName = null;
     accessToken = null;
+    isDeveloper = false;
+    developerBadge = null;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('cn_call_user_id');
     await prefs.remove('cn_call_display_name');
     await prefs.remove('cn_call_access_token');
+    await prefs.remove('cn_call_is_developer');
+    await prefs.remove('cn_call_developer_badge');
 
     onSessionInvalidated?.call();
   }
@@ -203,6 +221,8 @@ class CallSession {
     final id = prefs.getString('cn_call_user_id');
     final name = prefs.getString('cn_call_display_name');
     final token = prefs.getString('cn_call_access_token');
+    final storedIsDeveloper = prefs.getBool('cn_call_is_developer') ?? false;
+    final storedDeveloperBadge = prefs.getString('cn_call_developer_badge');
 
     if (id == null ||
         id.isEmpty ||
@@ -216,6 +236,10 @@ class CallSession {
     userId = id;
     displayName = name;
     accessToken = token;
+    isDeveloper = storedIsDeveloper;
+    final normalizedBadge = storedDeveloperBadge?.trim();
+    developerBadge =
+        normalizedBadge?.isNotEmpty == true ? normalizedBadge : null;
 
     try {
       await const MethodChannel('cn_call/call').invokeMethod('syncCredentials');
@@ -232,6 +256,9 @@ class CallSession {
     final id = prefs.getString('cn_call_user_id')?.trim();
     final name = prefs.getString('cn_call_display_name')?.trim();
     final token = prefs.getString('cn_call_access_token')?.trim();
+    final storedIsDeveloper = prefs.getBool('cn_call_is_developer') ?? false;
+    final storedDeveloperBadge =
+        prefs.getString('cn_call_developer_badge')?.trim();
 
     if (id == null ||
         id.isEmpty ||
@@ -245,6 +272,10 @@ class CallSession {
     userId = id;
     displayName = name;
     accessToken = token;
+    isDeveloper = storedIsDeveloper;
+    developerBadge = storedDeveloperBadge?.isNotEmpty == true
+        ? storedDeveloperBadge
+        : null;
     return true;
   }
 
@@ -283,11 +314,15 @@ class CallSession {
     userId = null;
     displayName = null;
     accessToken = null;
+    isDeveloper = false;
+    developerBadge = null;
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove('cn_call_user_id');
     await prefs.remove('cn_call_display_name');
     await prefs.remove('cn_call_access_token');
+    await prefs.remove('cn_call_is_developer');
+    await prefs.remove('cn_call_developer_badge');
     return true;
   }
 
