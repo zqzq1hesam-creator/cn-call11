@@ -310,31 +310,18 @@ async def _finalize_target_offline(call_id: str, source: str) -> bool:
     target_id = str(record["target_id"])
     caller_name = str(record.get("caller_name", "مستخدم CN CALL"))
 
-    finalized = finalize_call_terminal(
+    event_ids = finalize_call_terminal(
         call_id,
         "missed",
-        [],
+        [
+            (caller_id, "call_reject", target_id),
+        ],
     )
-    if not finalized:
+    if not event_ids:
         return False
 
-    caller_socket = connections.get(caller_id)
-    caller_notified = False
-    if caller_socket is not None:
-        try:
-            await caller_socket.send_json({
-                "type": "call_reject",
-                "call_id": call_id,
-                "target_id": caller_id,
-                "from_id": target_id,
-                "reason": "offline",
-            })
-            caller_notified = True
-        except Exception as exc:
-            print(
-                "[CN CALL][TARGET OFFLINE] caller notification failed "
-                f"call_id={call_id} caller={caller_id} error={exc}",
-            )
+    for event_id in event_ids:
+        await _deliver_terminal_event(event_id)
 
     await send_call_notification_async(
         target_id=target_id,
@@ -350,7 +337,7 @@ async def _finalize_target_offline(call_id: str, source: str) -> bool:
         "caller=", caller_id,
         "target=", target_id,
         "source=", source,
-        "caller_notified=", caller_notified,
+        "terminal_event_ids=", event_ids,
     )
     return True
 
