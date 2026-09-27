@@ -2,7 +2,7 @@ name: CN CALL Android Universal Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, feature/telecom-video]
   workflow_dispatch:
 
 jobs:
