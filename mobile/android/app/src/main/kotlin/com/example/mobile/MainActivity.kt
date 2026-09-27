@@ -307,6 +307,12 @@ class MainActivity : FlutterActivity() {
                             ) {
                                 add(android.Manifest.permission.RECORD_AUDIO)
                             }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                                checkSelfPermission(android.Manifest.permission.CAMERA) !=
+                                    PackageManager.PERMISSION_GRANTED
+                            ) {
+                                add(android.Manifest.permission.CAMERA)
+                            }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                                 checkSelfPermission(android.Manifest.permission.READ_PHONE_NUMBERS) !=
                                     PackageManager.PERMISSION_GRANTED
@@ -437,10 +443,13 @@ class MainActivity : FlutterActivity() {
         val hasAudio = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
+        val hasCamera = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
         val hasPhoneNumbers = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
             checkSelfPermission(android.Manifest.permission.READ_PHONE_NUMBERS) ==
                 PackageManager.PERMISSION_GRANTED
-        return hasAudio && hasPhoneNumbers
+        return hasAudio && hasCamera && hasPhoneNumbers
     }
 
     private fun requestNextStartupPermission() {
