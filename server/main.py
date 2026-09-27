@@ -10,6 +10,7 @@ import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 import psycopg
@@ -85,13 +86,16 @@ fcm_token_cleanup_task: asyncio.Task | None = None
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
 FCM_TOKEN_STALE_AFTER_DAYS = 30
-FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS = 5_000
+
+# Presence is a short, server-observed lease. It is refreshed by the native
+# signaling client only while its WebSocket is connected and Android reports
+# a validated network. A lease proves recent reachability, not call delivery.
+PRESENCE_LEASE_MS = 30_000
 
 _UNSET = object()
 
 terminal_outbox_task: asyncio.Task | None = None
 terminal_outbox_lock = asyncio.Lock()
-fcm_delivery_watchdog_tasks: dict[str, asyncio.Task] = {}
 
 
 def _mark_active_user(user_id: str, call_id: str, role: str) -> None:
@@ -118,6 +122,169 @@ def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
         "reason=",
         reason,
     )
+
+
+def _record_presence_lease(user_id: str, network_validated: bool) -> None:
+    user_id = str(user_id).strip()
+    if not user_id:
+        return
+
+    now = int(time.time() * 1000)
+    lease_expires_at = now + PRESENCE_LEASE_MS
+    db = get_db()
+    try:
+        db.execute(
+            """
+            INSERT INTO presence_leases
+                (user_id, last_seen_at, lease_expires_at, network_validated)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (user_id) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                lease_expires_at = excluded.lease_expires_at,
+                network_validated = excluded.network_validated
+            """,
+            (
+                user_id,
+                now,
+                lease_expires_at,
+                1 if network_validated else 0,
+            ),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _get_presence_lease(user_id: str) -> dict[str, object] | None:
+    user_id = str(user_id).strip()
+    if not user_id:
+        return None
+
+    db = get_db()
+    try:
+        row = db.execute(
+            """
+            SELECT user_id, last_seen_at, lease_expires_at, network_validated
+            FROM presence_leases
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
+    finally:
+        db.close()
+
+    if row is None:
+        return None
+
+    return {
+        "user_id": str(row["user_id"]),
+        "last_seen_at": int(row["last_seen_at"]),
+        "lease_expires_at": int(row["lease_expires_at"]),
+        "network_validated": bool(row["network_validated"]),
+    }
+
+
+def _presence_is_fresh(user_id: str) -> bool:
+    lease = _get_presence_lease(user_id)
+    if lease is None:
+        return False
+
+    return (
+        bool(lease["network_validated"])
+        and int(lease["lease_expires_at"]) > int(time.time() * 1000)
+    )
+
+
+async def _record_reachability_response(
+    user_id: str,
+    call_id: str,
+    challenge_id: str,
+    nonce: str,
+    network_validated: bool,
+) -> tuple[bool, str]:
+    user_id = str(user_id).strip()
+    call_id = str(call_id).strip()
+    challenge_id = str(challenge_id).strip()
+    nonce = str(nonce).strip()
+
+    if not user_id or not call_id or not challenge_id or not nonce:
+        return False, "invalid_request"
+
+    record = active_calls.get(call_id)
+    if record is None:
+        return False, "unknown_or_ended_call"
+
+    if user_id != str(record["target_id"]):
+        return False, "sender_not_call_owner"
+
+    expected_challenge = str(record.get("reachability_challenge_id") or "")
+    expected_nonce = str(record.get("reachability_nonce") or "")
+
+    if not expected_challenge or not expected_nonce:
+        return False, "challenge_unavailable"
+
+    if not hmac.compare_digest(challenge_id, expected_challenge):
+        return False, "invalid_challenge"
+
+    if not hmac.compare_digest(nonce, expected_nonce):
+        return False, "invalid_challenge"
+
+    if str(record["status"]) != "ringing":
+        return False, "unknown_or_ended_call"
+
+    if int(record["ring_expires_at"]) <= int(time.time() * 1000):
+        return False, "challenge_expired"
+
+    if not network_validated:
+        return False, "network_not_validated"
+
+    now = int(time.time() * 1000)
+    db = get_db()
+    try:
+        db.execute(
+            """
+            UPDATE call_records
+            SET reachability_proven_at = ?
+            WHERE call_id = ?
+              AND target_id = ?
+              AND status = 'ringing'
+            """,
+            (now, call_id, user_id),
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    record = active_calls.get(call_id)
+    if record is not None:
+        record["reachability_proven_at"] = now
+
+    caller_id = str(record["caller_id"])
+    caller_socket = connections.get(caller_id)
+    if caller_socket is not None:
+        try:
+            await caller_socket.send_json({
+                "type": "reachability_proven",
+                "call_id": call_id,
+                "target_id": caller_id,
+                "from_id": user_id,
+                "network_validated": True,
+            })
+        except Exception:
+            pass
+
+    print(
+        "[CN CALL][REACHABILITY PROVEN]",
+        "call_id=", call_id,
+        "target=", user_id,
+    )
+    return True, "proven"
 
 
 def _ready_users_to_json(users) -> str:
@@ -448,14 +615,6 @@ def finalize_call_terminal(
     if record is None:
         return event_ids
 
-    watchdog = fcm_delivery_watchdog_tasks.pop(call_id, None)
-    if (
-        watchdog is not None
-        and watchdog is not asyncio.current_task()
-        and not watchdog.done()
-    ):
-        watchdog.cancel()
-
     record["status"] = str(new_status)
     record["negotiation_expires_at"] = None
     record["connection_expires_at"] = None
@@ -745,10 +904,6 @@ async def _acknowledge_call_delivery(
         record["delivery_confirmed_at"] = confirmed_at
         record["delivery_deadline_at"] = None
 
-    watchdog = fcm_delivery_watchdog_tasks.pop(call_id, None)
-    if watchdog is not None and not watchdog.done():
-        watchdog.cancel()
-
     if not already_confirmed:
         print(
             "[CN CALL][CALL DELIVERED HTTPS ACK]",
@@ -780,92 +935,6 @@ async def _acknowledge_call_delivery(
 
     return True, "already_confirmed" if already_confirmed else "confirmed"
 
-
-async def _fcm_delivery_watchdog(call_id: str, deadline_at: int) -> None:
-    """Timeout only an FCM-fallback call that never produced delivery proof."""
-    try:
-        delay_ms = max(0, int(deadline_at) - int(time.time() * 1000))
-        await asyncio.sleep(delay_ms / 1000)
-
-        record = active_calls.get(call_id)
-        if record is None or str(record.get("status")) != "ringing":
-            return
-
-        db = get_db()
-        row = db.execute(
-            """
-            SELECT status, delivery_confirmed_at, delivery_deadline_at
-            FROM call_records
-            WHERE call_id = ?
-            """,
-            (call_id,),
-        ).fetchone()
-        db.close()
-
-        if row is None or str(row["status"]) != "ringing":
-            return
-        if row["delivery_confirmed_at"] is not None:
-            return
-        if row["delivery_deadline_at"] is None:
-            return
-
-        caller_id = str(record["caller_id"])
-        target_id = str(record["target_id"])
-        print(
-            "[CN CALL][FCM DELIVERY TIMEOUT]",
-            "call_id=", call_id,
-            "caller=", caller_id,
-            "target=", target_id,
-            "timeout_ms=", FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS,
-        )
-
-        finalize_call_terminal(
-            call_id,
-            "missed",
-            [(caller_id, "call_cancelled", target_id)],
-        )
-
-        caller_socket = connections.get(caller_id)
-        if caller_socket is not None:
-            try:
-                await caller_socket.send_json({
-                    "type": "call_reject",
-                    "call_id": call_id,
-                    "target_id": target_id,
-                    "from_id": target_id,
-                    "reason": "offline",
-                })
-                print("[CN CALL][FCM DELIVERY TIMEOUT] caller notified via WS", "call_id=", call_id)
-                return
-            except Exception as exc:
-                print("[CN CALL][FCM DELIVERY TIMEOUT] caller WS failed", "call_id=", call_id, "error=", exc)
-
-        await send_call_notification_async(
-            target_id=caller_id,
-            caller_id=target_id,
-            caller_name="مستخدم CN CALL",
-            call_id=call_id,
-            message_type="call_reject",
-            reason="offline",
-        )
-        print("[CN CALL][FCM DELIVERY TIMEOUT] caller notified via FCM", "call_id=", call_id)
-    except asyncio.CancelledError:
-        raise
-    finally:
-        current = asyncio.current_task()
-        if fcm_delivery_watchdog_tasks.get(call_id) is current:
-            fcm_delivery_watchdog_tasks.pop(call_id, None)
-
-
-def _start_fcm_delivery_watchdog(call_id: str, deadline_at: int | None = None) -> None:
-    existing = fcm_delivery_watchdog_tasks.get(call_id)
-    if existing is not None and not existing.done():
-        existing.cancel()
-    if deadline_at is None:
-        deadline_at = int(time.time() * 1000) + FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS
-    fcm_delivery_watchdog_tasks[call_id] = asyncio.create_task(
-        _fcm_delivery_watchdog(call_id, int(deadline_at))
-    )
 
 async def release_calls_for_user(user_id: str, token: str | None = None):
     call_ids = [
@@ -1020,18 +1089,6 @@ async def start_call_expiry_loop():
     load_fcm_tokens()
     load_access_tokens()
     rebuild_active_calls_from_db()
-
-    for record in active_calls.values():
-        deadline_at = record.get("delivery_deadline_at")
-        if (
-            str(record.get("status")) == "ringing"
-            and deadline_at is not None
-            and not bool(record.get("delivery_confirmed"))
-        ):
-            _start_fcm_delivery_watchdog(
-                str(record["call_id"]),
-                int(deadline_at),
-            )
 
     call_expiry_task = asyncio.create_task(_call_expiry_loop())
     terminal_outbox_task = asyncio.create_task(_terminal_outbox_loop())
@@ -1274,7 +1331,19 @@ def init_db():
             media_ready_users TEXT NOT NULL DEFAULT '[]',
             delivery_confirmed_at BIGINT,
             delivery_deadline_at BIGINT,
+            reachability_proven_at BIGINT,
             state_version INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS presence_leases (
+            user_id TEXT PRIMARY KEY,
+            last_seen_at BIGINT NOT NULL,
+            lease_expires_at BIGINT NOT NULL,
+            network_validated INTEGER NOT NULL DEFAULT 0
         )
         """
     )
@@ -1321,6 +1390,7 @@ def init_db():
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed_at BIGINT",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_deadline_at BIGINT",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS reachability_proven_at BIGINT",
             "ALTER TABLE call_records ALTER COLUMN delivery_confirmed_at TYPE BIGINT",
             "ALTER TABLE call_records ALTER COLUMN delivery_deadline_at TYPE BIGINT",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
@@ -1350,6 +1420,10 @@ def init_db():
             pass
         try:
             db.execute("ALTER TABLE call_records ADD COLUMN delivery_deadline_at INTEGER")
+        except Exception:
+            pass
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN reachability_proven_at INTEGER")
         except Exception:
             pass
         try:
@@ -1400,7 +1474,8 @@ def rebuild_active_calls_from_db():
             SELECT call_id, caller_id, target_id, caller_name, created_at,
                    expires_at, status, negotiation_expires_at,
                    connection_expires_at, media_ready_users,
-                   delivery_confirmed_at, delivery_deadline_at, state_version
+                   delivery_confirmed_at, delivery_deadline_at,
+                   reachability_proven_at, state_version
             FROM call_records
             WHERE status IN ('ringing', 'accepted', 'negotiating', 'connected')
             """
@@ -1527,6 +1602,7 @@ def rebuild_active_calls_from_db():
                 "delivery_confirmed": row["delivery_confirmed_at"] is not None,
                 "delivery_confirmed_at": row["delivery_confirmed_at"],
                 "delivery_deadline_at": row["delivery_deadline_at"],
+                "reachability_proven_at": row["reachability_proven_at"],
                 "state_version": current_version,
             })
             restored += 1
@@ -2111,6 +2187,8 @@ def send_call_notification(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    reachability_challenge_id: str | None = None,
+    reachability_nonce: str | None = None,
 ) -> bool:
     token = FCM_TOKENS.get(target_id)
 
@@ -2155,6 +2233,16 @@ def send_call_notification(
                 **(
                     {"event_id": event_id}
                     if event_id
+                    else {}
+                ),
+                **(
+                    {
+                        "reachability_challenge_id": reachability_challenge_id,
+                        "reachability_nonce": reachability_nonce,
+                    }
+                    if message_type == "incoming_call"
+                    and reachability_challenge_id
+                    and reachability_nonce
                     else {}
                 ),
             },
@@ -2207,6 +2295,8 @@ async def send_call_notification_async(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    reachability_challenge_id: str | None = None,
+    reachability_nonce: str | None = None,
 ) -> bool:
     """Run the blocking Firebase Admin SDK send outside FastAPI's event loop."""
     return await asyncio.to_thread(
@@ -2217,6 +2307,8 @@ async def send_call_notification_async(
         call_id=call_id,
         message_type=message_type,
         event_id=event_id,
+        reachability_challenge_id=reachability_challenge_id,
+        reachability_nonce=reachability_nonce,
     )
 
 
@@ -2335,6 +2427,36 @@ def livekit_token(
     }
 
 
+@app.post("/calls/{call_id}/reachability")
+async def call_reachability_http(
+    call_id: str,
+    request: dict,
+    authorization: str | None = Header(default=None),
+):
+    user_id = authenticated_user(authorization)
+    if user_id is None:
+        raise HTTPException(status_code=401, detail="invalid session")
+
+    proven, reason = await _record_reachability_response(
+        user_id=user_id,
+        call_id=call_id,
+        challenge_id=str(request.get("challenge_id", "")),
+        nonce=str(request.get("nonce", "")),
+        network_validated=bool(request.get("network_validated", False)),
+    )
+    if not proven:
+        raise HTTPException(
+            status_code=403 if reason == "sender_not_call_owner" else 409,
+            detail=reason,
+        )
+
+    return {
+        "success": True,
+        "call_id": call_id.strip(),
+        "reachability_proven": True,
+    }
+
+
 @app.post("/calls/{call_id}/delivered")
 async def call_delivered_http(
     call_id: str,
@@ -2416,6 +2538,8 @@ async def websocket_endpoint(
                         "from_id": caller_id,
                         "caller_name": str(rec.get("caller_name", "مستخدم CN CALL")),
                         "ring_expires_at": rec.get("ring_expires_at"),
+                        "reachability_challenge_id": rec.get("reachability_challenge_id", ""),
+                        "reachability_nonce": rec.get("reachability_nonce", ""),
                     })
                 elif (
                     status == "ringing"
@@ -2512,6 +2636,37 @@ async def websocket_endpoint(
             print("[CN CALL][CALL MESSAGE] type=", message_type, "call_id=", call_id, "from=", user_id, "target=", target_id)
 
             await expire_active_calls()
+
+            if message_type == "presence_heartbeat":
+                network_validated = (
+                    str(message.get("network_validated", "")).strip().lower() == "true"
+                )
+                _record_presence_lease(user_id, network_validated)
+                await websocket.send_json({
+                    "type": "presence_ack",
+                    "user_id": user_id,
+                    "network_validated": network_validated,
+                })
+                continue
+
+            if message_type == "reachability_response":
+                proof_ok, proof_reason = await _record_reachability_response(
+                    user_id=user_id,
+                    call_id=call_id,
+                    challenge_id=str(message.get("reachability_challenge_id", "")),
+                    nonce=str(message.get("reachability_nonce", "")),
+                    network_validated=(
+                        str(message.get("network_validated", "")).strip().lower() == "true"
+                    ),
+                )
+                if not proof_ok:
+                    await websocket.send_json({
+                        "type": "signaling_rejected",
+                        "call_id": call_id,
+                        "message_type": message_type,
+                        "reason": proof_reason,
+                    })
+                continue
 
             if message_type == "terminal_ack":
                 event_id = str(message.get("event_id", "")).strip()
@@ -2660,6 +2815,10 @@ async def websocket_endpoint(
                 except (TypeError, ValueError):
                     ring_expires_at = int(time.time() * 1000) + 90000
 
+                reachability_challenge_id = uuid.uuid4().hex
+                reachability_nonce = secrets.token_urlsafe(24)
+                target_reachability_proven = _presence_is_fresh(target_id)
+
                 created_at = int(time.time() * 1000)
                 db = get_db()
                 db.execute(
@@ -2667,8 +2826,9 @@ async def websocket_endpoint(
                     INSERT INTO call_records
                     (call_id, caller_id, target_id, caller_name,
                      created_at, expires_at, status, media_ready_users,
-                     delivery_confirmed_at, delivery_deadline_at, state_version)
-                    VALUES (?, ?, ?, ?, ?, ?, 'ringing', '[]', NULL, NULL, 1)
+                     delivery_confirmed_at, delivery_deadline_at,
+                     reachability_proven_at, state_version)
+                    VALUES (?, ?, ?, ?, ?, ?, 'ringing', '[]', NULL, NULL, NULL, 1)
                     """,
                     (
                         call_id,
@@ -2698,6 +2858,9 @@ async def websocket_endpoint(
                     "delivery_confirmed": False,
                     "delivery_confirmed_at": None,
                     "delivery_deadline_at": None,
+                    "reachability_challenge_id": reachability_challenge_id,
+                    "reachability_nonce": reachability_nonce,
+                    "reachability_proven_at": None,
                 }
                 _mark_active_user(user_id, call_id, "caller")
                 _mark_active_user(target_id, call_id, "callee")
@@ -2711,6 +2874,7 @@ async def websocket_endpoint(
                     "from_id": user_id,
                     "ring_expires_at": ring_expires_at,
                     "target_online": target_socket is not None,
+                    "target_reachability_proven": target_reachability_proven,
                 })
 
                 delivered = False
@@ -2726,6 +2890,8 @@ async def websocket_endpoint(
                             "call_id": call_id,
                             "ring_expires_at": ring_expires_at,
                             "from_id": user_id,
+                            "reachability_challenge_id": reachability_challenge_id,
+                            "reachability_nonce": reachability_nonce,
                         })
                         delivered = True
                         print(
@@ -2761,6 +2927,8 @@ async def websocket_endpoint(
                         ),
                         call_id=call_id,
                         message_type="incoming_call",
+                        reachability_challenge_id=reachability_challenge_id,
+                        reachability_nonce=reachability_nonce,
                     )
                     print(
                         "[CN CALL][PARALLEL FCM] "
@@ -2780,6 +2948,8 @@ async def websocket_endpoint(
                         ),
                         call_id=call_id,
                         message_type="incoming_call",
+                        reachability_challenge_id=reachability_challenge_id,
+                        reachability_nonce=reachability_nonce,
                     )
                     print(
                         "[CN CALL][CALL DELIVERY MODE] "
@@ -2787,35 +2957,10 @@ async def websocket_endpoint(
                         f"fcm={'SENT' if fcm_sent else 'FAILED'}"
                     )
 
-                    if fcm_sent:
-                        deadline_at = (
-                            int(time.time() * 1000)
-                            + FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS
-                        )
-                        db = get_db()
-                        db.execute(
-                            """
-                            UPDATE call_records
-                            SET delivery_deadline_at = ?
-                            WHERE call_id = ?
-                              AND status = 'ringing'
-                              AND delivery_confirmed_at IS NULL
-                            """,
-                            (deadline_at, call_id),
-                        )
-                        db.commit()
-                        db.close()
-
-                        record = active_calls.get(call_id)
-                        if record is not None:
-                            record["delivery_deadline_at"] = deadline_at
-
-                        _start_fcm_delivery_watchdog(call_id, deadline_at)
-                        print(
-                            "[CN CALL][FCM DELIVERY WATCHDOG STARTED]",
-                            "call_id=", call_id,
-                            "deadline_at=", deadline_at,
-                        )
+                    # No delivery timeout is started here. FCM delivery and
+                    # call_delivered are evidence about this call's transport,
+                    # not proof that the target is offline. Reachability is
+                    # tracked separately by the native presence lease + challenge.
 
                 continue
 

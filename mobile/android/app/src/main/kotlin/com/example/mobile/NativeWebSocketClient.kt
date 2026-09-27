@@ -2,6 +2,8 @@ package com.example.mobile
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -64,6 +66,7 @@ object NativeWebSocketClient {
     private const val RECONNECT_DELAY_MAX_SHIFT = 5
     private const val CLOSE_NORMAL = 1000
     private const val CLOSE_SESSION_INVALID = 1008
+    private const val PRESENCE_HEARTBEAT_INTERVAL_SECONDS = 10L
 
     // Phase 2: shared signaling-owner marker. Same SharedPreferences file and
     // fully-qualified key that the Flutter side writes ("flutter." prefix is
@@ -96,6 +99,7 @@ object NativeWebSocketClient {
      */
     private val pendingFrames = ArrayDeque<String>()
     @Volatile private var reconnectFuture: ScheduledFuture<*>? = null
+    @Volatile private var presenceFuture: ScheduledFuture<*>? = null
     @Volatile private var generation = 0
     @Volatile private var currentUserId: String? = null
     @Volatile private var currentToken: String? = null
@@ -215,6 +219,7 @@ object NativeWebSocketClient {
                 pendingFrames.clear()
             }
 
+            cancelPresenceHeartbeat()
             closeQuietly()
             currentUserId = null
             currentToken = null
@@ -303,11 +308,13 @@ object NativeWebSocketClient {
                             connected = true
                             reconnectAttempt.set(0)
                             flushPendingFrames()
+                            startPresenceHeartbeat()
                             dispatch(type, payload)
                         }
                         "session_invalid" -> {
                             reconnectEnabled = false
                             cancelPendingReconnect()
+                            cancelPresenceHeartbeat()
                             pendingFrames.clear()
                             closeQuietly()
                             dispatch(type, payload)
@@ -329,6 +336,7 @@ object NativeWebSocketClient {
                 connecting.set(false)
                 ready = false
                 connected = false
+                cancelPresenceHeartbeat()
                 notifyClosed(code, reason)
                 if (reconnectEnabled && code != CLOSE_SESSION_INVALID) {
                     scheduleReconnect()
@@ -341,11 +349,60 @@ object NativeWebSocketClient {
                 connecting.set(false)
                 ready = false
                 connected = false
+                cancelPresenceHeartbeat()
                 notifyError(t)
                 if (reconnectEnabled) scheduleReconnect()
             }
         })
         return true
+    }
+
+    private fun startPresenceHeartbeat() {
+        cancelPresenceHeartbeat()
+
+        sendPresenceHeartbeat()
+
+        presenceFuture = scheduler.scheduleAtFixedRate(
+            {
+                if (!connected || !ready || !reconnectEnabled) return@scheduleAtFixedRate
+                sendPresenceHeartbeat()
+            },
+            PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
+            PRESENCE_HEARTBEAT_INTERVAL_SECONDS,
+            TimeUnit.SECONDS,
+        )
+    }
+
+    private fun cancelPresenceHeartbeat() {
+        presenceFuture?.cancel(false)
+        presenceFuture = null
+    }
+
+    private fun sendPresenceHeartbeat() {
+        val context = appContext ?: return
+        if (!connected || !ready) return
+
+        val validated = hasValidatedInternet(context)
+        val queued = send(
+            "presence_heartbeat",
+            mapOf(
+                "network_validated" to validated.toString(),
+                "sent_at" to System.currentTimeMillis().toString(),
+            ),
+        )
+        println(
+            "[CN CALL][PRESENCE] heartbeat queued=$queued validated=$validated",
+        )
+    }
+
+    private fun hasValidatedInternet(context: Context): Boolean {
+        val manager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     /**
@@ -393,6 +450,7 @@ object NativeWebSocketClient {
         generation++
         reconnectEnabled = false
         cancelPendingReconnect()
+        cancelPresenceHeartbeat()
         connecting.set(false)
         synchronized(this) { pendingFrames.clear() }
         closeQuietly()

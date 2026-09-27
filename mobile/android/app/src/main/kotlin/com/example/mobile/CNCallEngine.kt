@@ -1180,8 +1180,49 @@ object CNCallEngine {
                                     " call_id=$frameCallId",
                             )
                     }
+                    
+                    val reachabilityChallengeId =
+                        payload["reachability_challenge_id"]?.trim().orEmpty()
+                    val reachabilityNonce =
+                        payload["reachability_nonce"]?.trim().orEmpty()
+                    val reachabilityContext = appContext
+                    val reachabilityUserId =
+                        reachabilityContext?.let {
+                            NativeCallTokenHelper.restoreUserId(it)
+                        }?.trim().orEmpty()
+
+                    if (
+                        reachabilityChallengeId.isNotEmpty() &&
+                        reachabilityNonce.isNotEmpty() &&
+                        reachabilityContext != null &&
+                        reachabilityUserId.isNotEmpty()
+                    ) {
+                        NativeCallTokenHelper.enqueueReachabilityProof(
+                            reachabilityContext,
+                            reachabilityUserId,
+                            frameCallId,
+                            reachabilityChallengeId,
+                            reachabilityNonce,
+                        )
+                    }
                     if (acceptedForPresentation) {
                         presentIncomingCallToTelecom(frameCallId, callerId, callerName)
+                    }
+                }
+
+                "reachability_proven" -> {
+                    var isStale = false
+                    synchronized(lock) {
+                        if (frameCallId != scoredCallId || !isCaller) {
+                            isStale = true
+                        }
+                    }
+                    if (!isStale) {
+                        println(
+                            "[CN CALL][ENGINE] reachability proven" +
+                                " call_id=$frameCallId target=" +
+                                (payload["from_id"] ?: ""),
+                        )
                     }
                 }
 
@@ -1210,7 +1251,9 @@ object CNCallEngine {
                     if (!isStale) {
                         println(
                             "[CN CALL][ENGINE] signaling call_started" +
-                                " call_id=$frameCallId target_online=$targetOnline",
+                                " call_id=$frameCallId target_online=$targetOnline" +
+                                    " target_reachability_proven=" +
+                                    (payload["target_reachability_proven"] ?: "false"),
                         )
                         // call_started only confirms that the server
                         // created the ringing call. It is NOT recipient

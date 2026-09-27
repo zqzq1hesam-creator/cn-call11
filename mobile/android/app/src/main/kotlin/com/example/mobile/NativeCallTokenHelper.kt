@@ -2,12 +2,15 @@ package com.example.mobile
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Looper
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.MediaType.Companion.toMediaType
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -76,6 +79,82 @@ object NativeCallTokenHelper {
             .callTimeout(4, TimeUnit.SECONDS)
             .retryOnConnectionFailure(false)
             .build()
+    }
+
+    /**
+     * Sends a cryptographically-bound per-call reachability proof.
+     * The server validates the challenge against the authenticated target.
+     */
+    fun enqueueReachabilityProof(
+        context: Context,
+        userId: String,
+        callId: String,
+        challengeId: String,
+        nonce: String,
+    ): Boolean {
+        val accessToken = restoreAccessToken(context) ?: return false
+        if (
+            userId.isBlank() ||
+            callId.isBlank() ||
+            challengeId.isBlank() ||
+            nonce.isBlank()
+        ) {
+            return false
+        }
+
+        val networkValidated = hasValidatedInternet(context)
+        val body = JSONObject()
+            .put("challenge_id", challengeId)
+            .put("nonce", nonce)
+            .put("network_validated", networkValidated)
+            .toString()
+            .toRequestBody("application/json; charset=utf-8".toMediaType())
+
+        val url = HttpUrl.Builder()
+            .scheme("https")
+            .host(HOST)
+            .addPathSegments("calls")
+            .addPathSegment(callId)
+            .addPathSegment("reachability")
+            .build()
+
+        tokenExecutor.execute {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Authorization", "Bearer $accessToken")
+                    .header("Content-Type", "application/json")
+                    .post(body)
+                    .build()
+
+                deliveryHttpClient.newCall(request).execute().use { httpResponse ->
+                    println(
+                        "[CN CALL][HTTPS REACHABILITY] " +
+                            "call_id=$callId user=$userId " +
+                            "validated=$networkValidated " +
+                            "status=${httpResponse.code} " +
+                            "success=${httpResponse.isSuccessful}",
+                    )
+                }
+            } catch (error: Exception) {
+                println(
+                    "[CN CALL][HTTPS REACHABILITY FAILED] " +
+                        "call_id=$callId user=$userId error=$error",
+                )
+            }
+        }
+
+        return true
+    }
+
+    private fun hasValidatedInternet(context: Context): Boolean {
+        val manager =
+            context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+                ?: return false
+        val network = manager.activeNetwork ?: return false
+        val capabilities = manager.getNetworkCapabilities(network) ?: return false
+        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
     /** Result of a LiveKit token fetch. */
