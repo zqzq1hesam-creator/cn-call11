@@ -425,6 +425,8 @@ class _LoginScreenState extends State<LoginScreen>
     final loggedUserId = user['user_id']?.toString();
     final username = user['username']?.toString();
     final accessToken = result['access_token']?.toString();
+    final isDeveloper = user['is_developer'] == true;
+    final developerBadge = user['developer_badge']?.toString().trim();
 
     if (loggedUserId == null ||
         loggedUserId.isEmpty ||
@@ -440,6 +442,8 @@ class _LoginScreenState extends State<LoginScreen>
       id: loggedUserId,
       name: username,
       token: accessToken,
+      isDeveloper: isDeveloper,
+      developerBadge: developerBadge,
     );
 
     await FirebaseMessagingService.instance.refreshTokenForCurrentUser();
@@ -881,6 +885,29 @@ class _HomeScreenState extends State<HomeScreen> {
                                     ),
                                   ),
                                 ],
+                                  if (CallSession.instance.isDeveloper &&
+                                      CallSession.instance.developerBadge != null) ...[
+                                    const SizedBox(height: 7),
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        const Icon(
+                                          Icons.verified_rounded,
+                                          color: Color(0xFF00E676),
+                                          size: 16,
+                                        ),
+                                        const SizedBox(width: 5),
+                                        Text(
+                                          CallSession.instance.developerBadge!,
+                                          style: const TextStyle(
+                                            color: Color(0xFF00E676),
+                                            fontSize: 12,
+                                            fontWeight: FontWeight.w700,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
                               ),
                             ),
                           ],
@@ -1003,6 +1030,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
     final loggedUserId = user['user_id']?.toString();
     final loggedUsername = user['username']?.toString() ?? username;
     final accessToken = loginResult['access_token']?.toString();
+    final isDeveloper = user['is_developer'] == true;
+    final developerBadge = user['developer_badge']?.toString().trim();
 
     if (loggedUserId == null ||
         loggedUserId.isEmpty ||
@@ -1016,6 +1045,8 @@ class _RegisterScreenState extends State<RegisterScreen> {
       id: loggedUserId,
       name: loggedUsername,
       token: accessToken,
+      isDeveloper: isDeveloper,
+      developerBadge: developerBadge,
     );
 
     await FirebaseMessagingService.instance.refreshTokenForCurrentUser();
