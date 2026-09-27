@@ -1937,7 +1937,7 @@ object CNCallEngine {
                         VideoProfile.STATE_AUDIO_ONLY
                     }
 
-                CNCallRegistry.get(callId)?.connection
+                (CNCallRegistry.get(callId)?.connection as? CNCallConnection)
                     ?.completeVideoSessionModify(
                         finalState,
                         true,
