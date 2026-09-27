@@ -7,6 +7,9 @@ import android.net.Uri
 import android.provider.CallLog
 import android.telecom.Connection
 import android.telecom.DisconnectCause
+import android.telecom.VideoProfile
+import android.view.Surface
+import livekit.org.webrtc.VideoSink
 import java.io.IOException
 
 class CNCallConnection(
@@ -23,6 +26,59 @@ class CNCallConnection(
     @Volatile
     private var active = false
     private val terminalLock = Any()
+
+    private val videoProvider =
+        CNCallVideoProvider(callId, object : CNCallVideoProvider.Listener {
+            override fun onSessionModifyRequest(
+                fromProfile: VideoProfile,
+                toProfile: VideoProfile,
+            ) {
+                CNCallEngine.requestVideoState(
+                    callId,
+                    fromProfile.videoState,
+                    toProfile.videoState,
+                )
+            }
+
+            override fun onSessionModifyResponse(responseProfile: VideoProfile) {
+                CNCallEngine.handleVideoResponse(
+                    callId,
+                    responseProfile.videoState,
+                )
+            }
+
+            override fun onSetCamera(cameraId: String) {
+                CNCallEngine.switchVideoCamera(callId, cameraId)
+            }
+
+            override fun onPreviewRendererChanged(renderer: VideoSink?) {
+                CNCallEngine.setLocalVideoRenderer(callId, renderer)
+            }
+
+            override fun onDisplayRendererChanged(renderer: VideoSink?) {
+                CNCallEngine.setRemoteVideoRenderer(callId, renderer)
+            }
+
+            override fun onRequestCameraCapabilities() {
+                CNCallEngine.reportCameraCapabilities(callId)
+            }
+
+            override fun onSetDeviceOrientation(rotation: Int) {
+                CNCallEngine.setVideoOrientation(callId, rotation)
+            }
+
+            override fun onSetZoom(value: Float) {
+                CNCallEngine.setVideoZoom(callId, value)
+            }
+
+            override fun onRequestCallDataUsage() {
+                CNCallEngine.reportVideoDataUsage(callId)
+            }
+
+            override fun onSetPauseImage(uri: android.net.Uri?) {
+                CNCallEngine.setVideoPauseImage(callId, uri)
+            }
+        })
     private val ringbackLock = Any()
     private var ringbackPlayer: MediaPlayer? = null
     private var ringbackGeneration = 0L
@@ -105,6 +161,13 @@ class CNCallConnection(
 
     init {
         setAudioModeIsVoip(true)
+        setConnectionCapabilities(
+            getConnectionCapabilities() or
+                CAPABILITY_SUPPORTS_VT_LOCAL_BIDIRECTIONAL or
+                CAPABILITY_SUPPORTS_VT_REMOTE_BIDIRECTIONAL,
+        )
+        setVideoProvider(videoProvider)
+        setVideoState(VideoProfile.STATE_AUDIO_ONLY)
         setAddress(address, CallLog.Calls.PRESENTATION_ALLOWED)
         if (!incoming) {
             prepareOutgoingRingback()
@@ -464,6 +527,16 @@ class CNCallConnection(
         terminateFromRemote(DisconnectCause(code))
     }
 
+    internal fun updateVideoState(videoState: Int) {
+        if (terminal) return
+        setVideoState(videoState)
+    }
+
+    internal fun notifyLocalVideoTrack(track: Any?) {
+        // Track lifecycle is owned by NativeLiveKit; Telecom only needs the
+        // provider surfaces. Kept as a no-op hook for future diagnostics.
+    }
+
     private fun terminateFromRemote(cause: DisconnectCause) {
         synchronized(terminalLock) {
             if (terminal || !CNCallRegistry.claimDisconnect(callId)) return
@@ -490,6 +563,7 @@ class CNCallConnection(
         CNCallRegistry.remove(callId)
         CNCallNotification.cancel(appContext, callId)
         CNCallEngine.notifyTelecomCallEnded(callId)
+        videoProvider.release()
         destroy()
     }
 }
