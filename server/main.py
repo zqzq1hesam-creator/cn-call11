@@ -2280,6 +2280,7 @@ def send_call_notification(
     event_id: str | None = None,
     reachability_challenge_id: str | None = None,
     reachability_nonce: str | None = None,
+    reason: str | None = None,
 ) -> bool:
     token = FCM_TOKENS.get(target_id)
 
@@ -2324,6 +2325,11 @@ def send_call_notification(
                 **(
                     {"event_id": event_id}
                     if event_id
+                    else {}
+                ),
+                **(
+                    {"reason": reason.strip()}
+                    if reason and reason.strip()
                     else {}
                 ),
                 **(
@@ -2388,6 +2394,7 @@ async def send_call_notification_async(
     event_id: str | None = None,
     reachability_challenge_id: str | None = None,
     reachability_nonce: str | None = None,
+    reason: str | None = None,
 ) -> bool:
     """Run the blocking Firebase Admin SDK send outside FastAPI's event loop."""
     return await asyncio.to_thread(
@@ -2400,6 +2407,7 @@ async def send_call_notification_async(
         event_id=event_id,
         reachability_challenge_id=reachability_challenge_id,
         reachability_nonce=reachability_nonce,
+        reason=reason,
     )
 
 
