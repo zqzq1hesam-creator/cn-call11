@@ -3,6 +3,7 @@ package com.example.mobile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
+import android.media.ToneGenerator
 import android.net.Uri
 import android.provider.CallLog
 import android.telecom.Connection
@@ -70,6 +71,24 @@ class CNCallConnection(
             if (terminal || incoming) return
 
             stopOutgoingRingback()
+
+            if (reason == "rejected") {
+                println(
+                    "[CN CALL][TELECOM] remote party rejected call " +
+                        "call_id=$callId tone=TONE_PROP_NACK",
+                )
+                terminateFromRemote(
+                    DisconnectCause(
+                        DisconnectCause.REJECTED,
+                        "",
+                        "",
+                        "remote_rejected",
+                        ToneGenerator.TONE_PROP_NACK,
+                    ),
+                )
+                return
+            }
+
             val assetFileName = when (reason) {
                 "offline" -> "offline.mp3"
                 "busy" -> "busy.mp3"
@@ -459,6 +478,10 @@ class CNCallConnection(
     }
 
     fun terminateFromRemote(code: Int) {
+        terminateFromRemote(DisconnectCause(code))
+    }
+
+    private fun terminateFromRemote(cause: DisconnectCause) {
         synchronized(terminalLock) {
             if (terminal || !CNCallRegistry.claimDisconnect(callId)) return
             terminal = true
@@ -469,7 +492,7 @@ class CNCallConnection(
         CNCallRegistry.markTerminated(callId)
         CNCallEngine.release(callId)
         CNCallNotification.cancel(appContext, callId)
-        setDisconnected(DisconnectCause(code))
+        setDisconnected(cause)
         MainActivity.postTelecomEvent("ended", mapOf("callId" to callId))
         destroyAndRemove()
     }
