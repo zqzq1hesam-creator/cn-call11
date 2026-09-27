@@ -8,7 +8,9 @@ import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
 import android.telecom.TelecomManager
+import android.telecom.VideoProfile
 import androidx.core.content.ContextCompat
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -107,6 +109,16 @@ object CNCallEngine {
         fun unhold(callId: String): Boolean
         fun setMute(callId: String, muted: Boolean): Boolean
         fun setSpeaker(callId: String, speaker: Boolean): Boolean
+        fun requestVideoState(callId: String, fromVideoState: Int, toVideoState: Int): Boolean
+        fun handleVideoResponse(callId: String, videoState: Int): Boolean
+        fun switchVideoCamera(callId: String, cameraId: String): Boolean
+        fun setLocalVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
+        fun setRemoteVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
+        fun reportCameraCapabilities(callId: String)
+        fun setVideoOrientation(callId: String, rotation: Int)
+        fun setVideoZoom(callId: String, value: Float)
+        fun reportVideoDataUsage(callId: String)
+        fun setVideoPauseImage(callId: String, uri: android.net.Uri?)
         fun release(callId: String): Boolean
     }
 
