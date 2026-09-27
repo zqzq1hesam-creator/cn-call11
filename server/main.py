@@ -701,11 +701,16 @@ async def _fcm_delivery_watchdog(call_id: str) -> None:
         # The durable call becomes missed and is still replayable to the target
         # when it reconnects. Notify the caller using the existing documented
         # call_reject/offline protocol.
-        finalize_call_terminal(
+        event_ids = finalize_call_terminal(
             call_id,
             "missed",
-            [],
+            [
+                (target_id, "call_cancelled", caller_id),
+            ],
         )
+
+        for event_id in event_ids:
+            await _deliver_terminal_event(event_id)
 
         caller_socket = connections.get(caller_id)
         notified = False
