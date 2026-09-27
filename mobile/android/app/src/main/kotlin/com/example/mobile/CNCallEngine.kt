@@ -779,6 +779,89 @@ object CNCallEngine {
             return true
         }
 
+        override fun requestVideoState(
+            callId: String,
+            fromVideoState: Int,
+            toVideoState: Int,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            return sendVideoRequest(
+                callId,
+                fromVideoState,
+                toVideoState,
+            )
+        }
+
+        override fun handleVideoResponse(
+            callId: String,
+            videoState: Int,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            return applyVideoState(callId, videoState)
+        }
+
+        override fun switchVideoCamera(
+            callId: String,
+            cameraId: String,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.switchCamera(cameraId)
+            return true
+        }
+
+        override fun setLocalVideoRenderer(
+            callId: String,
+            renderer: livekit.org.webrtc.VideoSink?,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.setLocalVideoRenderer(renderer)
+            return true
+        }
+
+        override fun setRemoteVideoRenderer(
+            callId: String,
+            renderer: livekit.org.webrtc.VideoSink?,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.setRemoteVideoRenderer(renderer)
+            return true
+        }
+
+        override fun reportCameraCapabilities(callId: String) {
+            println(
+                "[CN CALL][VIDEO] camera capabilities requested call_id=" +
+                    callId,
+            )
+        }
+
+        override fun setVideoOrientation(callId: String, rotation: Int) {
+            println(
+                "[CN CALL][VIDEO] orientation call_id=" +
+                    callId + " rotation=" + rotation,
+            )
+        }
+
+        override fun setVideoZoom(callId: String, value: Float) {
+            println(
+                "[CN CALL][VIDEO] zoom call_id=" +
+                    callId + " value=" + value,
+            )
+        }
+
+        override fun reportVideoDataUsage(callId: String) {
+            println(
+                "[CN CALL][VIDEO] data usage requested call_id=" +
+                    callId,
+            )
+        }
+
+        override fun setVideoPauseImage(callId: String, uri: android.net.Uri?) {
+            println(
+                "[CN CALL][VIDEO] pause image requested call_id=" +
+                    callId + " uri=" + uri,
+            )
+        }
+
         override fun release(callId: String): Boolean {
             val released: Boolean
             synchronized(lock) {
@@ -1645,6 +1728,167 @@ object CNCallEngine {
             )
 
             return sent
+        }
+
+        private fun sendVideoRequest(
+            callId: String,
+            fromVideoState: Int,
+            toVideoState: Int,
+        ): Boolean {
+            val context = appContext ?: return false
+            val userId = NativeCallTokenHelper.restoreUserId(context)
+                ?.trim()
+                .orEmpty()
+            if (userId.isEmpty()) return false
+
+            val targetId = synchronized(lock) {
+                if (callId != scoredCallId) {
+                    null
+                } else if (isCaller) {
+                    outgoingTargetId
+                } else {
+                    pendingIncomingCall?.callerId
+                }
+            }?.trim().orEmpty()
+            if (targetId.isEmpty()) return false
+
+            val wantsVideo =
+                toVideoState and
+                    (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+            if (wantsVideo && !hasCameraPermission(context)) {
+                println(
+                    "[CN CALL][VIDEO] request denied: camera permission missing " +
+                        "call_id=" + callId,
+                )
+                return false
+            }
+
+            if (wantsVideo &&
+                !CNCallVideoService.startForCall(context, callId)
+            ) {
+                println(
+                    "[CN CALL][VIDEO] video FGS start failed call_id=" +
+                        callId,
+                )
+                return false
+            }
+
+            val requestId = UUID.randomUUID().toString()
+            val sent = NativeWebSocketClient.send(
+                "call_video_request",
+                mapOf(
+                    "call_id" to callId,
+                    "target_id" to targetId,
+                    "from_id" to userId,
+                    "video_state" to toVideoState.toString(),
+                    "request_id" to requestId,
+                ),
+            )
+
+            if (!sent && wantsVideo) {
+                CNCallVideoService.stopForCall(context, callId)
+            }
+
+            println(
+                "[CN CALL][VIDEO] request call_id=" + callId +
+                    " from=" + fromVideoState +
+                    " to=" + toVideoState +
+                    " target=" + targetId +
+                    " sent=" + sent,
+            )
+            return sent
+        }
+
+        private fun applyVideoState(
+            callId: String,
+            videoState: Int,
+        ): Boolean {
+            val context = appContext ?: return false
+            val wantsVideo =
+                videoState and
+                    (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+
+            if (wantsVideo && !hasCameraPermission(context)) {
+                return false
+            }
+
+            if (wantsVideo &&
+                !CNCallVideoService.startForCall(context, callId)
+            ) {
+                return false
+            }
+
+            NativeLiveKit.setCameraEnabled(wantsVideo) { error ->
+                if (error != null) {
+                    println(
+                        "[CN CALL][VIDEO] apply state failed call_id=" +
+                            callId + " error=" + error.message,
+                    )
+                    return@setCameraEnabled
+                }
+
+                if (!wantsVideo) {
+                    CNCallVideoService.stopForCall(context, callId)
+                }
+
+                CNCallRegistry.get(callId)?.connection
+                    ?.let { it as? CNCallConnection }
+                    ?.updateVideoState(
+                        if (wantsVideo) {
+                            VideoProfile.STATE_BIDIRECTIONAL
+                        } else {
+                            VideoProfile.STATE_AUDIO_ONLY
+                        },
+                    )
+            }
+            return true
+        }
+
+        private fun sendVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+        ) {
+            val context = appContext ?: return
+            val userId = NativeCallTokenHelper.restoreUserId(context)
+                ?.trim()
+                .orEmpty()
+            val targetId = synchronized(lock) {
+                if (callId != scoredCallId) {
+                    null
+                } else if (isCaller) {
+                    outgoingTargetId
+                } else {
+                    pendingIncomingCall?.callerId
+                }
+            }?.trim().orEmpty()
+
+            if (userId.isEmpty() || targetId.isEmpty()) return
+
+            val sent = NativeWebSocketClient.send(
+                "call_video_response",
+                mapOf(
+                    "call_id" to callId,
+                    "target_id" to targetId,
+                    "from_id" to userId,
+                    "success" to success.toString(),
+                    "video_state" to videoState.toString(),
+                ),
+            )
+
+            println(
+                "[CN CALL][VIDEO] response call_id=" + callId +
+                    " success=" + success +
+                    " state=" + videoState +
+                    " sent=" + sent,
+            )
+        }
+
+        private fun hasCameraPermission(context: Context): Boolean {
+            return ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA,
+            ) == PackageManager.PERMISSION_GRANTED
         }
 
         private fun clearScoredCall(
