@@ -8,7 +8,6 @@ import android.provider.CallLog
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.VideoProfile
-import android.view.Surface
 import livekit.org.webrtc.VideoSink
 import java.io.IOException
 
@@ -532,9 +531,53 @@ class CNCallConnection(
         setVideoState(videoState)
     }
 
-    internal fun notifyLocalVideoTrack(track: Any?) {
-        // Track lifecycle is owned by NativeLiveKit; Telecom only needs the
-        // provider surfaces. Kept as a no-op hook for future diagnostics.
+    internal fun notifyRemoteVideoRequest(videoState: Int) {
+        if (terminal) return
+        try {
+            videoProvider.receiveSessionModifyRequest(
+                VideoProfile(videoState),
+            )
+        } catch (error: Exception) {
+            println(
+                "[CN CALL][VIDEO] Telecom request notification failed " +
+                    "call_id=" + callId +
+                    " error=" + error.message,
+            )
+        }
+    }
+
+    internal fun completeVideoSessionModify(
+        videoState: Int,
+        success: Boolean,
+    ) {
+        if (terminal) return
+
+        val responseProfile = VideoProfile(videoState)
+        val requestedProfile = VideoProfile(videoState)
+        val status =
+            if (success) {
+                Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS
+            } else {
+                Connection.VideoProvider.SESSION_MODIFY_REQUEST_FAIL
+            }
+
+        try {
+            videoProvider.receiveSessionModifyResponse(
+                status,
+                responseProfile,
+                requestedProfile,
+            )
+        } catch (error: Exception) {
+            println(
+                "[CN CALL][VIDEO] Telecom response notification failed " +
+                    "call_id=" + callId +
+                    " error=" + error.message,
+            )
+        }
+
+        if (success) {
+            setVideoState(videoState)
+        }
     }
 
     private fun terminateFromRemote(cause: DisconnectCause) {
