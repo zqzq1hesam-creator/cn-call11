@@ -1272,8 +1272,8 @@ def init_db():
             negotiation_expires_at INTEGER,
             connection_expires_at INTEGER,
             media_ready_users TEXT NOT NULL DEFAULT '[]',
-            delivery_confirmed_at INTEGER,
-            delivery_deadline_at INTEGER,
+            delivery_confirmed_at BIGINT,
+            delivery_deadline_at BIGINT,
             state_version INTEGER NOT NULL DEFAULT 1
         )
         """
@@ -1319,8 +1319,10 @@ def init_db():
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed_at INTEGER",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_deadline_at INTEGER",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed_at BIGINT",
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_deadline_at BIGINT",
+            "ALTER TABLE call_records ALTER COLUMN delivery_confirmed_at TYPE BIGINT",
+            "ALTER TABLE call_records ALTER COLUMN delivery_deadline_at TYPE BIGINT",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
             "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
         ):
