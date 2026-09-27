@@ -738,11 +738,12 @@ async def _deliver_terminal_event(event_id: str) -> bool:
 
     target_id = str(row["target_user_id"])
     terminal_reason = None
-    if (
-        str(row["event_type"]) == "call_reject"
-        and str(row["call_status"] or "") == "missed"
-    ):
-        terminal_reason = "offline"
+    if str(row["event_type"]) == "call_reject":
+        call_status = str(row["call_status"] or "")
+        if call_status == "missed":
+            terminal_reason = "offline"
+        elif call_status == "rejected":
+            terminal_reason = "rejected"
 
     _mark_terminal_attempt(event_id)
 
