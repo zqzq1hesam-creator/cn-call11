@@ -2418,6 +2418,101 @@ object CNCallEngine {
         return currentDelegate.setSpeaker(callId, speaker)
     }
 
+    fun requestVideoState(
+        callId: String,
+        fromVideoState: Int,
+        toVideoState: Int,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("requestVideoState", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "requestVideoState",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.requestVideoState(
+            callId,
+            fromVideoState,
+            toVideoState,
+        )
+    }
+
+    fun handleVideoResponse(
+        callId: String,
+        videoState: Int,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("handleVideoResponse", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "handleVideoResponse",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.handleVideoResponse(callId, videoState)
+    }
+
+    fun switchVideoCamera(callId: String, cameraId: String): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("switchVideoCamera", callId, callbacks)
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "switchVideoCamera",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+        return currentDelegate.switchVideoCamera(callId, cameraId)
+    }
+
+    fun setLocalVideoRenderer(
+        callId: String,
+        renderer: livekit.org.webrtc.VideoSink?,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("setLocalVideoRenderer", callId, callbacks)
+        return currentDelegate.setLocalVideoRenderer(callId, renderer)
+    }
+
+    fun setRemoteVideoRenderer(
+        callId: String,
+        renderer: livekit.org.webrtc.VideoSink?,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("setRemoteVideoRenderer", callId, callbacks)
+        return currentDelegate.setRemoteVideoRenderer(callId, renderer)
+    }
+
+    fun reportCameraCapabilities(callId: String) {
+        (delegate as? CNCallEngineImpl)?.reportCameraCapabilities(callId)
+    }
+
+    fun setVideoOrientation(callId: String, rotation: Int) {
+        (delegate as? CNCallEngineImpl)?.setVideoOrientation(callId, rotation)
+    }
+
+    fun setVideoZoom(callId: String, value: Float) {
+        (delegate as? CNCallEngineImpl)?.setVideoZoom(callId, value)
+    }
+
+    fun reportVideoDataUsage(callId: String) {
+        (delegate as? CNCallEngineImpl)?.reportVideoDataUsage(callId)
+    }
+
+    fun setVideoPauseImage(callId: String, uri: android.net.Uri?) {
+        (delegate as? CNCallEngineImpl)?.setVideoPauseImage(callId, uri)
+    }
+
     fun hold(callId: String): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("hold", callId, callbacks)
