@@ -884,7 +884,6 @@ class _HomeScreenState extends State<HomeScreen> {
                                       fontSize: 13,
                                     ),
                                   ),
-                                ],
                                   if (CallSession.instance.isDeveloper &&
                                       CallSession.instance.developerBadge != null) ...[
                                     const SizedBox(height: 7),
@@ -908,7 +907,7 @@ class _HomeScreenState extends State<HomeScreen> {
                                       ],
                                     ),
                                   ],
-                              ),
+                                ],
                             ),
                           ],
                         ),
