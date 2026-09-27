@@ -4,6 +4,8 @@ import android.content.Context
 import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.net.Network
+import android.os.Build
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -87,6 +89,84 @@ object NativeWebSocketClient {
     /** Phase 2: set via [configure]; required to read the owner marker. */
     @Volatile private var appContext: Context? = null
 
+    private val networkStateLock = Any()
+    private var connectivityManager: ConnectivityManager? = null
+    @Volatile private var networkCallbackRegistered = false
+    private var observedDefaultNetwork: Network? = null
+    private var pendingNetworkReconnect = false
+    private var hasObservedDefaultNetwork = false
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            super.onAvailable(network)
+
+            synchronized(networkStateLock) {
+                if (!hasObservedDefaultNetwork) {
+                    hasObservedDefaultNetwork = true
+                    observedDefaultNetwork = network
+                } else if (observedDefaultNetwork != network) {
+                    observedDefaultNetwork = network
+                    pendingNetworkReconnect = true
+                }
+            }
+
+            println("[CN CALL][NETWORK] default network available network=$network")
+        }
+
+        override fun onCapabilitiesChanged(
+            network: Network,
+            networkCapabilities: NetworkCapabilities,
+        ) {
+            super.onCapabilitiesChanged(network, networkCapabilities)
+
+            val validated =
+                networkCapabilities.hasCapability(
+                    NetworkCapabilities.NET_CAPABILITY_INTERNET,
+                ) &&
+                    networkCapabilities.hasCapability(
+                        NetworkCapabilities.NET_CAPABILITY_VALIDATED,
+                    )
+
+            var shouldReconnect = false
+            synchronized(networkStateLock) {
+                if (!hasObservedDefaultNetwork) {
+                    hasObservedDefaultNetwork = true
+                    observedDefaultNetwork = network
+                } else if (observedDefaultNetwork != network) {
+                    observedDefaultNetwork = network
+                    pendingNetworkReconnect = true
+                }
+
+                if (validated && pendingNetworkReconnect) {
+                    pendingNetworkReconnect = false
+                    shouldReconnect = true
+                }
+            }
+
+            println(
+                "[CN CALL][NETWORK] capabilities changed " +
+                    "network=$network validated=$validated reconnect=$shouldReconnect",
+            )
+
+            if (shouldReconnect) {
+                reconnectForNetworkChange("validated")
+            }
+        }
+
+        override fun onLost(network: Network) {
+            super.onLost(network)
+
+            synchronized(networkStateLock) {
+                if (observedDefaultNetwork == network) {
+                    observedDefaultNetwork = null
+                    pendingNetworkReconnect = true
+                }
+            }
+
+            println("[CN CALL][NETWORK] default network lost network=$network")
+        }
+    }
+
     @Volatile private var webSocket: WebSocket? = null
     @Volatile private var ready = false
     @Volatile private var reconnectEnabled = false
@@ -132,8 +212,38 @@ object NativeWebSocketClient {
      * opens a socket.
      */
     fun configure(context: Context) {
-        appContext = context.applicationContext
+        val appCtx = context.applicationContext
+        appContext = appCtx
+        registerNetworkCallback(appCtx)
     }
+
+    private fun registerNetworkCallback(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        if (networkCallbackRegistered) return
+
+        synchronized(networkStateLock) {
+            if (networkCallbackRegistered) return
+
+            val manager =
+                context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (manager == null) {
+                println("[CN CALL][NETWORK] callback registration skipped: no ConnectivityManager")
+                return
+            }
+
+            try {
+                manager.registerDefaultNetworkCallback(networkCallback)
+                connectivityManager = manager
+                networkCallbackRegistered = true
+                println("[CN CALL][NETWORK] default network callback registered")
+            } catch (error: Exception) {
+                println(
+                    "[CN CALL][NETWORK] callback registration failed error=$error",
+                )
+            }
+        }
+    }
+
 
     /** Reads the shared signaling-owner marker ("" when none). */
     fun readOwner(context: Context): String? {
@@ -494,6 +604,61 @@ object NativeWebSocketClient {
             result[key] = value?.toString() ?: ""
         }
         return result
+    }
+
+    private fun reconnectForNetworkChange(reason: String) {
+        val userId = currentUserId ?: return
+        val token = currentToken ?: return
+        if (!reconnectEnabled) return
+
+        val context = appContext
+        if (context == null || readOwner(context) != "native") return
+
+        val oldSocket: WebSocket?
+        synchronized(this) {
+            if (!reconnectEnabled ||
+                currentUserId != userId ||
+                currentToken != token
+            ) {
+                return
+            }
+
+            generation++
+            connecting.set(false)
+            ready = false
+            connected = false
+            cancelPendingReconnect()
+            oldSocket = webSocket
+            webSocket = null
+        }
+
+        try {
+            oldSocket?.cancel()
+        } catch (_: Exception) {
+        }
+
+        println(
+            "[CN CALL][NETWORK] forcing signaling reconnect " +
+                "reason=$reason user_id=$userId",
+        )
+
+        scheduler.execute {
+            try {
+                if (!reconnectEnabled ||
+                    currentUserId != userId ||
+                    currentToken != token
+                ) {
+                    return@execute
+                }
+                connect(userId, token)
+            } catch (error: Exception) {
+                println(
+                    "[CN CALL][NETWORK] immediate reconnect failed " +
+                        "reason=$reason error=$error",
+                )
+                scheduleReconnect()
+            }
+        }
     }
 
     private fun scheduleReconnect() {
