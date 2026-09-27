@@ -672,6 +672,7 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
+            appContext?.let { CNCallVideoService.stopForCall(it, callId) }
             // Keep native signaling ownership/session alive so a terminal frame
             // queued during the WebSocket handshake cannot be cleared before
             // it reaches the server.
@@ -753,6 +754,7 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
+            appContext?.let { CNCallVideoService.stopForCall(it, callId) }
             // Keep native signaling ownership/session alive so a queued terminal
             // frame can flush after the WebSocket handshake.
             return sent
@@ -883,6 +885,7 @@ object CNCallEngine {
                 appContext?.let { markCallEndedLocally(it, callId) }
                 CNCallRegistry.releaseTelecomPresentation(callId)
                 stopCallAudioService(callId)
+                appContext?.let { CNCallVideoService.stopForCall(it, callId) }
                 releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): call finished; no queued frame may be flushed.
                 NativeWebSocketClient.clearPendingFrames()
@@ -930,6 +933,9 @@ object CNCallEngine {
                 CNCallRegistry.releaseTelecomPresentation(endedCallId)
             }
             stopCallAudioService(endedCallId)
+            if (endedCallId != null) {
+                appContext?.let { CNCallVideoService.stopForCall(it, endedCallId) }
+            }
             releaseNativeOwnershipIfOwned()
             // Phase 2.3 (E1): hard end; no queued frame may be flushed after
             // the call is over.
