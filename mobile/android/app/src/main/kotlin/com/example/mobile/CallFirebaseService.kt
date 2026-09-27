@@ -30,9 +30,10 @@ class CallFirebaseService : FirebaseMessagingService() {
 
             try {
                 markCallEnded(callId)
+                NativeCallTokenHelper.cancelReachabilityProof(callId)
             } catch (error: Exception) {
                 println(
-                    "[CN CALL][FCM] terminal persistence failed " +
+                    "[CN CALL][FCM] terminal persistence/cleanup failed " +
                         "call_id=$callId error=$error",
                 )
             }
@@ -141,6 +142,15 @@ class CallFirebaseService : FirebaseMessagingService() {
         val callId = message.data["call_id"]?.trim().orEmpty()
         if (callId.isEmpty()) return
 
+        // The FCM delivery itself can be stale because Android may deliver it
+        // after the call already ended through WebSocket/another FCM path.
+        // Check the local tombstone BEFORE responding to the old challenge.
+        if (isCallEnded(callId)) {
+            NativeCallTokenHelper.cancelReachabilityProof(callId)
+            println("CN CALL: ignored stale incoming FCM. callId=$callId")
+            return
+        }
+
         val reachabilityChallengeId =
             message.data["reachability_challenge_id"]?.trim().orEmpty()
         val reachabilityNonce =
@@ -160,11 +170,6 @@ class CallFirebaseService : FirebaseMessagingService() {
                 reachabilityChallengeId,
                 reachabilityNonce,
             )
-        }
-
-        if (isCallEnded(callId)) {
-            println("CN CALL: ignored stale incoming FCM. callId=$callId")
-            return
         }
 
         // Phase 3 (cold-start): reserve native signaling ownership NOW, before

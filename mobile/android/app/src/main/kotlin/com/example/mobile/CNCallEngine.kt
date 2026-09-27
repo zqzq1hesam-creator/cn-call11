@@ -623,6 +623,12 @@ object CNCallEngine {
             }
             if (!current) return false
             if (targetId.isNullOrBlank()) return false
+
+            val context = appContext
+            NativeCallTokenHelper.cancelReachabilityProof(callId)
+            if (context != null) {
+                markCallEndedLocally(context, callId)
+            }
             if (!ensureSignalingConnected()) return false
 
             // Phase 2.3 (E1): a freshly opened or reconnecting socket must not
@@ -692,6 +698,11 @@ object CNCallEngine {
                 "[CN CALL][DIAG][ENGINE disconnect DECISION] " +
                     "call_id=$callId target=$targetId callerStillRinging=$callerStillRinging",
             )
+
+            // Termination starts locally before transport cleanup so any late
+            // FCM/WS invite for this exact UUID is ignored as stale.
+            NativeCallTokenHelper.cancelReachabilityProof(callId)
+            appContext?.let { markCallEndedLocally(it, callId) }
 
             // Verified: rtc_call_manager.dart hangup() (lines 551-559) —
             // caller cancels while still ringing → "call_cancelled",
@@ -773,6 +784,9 @@ object CNCallEngine {
             // scoped and stays connected (no close), and no frame is sent
             // automatically.
             if (released) {
+                NativeCallTokenHelper.cancelReachabilityProof(callId)
+                appContext?.let { markCallEndedLocally(it, callId) }
+                CNCallRegistry.releaseTelecomPresentation(callId)
                 stopCallAudioService(callId)
                 releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): call finished; no queued frame may be flushed.
@@ -814,6 +828,11 @@ object CNCallEngine {
                 acceptedCallId = null
                 isCaller = false
                 outgoingTargetId = null
+            }
+            if (endedCallId != null) {
+                NativeCallTokenHelper.cancelReachabilityProof(endedCallId)
+                appContext?.let { markCallEndedLocally(it, endedCallId) }
+                CNCallRegistry.releaseTelecomPresentation(endedCallId)
             }
             stopCallAudioService(endedCallId)
             releaseNativeOwnershipIfOwned()
@@ -1108,13 +1127,26 @@ object CNCallEngine {
             val frameCallId = payload["call_id"].orEmpty()
             when (type) {
                 "call" -> {
+                    val localContext = appContext
+                    if (frameCallId.isBlank()) {
+                        println("[CN CALL][ENGINE] ignored incoming call with blank call_id")
+                        return@handleSignalingFrame
+                    }
+                    if (localContext != null && isCallEndedLocally(localContext, frameCallId)) {
+                        NativeCallTokenHelper.cancelReachabilityProof(frameCallId)
+                        CNCallRegistry.releaseTelecomPresentation(frameCallId)
+                        println(
+                            "[CN CALL][ENGINE] ignored stale incoming call tombstone" +
+                                " call_id=$frameCallId",
+                        )
+                        return@handleSignalingFrame
+                    }
+
                     // Incoming invitation, forwarded to the target by the
-                    // server (main.py lines 1078-1084). An Online target
-                    // receives ONLY this WS "call" — the FCM "incoming_call"
-                    // handled by CallFirebaseService is the Offline/cold-start
-                    // path and is never sent while the target socket is
-                    // connected. This branch is therefore the driving channel
-                    // for Online targets: it records the invite
+                    // server (main.py). A terminal call is durably tombstoned
+                    // locally, so a delayed WS duplicate can never re-present
+                    // Telecom or answer an old Reachability Challenge.
+                    // This branch otherwise records the invite
                     // (pendingIncomingCall) and, when the native WS holds the
                     // ownership marker, presents the SAME incoming Telecom call
                     // the FCM path would create, so the Samsung InCall UI rings
@@ -1617,6 +1649,9 @@ object CNCallEngine {
                 "[CN CALL][ENGINE] signaling $event call_id=$callId cleared=$cleared",
             )
             if (cleared) {
+                NativeCallTokenHelper.cancelReachabilityProof(callId)
+                appContext?.let { markCallEndedLocally(it, callId) }
+                CNCallRegistry.releaseTelecomPresentation(callId)
                 stopCallAudioService(callId)
                 releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): an inbound terminal frame ended this call;
@@ -1664,10 +1699,66 @@ object CNCallEngine {
                     endedCallId = null
                 }
             }
+            if (endedCallId != null) {
+                NativeCallTokenHelper.cancelReachabilityProof(endedCallId)
+                appContext?.let { markCallEndedLocally(it, endedCallId) }
+                CNCallRegistry.releaseTelecomPresentation(endedCallId)
+            }
             stopCallAudioService(endedCallId)
             NativeWebSocketClient.clearPendingFrames()
         }
 
+        /** Reads the same durable local terminal tombstone used by FCM. */
+        private fun isCallEndedLocally(context: Context, callId: String): Boolean {
+            val prefs = context.getSharedPreferences(
+                "FlutterSharedPreferences",
+                Context.MODE_PRIVATE,
+            )
+            val encoded = prefs.getString("flutter.cn_call_ended_call_ids_v2", "[]")
+            return try {
+                val values = org.json.JSONArray(encoded ?: "[]")
+                (0 until values.length())
+                    .asSequence()
+                    .map { values.optString(it).trim() }
+                    .any { it == callId.trim() }
+            } catch (_: Exception) {
+                false
+            }
+        }
+
+        /** Durably marks a UUID terminal before late transport work can revive it. */
+        private fun markCallEndedLocally(context: Context, callId: String) {
+            val id = callId.trim()
+            if (id.isEmpty()) return
+
+            val prefs = context.getSharedPreferences(
+                "FlutterSharedPreferences",
+                Context.MODE_PRIVATE,
+            )
+            val encoded = prefs.getString("flutter.cn_call_ended_call_ids_v2", "[]")
+            val endedIds = try {
+                val values = org.json.JSONArray(encoded ?: "[]")
+                (0 until values.length())
+                    .asSequence()
+                    .map { values.optString(it).trim() }
+                    .filter { it.isNotEmpty() && it != id }
+                    .toMutableList()
+            } catch (_: Exception) {
+                mutableListOf()
+            }
+            endedIds.add(id)
+            if (endedIds.size > 32) {
+                endedIds.subList(0, endedIds.size - 32).clear()
+            }
+            if (!prefs.edit()
+                    .putString("flutter.cn_call_ended_call_ids_v2", org.json.JSONArray(endedIds).toString())
+                    .commit()
+            ) {
+                println(
+                    "[CN CALL][ENGINE] local terminal tombstone commit failed call_id=$id",
+                )
+            }
+        }
         /** Extracts the target user id from an address like "cncall:<id>" or
          * "tel:<id>". Only those two schemes are valid CN CALL addresses; any
          * other (or missing) scheme is rejected. */
