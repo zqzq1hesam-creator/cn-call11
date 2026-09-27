@@ -1366,6 +1366,7 @@ object CNCallEngine {
                     val requestedState =
                         payload["video_state"]?.toIntOrNull()
                             ?: VideoProfile.STATE_AUDIO_ONLY
+                    val context = appContext
                     val wantsVideo =
                         requestedState and
                             (VideoProfile.STATE_TX_ENABLED or
@@ -1381,7 +1382,6 @@ object CNCallEngine {
                     connection.notifyRemoteVideoRequest(requestedState)
 
                     if (wantsVideo) {
-                        val context = appContext
                         if (context == null || !hasCameraPermission(context)) {
                             println(
                                 "[CN CALL][VIDEO] remote request denied " +
