@@ -140,6 +140,28 @@ class CallFirebaseService : FirebaseMessagingService() {
 
         val callId = message.data["call_id"]?.trim().orEmpty()
         if (callId.isEmpty()) return
+
+        val reachabilityChallengeId =
+            message.data["reachability_challenge_id"]?.trim().orEmpty()
+        val reachabilityNonce =
+            message.data["reachability_nonce"]?.trim().orEmpty()
+        val reachabilityUserId =
+            NativeCallTokenHelper.restoreUserId(this)?.trim().orEmpty()
+
+        if (
+            reachabilityChallengeId.isNotEmpty() &&
+            reachabilityNonce.isNotEmpty() &&
+            reachabilityUserId.isNotEmpty()
+        ) {
+            NativeCallTokenHelper.enqueueReachabilityProof(
+                this,
+                reachabilityUserId,
+                callId,
+                reachabilityChallengeId,
+                reachabilityNonce,
+            )
+        }
+
         if (isCallEnded(callId)) {
             println("CN CALL: ignored stale incoming FCM. callId=$callId")
             return
