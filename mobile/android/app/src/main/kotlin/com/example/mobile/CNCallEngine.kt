@@ -900,7 +900,16 @@ object CNCallEngine {
                 context,
                 callId,
                 "caller_offline.mp3",
-            ) {}
+            ) {
+                // The caller-offline recording must finish before Telecom
+                // releases the call. Reuse the existing connection callback
+                // so the normal disconnect/release lifecycle stays centralized.
+                println(
+                    "[CN CALL][CALLER OFFLINE AUDIO] completed; ending call" +
+                        " call_id=$callId",
+                )
+                callbacks?.onDisconnected()
+            }
         }
 
         private fun isScored(callId: String): Boolean {
