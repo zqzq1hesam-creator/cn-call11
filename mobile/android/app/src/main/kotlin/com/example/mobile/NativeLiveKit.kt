@@ -596,8 +596,6 @@ object NativeLiveKit {
         if (remoteTrack != null && remoteRenderer != null) {
             remoteTrack.removeRenderer(remoteRenderer)
         }
-        listener?.onLocalVideoTrackChanged(null)
-        listener?.onRemoteVideoTrackChanged(null)
     }
 
     private fun updateLocalVideoTrack(track: LocalVideoTrack?) {
