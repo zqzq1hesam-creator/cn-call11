@@ -3,7 +3,6 @@ package com.example.mobile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
-import android.media.ToneGenerator
 import android.net.Uri
 import android.provider.CallLog
 import android.telecom.Connection
@@ -72,27 +71,11 @@ class CNCallConnection(
 
             stopOutgoingRingback()
 
-            if (reason == "rejected") {
-                println(
-                    "[CN CALL][TELECOM] remote party rejected call " +
-                        "call_id=$callId tone=TONE_PROP_NACK",
-                )
-                terminateFromRemote(
-                    DisconnectCause(
-                        DisconnectCause.REJECTED,
-                        "",
-                        "",
-                        "remote_rejected",
-                        ToneGenerator.TONE_PROP_NACK,
-                    ),
-                )
-                return
-            }
-
             val assetFileName = when (reason) {
                 "offline" -> "offline.mp3"
                 "busy" -> "busy.mp3"
                 "user_not_found" -> "user_not_found.mp3"
+                "rejected" -> "rejected.mp3"
                 else -> return
             }
 
