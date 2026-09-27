@@ -85,11 +85,15 @@ fcm_token_cleanup_task: asyncio.Task | None = None
 CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
 FCM_TOKEN_STALE_AFTER_DAYS = 30
+# When FCM is the wake-up path, wait for the existing native
+# "call_delivered" ACK before declaring the target unreachable.
+FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS = 5_000
 
 _UNSET = object()
 
 terminal_outbox_task: asyncio.Task | None = None
 terminal_outbox_lock = asyncio.Lock()
+fcm_delivery_watchdog_tasks: dict[str, asyncio.Task] = {}
 
 
 def _mark_active_user(user_id: str, call_id: str, role: str) -> None:
@@ -664,6 +668,97 @@ async def acknowledge_terminal_event(
     return acknowledged
 
 
+async def _fcm_delivery_watchdog(call_id: str) -> None:
+    """
+    Wait for the existing native call_delivered ACK after an FCM-only
+    delivery attempt. No ACK within the configured window means the target
+    is treated as unreachable for this call.
+    """
+    try:
+        await asyncio.sleep(FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS / 1000)
+
+        record = active_calls.get(call_id)
+        if record is None:
+            return
+
+        if str(record["status"]) != "ringing":
+            return
+
+        if bool(record.get("delivery_confirmed")):
+            return
+
+        caller_id = str(record["caller_id"])
+        target_id = str(record["target_id"])
+
+        print(
+            "[CN CALL][FCM DELIVERY TIMEOUT]",
+            "call_id=", call_id,
+            "caller=", caller_id,
+            "target=", target_id,
+            "timeout_ms=", FCM_DELIVERY_CONFIRMATION_TIMEOUT_MS,
+        )
+
+        # The durable call becomes missed and is still replayable to the target
+        # when it reconnects. Notify the caller using the existing documented
+        # call_reject/offline protocol.
+        finalize_call_terminal(
+            call_id,
+            "missed",
+            [],
+        )
+
+        caller_socket = connections.get(caller_id)
+        notified = False
+
+        if caller_socket is not None:
+            try:
+                await caller_socket.send_json({
+                    "type": "call_reject",
+                    "call_id": call_id,
+                    "target_id": target_id,
+                    "from_id": target_id,
+                    "reason": "offline",
+                })
+                notified = True
+                print(
+                    "[CN CALL][FCM DELIVERY TIMEOUT] caller notified via WS",
+                    "call_id=", call_id,
+                )
+            except Exception as exc:
+                print(
+                    "[CN CALL][FCM DELIVERY TIMEOUT] caller WS failed",
+                    "call_id=", call_id,
+                    "error=", exc,
+                )
+
+        if not notified:
+            await send_call_notification_async(
+                target_id=caller_id,
+                caller_id=target_id,
+                caller_name="مستخدم CN CALL",
+                call_id=call_id,
+                message_type="call_reject",
+                reason="offline",
+            )
+            print(
+                "[CN CALL][FCM DELIVERY TIMEOUT] caller notified via FCM",
+                "call_id=", call_id,
+            )
+    except asyncio.CancelledError:
+        raise
+    finally:
+        current = asyncio.current_task()
+        if fcm_delivery_watchdog_tasks.get(call_id) is current:
+            fcm_delivery_watchdog_tasks.pop(call_id, None)
+
+
+def _start_fcm_delivery_watchdog(call_id: str) -> None:
+    existing = fcm_delivery_watchdog_tasks.get(call_id)
+    if existing is not None and not existing.done():
+        existing.cancel()
+
+    task = asyncio.create_task(_fcm_delivery_watchdog(call_id))
+    fcm_delivery_watchdog_tasks[call_id] = task
 
 
 async def release_calls_for_user(user_id: str, token: str | None = None):
@@ -703,6 +798,10 @@ async def release_calls_for_user(user_id: str, token: str | None = None):
             if message_type == "call_reject"
             else "ended"
         )
+
+        watchdog = fcm_delivery_watchdog_tasks.pop(call_id, None)
+        if watchdog is not None and not watchdog.done():
+            watchdog.cancel()
 
         event_ids = finalize_call_terminal(
             call_id,
@@ -1879,6 +1978,7 @@ def send_call_notification(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    reason: str | None = None,
 ) -> bool:
     token = FCM_TOKENS.get(target_id)
 
@@ -1923,6 +2023,11 @@ def send_call_notification(
                 **(
                     {"event_id": event_id}
                     if event_id
+                    else {}
+                ),
+                **(
+                    {"reason": reason}
+                    if reason
                     else {}
                 ),
             },
@@ -1975,6 +2080,7 @@ async def send_call_notification_async(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    reason: str | None = None,
 ) -> bool:
     """Run the blocking Firebase Admin SDK send outside FastAPI's event loop."""
     return await asyncio.to_thread(
@@ -1985,6 +2091,7 @@ async def send_call_notification_async(
         call_id=call_id,
         message_type=message_type,
         event_id=event_id,
+        reason=reason,
     )
 
 
@@ -2519,6 +2626,12 @@ async def websocket_endpoint(
                         f"fcm={'SENT' if fcm_sent else 'FAILED'}"
                     )
 
+                    # FCM send() success means Firebase accepted the message,
+                    # not that the phone received it. Wait for the existing
+                    # native call_delivered ACK for five seconds before deciding
+                    # that this target is unreachable for this call.
+                    _start_fcm_delivery_watchdog(call_id)
+
                 continue
 
             record = active_calls.get(call_id)
@@ -2570,6 +2683,16 @@ async def websocket_endpoint(
                 # delivery ACK to the caller.
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "ringing"
+                if allowed:
+                    record["delivery_confirmed"] = True
+                    watchdog = fcm_delivery_watchdog_tasks.pop(call_id, None)
+                    if watchdog is not None and not watchdog.done():
+                        watchdog.cancel()
+                    print(
+                        "[CN CALL][CALL DELIVERED ACK]",
+                        "call_id=", call_id,
+                        "target=", user_id,
+                    )
             elif message_type == "call_accept":
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "accepted"
