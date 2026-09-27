@@ -287,6 +287,75 @@ async def _record_reachability_response(
     return True, "proven"
 
 
+async def _finalize_target_offline(call_id: str, source: str) -> bool:
+    """End a pre-delivery ringing call as target-offline and notify its caller.
+
+    Offline is valid only before the target has acknowledged Telecom delivery.
+    This prevents a later target disconnect from being mislabeled as offline.
+    """
+    record = active_calls.get(call_id)
+    if record is None:
+        return False
+
+    if str(record["status"]) != "ringing":
+        return False
+
+    if bool(record.get("delivery_confirmed")):
+        return False
+
+    if record.get("reachability_proven_at") is not None:
+        return False
+
+    caller_id = str(record["caller_id"])
+    target_id = str(record["target_id"])
+    caller_name = str(record.get("caller_name", "مستخدم CN CALL"))
+
+    finalized = finalize_call_terminal(
+        call_id,
+        "missed",
+        [],
+    )
+    if not finalized:
+        return False
+
+    caller_socket = connections.get(caller_id)
+    caller_notified = False
+    if caller_socket is not None:
+        try:
+            await caller_socket.send_json({
+                "type": "call_reject",
+                "call_id": call_id,
+                "target_id": caller_id,
+                "from_id": target_id,
+                "reason": "offline",
+            })
+            caller_notified = True
+        except Exception as exc:
+            print(
+                "[CN CALL][TARGET OFFLINE] caller notification failed "
+                f"call_id={call_id} caller={caller_id} error={exc}",
+            )
+
+    await send_call_notification_async(
+        target_id=target_id,
+        caller_id=caller_id,
+        caller_name=caller_name,
+        call_id=call_id,
+        message_type="missed_call",
+    )
+
+    print(
+        "[CN CALL][TARGET OFFLINE]",
+        "call_id=", call_id,
+        "caller=", caller_id,
+        "target=", target_id,
+        "source=", source,
+        "caller_notified=", caller_notified,
+    )
+    return True
+
+
+
 def _ready_users_to_json(users) -> str:
     """Serialize the media-ready user set stored in call_records."""
     if users is None:
@@ -1043,24 +1112,30 @@ async def expire_active_calls():
         record = active_calls.get(call_id)
         if record is None:
             continue
+
+        if (
+            str(record["status"]) == "ringing"
+            and not bool(record.get("delivery_confirmed"))
+            and record.get("reachability_proven_at") is None
+        ):
+            await _finalize_target_offline(
+                call_id,
+                "ring_expiry_without_delivery",
+            )
+            continue
+
         caller_id = str(record["caller_id"])
         target_id = str(record["target_id"])
         terminal_status = (
-            "missed"
+            "timeout"
             if str(record["status"]) == "ringing"
             else "timeout"
         )
 
-        terminal_events = (
-            [
-                (target_id, "call_cancelled", caller_id),
-            ]
-            if terminal_status == "missed"
-            else [
-                (target_id, "hangup", caller_id),
-                (caller_id, "hangup", target_id),
-            ]
-        )
+        terminal_events = [
+            (target_id, "hangup", caller_id),
+            (caller_id, "hangup", target_id),
+        ]
 
         event_ids = finalize_call_terminal(
             call_id,
@@ -2642,6 +2717,18 @@ async def websocket_endpoint(
                     str(message.get("network_validated", "")).strip().lower() == "true"
                 )
                 _record_presence_lease(user_id, network_validated)
+
+                if not network_validated:
+                    for active_call_id, rec in list(active_calls.items()):
+                        if (
+                            str(rec["target_id"]) == user_id
+                            and str(rec["status"]) == "ringing"
+                        ):
+                            await _finalize_target_offline(
+                                active_call_id,
+                                "presence_heartbeat",
+                            )
+
                 await websocket.send_json({
                     "type": "presence_ack",
                     "user_id": user_id,
@@ -2660,12 +2747,18 @@ async def websocket_endpoint(
                     ),
                 )
                 if not proof_ok:
-                    await websocket.send_json({
-                        "type": "signaling_rejected",
-                        "call_id": call_id,
-                        "message_type": message_type,
-                        "reason": proof_reason,
-                    })
+                    if proof_reason == "network_not_validated":
+                        await _finalize_target_offline(
+                            call_id,
+                            "reachability_response",
+                        )
+                    else:
+                        await websocket.send_json({
+                            "type": "signaling_rejected",
+                            "call_id": call_id,
+                            "message_type": message_type,
+                            "reason": proof_reason,
+                        })
                 continue
 
             if message_type == "terminal_ack":
