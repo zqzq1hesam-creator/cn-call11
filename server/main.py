@@ -615,14 +615,6 @@ def finalize_call_terminal(
     if record is None:
         return event_ids
 
-    watchdog = fcm_delivery_watchdog_tasks.pop(call_id, None)
-    if (
-        watchdog is not None
-        and watchdog is not asyncio.current_task()
-        and not watchdog.done()
-    ):
-        watchdog.cancel()
-
     record["status"] = str(new_status)
     record["negotiation_expires_at"] = None
     record["connection_expires_at"] = None
