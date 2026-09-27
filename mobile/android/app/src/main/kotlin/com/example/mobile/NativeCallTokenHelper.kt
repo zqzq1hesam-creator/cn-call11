@@ -7,6 +7,7 @@ import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.util.concurrent.Callable
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -68,6 +69,15 @@ object NativeCallTokenHelper {
         }
     }
 
+    private val deliveryHttpClient: OkHttpClient by lazy {
+        httpClient.newBuilder()
+            .connectTimeout(3, TimeUnit.SECONDS)
+            .readTimeout(3, TimeUnit.SECONDS)
+            .callTimeout(4, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(false)
+            .build()
+    }
+
     /** Result of a LiveKit token fetch. */
     data class LiveKitTokenResult(
         val url: String,
@@ -119,6 +129,51 @@ object NativeCallTokenHelper {
         return runTokenFetch { fetch(url = url, accessToken = accessToken) }
     }
 
+    /**
+     * Sends the native Telecom delivery proof directly to CN CALL over HTTPS.
+     * This does not depend on the signaling WebSocket handshake.
+     */
+    fun enqueueCallDelivered(
+        context: Context,
+        userId: String,
+        callId: String,
+    ): Boolean {
+        val accessToken = restoreAccessToken(context) ?: return false
+        if (userId.isBlank() || callId.isBlank()) return false
+
+        val url = HttpUrl.Builder()
+            .scheme("https")
+            .host(HOST)
+            .addPathSegment("calls")
+            .addPathSegment(callId)
+            .addPathSegment("delivered")
+            .build()
+
+        tokenExecutor.execute {
+            try {
+                val request = Request.Builder()
+                    .url(url)
+                    .header("Authorization", "Bearer $accessToken")
+                    .post(ByteArray(0).toRequestBody(null))
+                    .build()
+
+                deliveryHttpClient.newCall(request).execute().use { response ->
+                    println(
+                        "[CN CALL][HTTPS DELIVERY ACK] " +
+                            "call_id=$callId user=$userId " +
+                            "status=${response.code} success=${response.isSuccessful}",
+                    )
+                }
+            } catch (e: Exception) {
+                println(
+                    "[CN CALL][HTTPS DELIVERY ACK FAILED] " +
+                        "call_id=$callId user=$userId error=$e",
+                )
+            }
+        }
+
+        return true
+    }
     private fun fetch(url: HttpUrl, accessToken: String): LiveKitTokenResult? {
         return try {
             val request = Request.Builder()
