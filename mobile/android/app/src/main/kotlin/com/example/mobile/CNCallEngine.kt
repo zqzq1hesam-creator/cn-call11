@@ -1750,16 +1750,6 @@ object CNCallEngine {
         }
 
         val appCtx = context.applicationContext
-        NativeWebSocketClient.configure(appCtx)
-
-        if (!NativeWebSocketClient.tryAcquireNativeOwnership(appCtx)) {
-            println(
-                "[CN CALL][ENGINE] delivery_ack refused: native signaling ownership unavailable" +
-                    " call_id=$id",
-            )
-            return false
-        }
-
         val userId = NativeCallTokenHelper.restoreUserId(appCtx)
         val token = NativeCallTokenHelper.restoreAccessToken(appCtx)
 
@@ -1771,25 +1761,47 @@ object CNCallEngine {
             return false
         }
 
-        val connectedOrConnecting =
-            NativeWebSocketClient.connect(userId.trim(), token.trim())
-
-        val sent = NativeWebSocketClient.send(
-            "call_delivered",
-            mapOf(
-                "call_id" to id,
-                "target_id" to caller,
-                "from_id" to userId.trim(),
-            ),
+        // Primary delivery proof: HTTPS is independent of the signaling
+        // WebSocket handshake and is queued immediately after Telecom enters
+        // the RINGING state.
+        val httpsQueued = NativeCallTokenHelper.enqueueCallDelivered(
+            appCtx,
+            userId.trim(),
+            id,
         )
+
+        // Redundant fallback: retain the existing WebSocket ACK. The server
+        // treats both transports as the same idempotent delivery confirmation.
+        NativeWebSocketClient.configure(appCtx)
+        val wsOwned = NativeWebSocketClient.tryAcquireNativeOwnership(appCtx)
+        val wsQueued =
+            if (wsOwned) {
+                val connectedOrConnecting =
+                    NativeWebSocketClient.connect(userId.trim(), token.trim())
+                NativeWebSocketClient.send(
+                    "call_delivered",
+                    mapOf(
+                        "call_id" to id,
+                        "target_id" to caller,
+                        "from_id" to userId.trim(),
+                    ),
+                ).also {
+                    println(
+                        "[CN CALL][ENGINE] delivery WS fallback" +
+                            " call_id=$id connected_or_connecting=$connectedOrConnecting queued=$it",
+                    )
+                }
+            } else {
+                false
+            }
 
         println(
             "[CN CALL][ENGINE] delivery_ack" +
                 " call_id=$id caller=$caller" +
-                " connected_or_connecting=$connectedOrConnecting sent=$sent",
+                " https_queued=$httpsQueued ws_queued=$wsQueued",
         )
 
-        return sent
+        return httpsQueued || wsQueued
     }
 
     fun hasRecordAudioPermission(context: Context): Boolean {
