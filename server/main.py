@@ -1039,7 +1039,9 @@ async def expire_active_calls():
     now = int(time.time() * 1000)
     expired_ids = set()
 
-    for call_id, record in active_calls.items():
+    # Iterate over a stable snapshot because terminal finalization can
+    # remove the current call from active_calls while this async loop awaits.
+    for call_id, record in list(active_calls.items()):
         status = str(record["status"])
 
         if status == "ringing":
