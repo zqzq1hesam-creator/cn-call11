@@ -272,12 +272,7 @@ object NativeLiveKit {
             }
 
             try {
-                val changed = target.localParticipant.setCameraEnabled(enabled)
-                if (!changed) {
-                    throw IllegalStateException(
-                        "LiveKit camera enable failed",
-                    )
-                }
+                target.localParticipant.setCameraEnabled(enabled)
 
                 if (attempt != generation ||
                     state != NewNativeLiveKitState.CONNECTED
