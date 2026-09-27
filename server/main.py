@@ -87,6 +87,25 @@ CONNECTED_IDLE_TIMEOUT_MS = 60_000
 TERMINAL_EVENT_FCM_AFTER_MS = 30000
 FCM_TOKEN_STALE_AFTER_DAYS = 30
 
+# Developer identity is server-authoritative. The client may request any
+# caller name, but only this configured user id receives the reserved developer
+# identity. These values are presentation policy kept on the server.
+CN_CALL_DEVELOPER_ID = os.getenv("CN_CALL_DEVELOPER_ID", "780331040").strip()
+CN_CALL_DEVELOPER_NAME = (
+    os.getenv("CN_CALL_DEVELOPER_NAME", "هشام الريمي").strip()
+    or "هشام الريمي"
+)
+CN_CALL_DEVELOPER_BADGE = (
+    os.getenv("CN_CALL_DEVELOPER_BADGE", "مطوّر CN CALL").strip()
+    or "مطوّر CN CALL"
+)
+_RESERVED_DEVELOPER_PHRASES = (
+    "مطوّر cn call",
+    "مطور cn call",
+    "developer cn call",
+    "cn call developer",
+)
+
 # Presence is a short, server-observed lease. It is refreshed by the native
 # signaling client only while its WebSocket is connected and Android reports
 # a validated network. A lease proves recent reachability, not call delivery.
@@ -1806,6 +1825,46 @@ def authenticated_user(authorization: str | None) -> str | None:
     return access_tokens.get(token)
 
 
+def _normalized_identity_text(value: str) -> str:
+    return " ".join(str(value).strip().casefold().split())
+
+
+def _contains_reserved_developer_phrase(value: str) -> bool:
+    normalized = _normalized_identity_text(value)
+    return bool(normalized) and any(
+        phrase in normalized
+        for phrase in _RESERVED_DEVELOPER_PHRASES
+    )
+
+
+def _server_verified_caller_name(
+    caller_id: str,
+    supplied_name: str,
+    fallback_name: str = "مستخدم CN CALL",
+) -> str:
+    """Return the only caller display identity the server will allow."""
+    caller_id = str(caller_id).strip()
+    if caller_id == CN_CALL_DEVELOPER_ID:
+        return f"{CN_CALL_DEVELOPER_NAME} · {CN_CALL_DEVELOPER_BADGE}"
+
+    candidate = str(supplied_name).strip()
+    if not candidate:
+        candidate = str(fallback_name).strip() or "مستخدم CN CALL"
+
+    if _contains_reserved_developer_phrase(candidate):
+        return str(fallback_name).strip() or "مستخدم CN CALL"
+
+    return candidate
+
+
+def _developer_profile_for_user(user_id: str) -> tuple[bool, str | None]:
+    is_developer = str(user_id).strip() == CN_CALL_DEVELOPER_ID
+    return (
+        is_developer,
+        CN_CALL_DEVELOPER_BADGE if is_developer else None,
+    )
+
+
 def refresh_active_call_token(user_id: str, token: str) -> int:
     """Refresh the signaling credential cached by any active call for a user.
 
@@ -1994,6 +2053,15 @@ async def register(request: RegisterRequest):
             "message": "اسم المستخدم يجب أن يكون 3 أحرف على الأقل",
         }
 
+    if (
+        user_id != CN_CALL_DEVELOPER_ID
+        and _contains_reserved_developer_phrase(username)
+    ):
+        return {
+            "success": False,
+            "message": "هذا الاسم محجوز لهوية مطوّر CN CALL",
+        }
+
     if len(password) < 6:
         return {
             "success": False,
@@ -2038,12 +2106,15 @@ async def register(request: RegisterRequest):
     db.commit()
     db.close()
 
+    is_developer, developer_badge = _developer_profile_for_user(user_id)
     return {
         "success": True,
         "message": "تم إنشاء الحساب بنجاح",
         "user": {
             "user_id": user_id,
             "username": username,
+            "is_developer": is_developer,
+            "developer_badge": developer_badge,
         },
     }
 
@@ -2102,12 +2173,15 @@ async def login(request: LoginRequest):
         if connections.get(user["user_id"]) is old_connection:
             del connections[user["user_id"]]
 
+    is_developer, developer_badge = _developer_profile_for_user(user["user_id"])
     return {
         "success": True,
         "message": "تم تسجيل الدخول بنجاح",
         "user": {
             "user_id": user["user_id"],
             "username": user["username"],
+            "is_developer": is_developer,
+            "developer_badge": developer_badge,
         },
         "access_token": token,
     }
@@ -2143,12 +2217,15 @@ async def get_user(
             "message": "المستخدم غير موجود",
         }
 
+    is_developer, developer_badge = _developer_profile_for_user(user["user_id"])
     return {
         "success": True,
         "user": {
             "user_id": user["user_id"],
             "username": user["username"],
             "online": user["user_id"] in connections,
+            "is_developer": is_developer,
+            "developer_badge": developer_badge,
         },
     }
 
@@ -2797,6 +2874,10 @@ async def websocket_endpoint(
                     "SELECT user_id FROM users WHERE user_id = ?",
                     (target_id,),
                 ).fetchone()
+                caller_user = db.execute(
+                    "SELECT username FROM users WHERE user_id = ?",
+                    (user_id,),
+                ).fetchone()
                 existing = db.execute(
                     "SELECT status FROM call_records WHERE call_id = ?",
                     (call_id,),
@@ -2815,6 +2896,20 @@ async def websocket_endpoint(
                         f"call_id={call_id} from={user_id} target={target_id} reason=user_not_found"
                     )
                     continue
+
+                caller_fallback_name = (
+                    str(caller_user["username"]).strip()
+                    if caller_user is not None
+                    else ""
+                )
+                verified_caller_name = _server_verified_caller_name(
+                    user_id,
+                    str(message.get("caller_name", "")),
+                    caller_fallback_name,
+                )
+                # From this point onward every WS/FCM/DB copy of this call uses
+                # the server-verified identity, never an untrusted client value.
+                message["caller_name"] = verified_caller_name
 
                 if existing is not None:
                     await websocket.send_json({
