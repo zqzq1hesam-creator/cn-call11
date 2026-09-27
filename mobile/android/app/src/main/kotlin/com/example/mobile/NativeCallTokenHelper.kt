@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Looper
+import okhttp3.Call
 import okhttp3.HttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -46,6 +47,13 @@ import java.util.concurrent.TimeUnit
  * the engine is expected to call this from a Telecom/Binder worker thread.
  */
 object NativeCallTokenHelper {
+
+    // Reachability HTTP calls are explicitly cancelable per call_id. This
+    // prevents duplicate FCM/WS challenges from surviving a local call end.
+    private val reachabilityLock = Any()
+    private val canceledReachabilityCallIds = LinkedHashSet<String>()
+    private val reachabilityCalls = mutableMapOf<String, MutableSet<Call>>()
+    private const val MAX_CANCELED_REACHABILITY_CALL_IDS = 128
 
     // Same storage the Flutter shared_preferences plugin and the existing
     // native code (MainActivity.kt, CallFirebaseService.kt) read from.
@@ -102,6 +110,15 @@ object NativeCallTokenHelper {
             return false
         }
 
+        synchronized(reachabilityLock) {
+            if (canceledReachabilityCallIds.contains(callId)) {
+                println(
+                    "[CN CALL][HTTPS REACHABILITY] skipped canceled call_id=$callId",
+                )
+                return false
+            }
+        }
+
         val networkValidated = hasValidatedInternet(context)
         val body = JSONObject()
             .put("challenge_id", challengeId)
@@ -119,15 +136,32 @@ object NativeCallTokenHelper {
             .build()
 
         tokenExecutor.execute {
-            try {
-                val request = Request.Builder()
-                    .url(url)
-                    .header("Authorization", "Bearer $accessToken")
-                    .header("Content-Type", "application/json")
-                    .post(body)
-                    .build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Authorization", "Bearer $accessToken")
+                .header("Content-Type", "application/json")
+                .post(body)
+                .build()
 
-                deliveryHttpClient.newCall(request).execute().use { httpResponse ->
+            val call = synchronized(reachabilityLock) {
+                if (canceledReachabilityCallIds.contains(callId)) {
+                    null
+                } else {
+                    deliveryHttpClient.newCall(request).also { pending ->
+                        reachabilityCalls
+                            .getOrPut(callId) { mutableSetOf() }
+                            .add(pending)
+                    }
+                }
+            } ?: run {
+                println(
+                    "[CN CALL][HTTPS REACHABILITY] dropped before send: canceled call_id=$callId",
+                )
+                return@execute
+            }
+
+            try {
+                call.execute().use { httpResponse ->
                     println(
                         "[CN CALL][HTTPS REACHABILITY] " +
                             "call_id=$callId user=$userId " +
@@ -141,10 +175,51 @@ object NativeCallTokenHelper {
                     "[CN CALL][HTTPS REACHABILITY FAILED] " +
                         "call_id=$callId user=$userId error=$error",
                 )
+            } finally {
+                synchronized(reachabilityLock) {
+                    val pending = reachabilityCalls[callId]
+                    pending?.remove(call)
+                    if (pending?.isEmpty() == true) {
+                        reachabilityCalls.remove(callId)
+                    }
+                }
             }
         }
 
         return true
+    }
+
+    /**
+     * Hard-cancels all queued/in-flight Reachability Proof requests for a call.
+     * The call_id is also tombstoned in this process so a late duplicate
+     * challenge cannot enqueue another proof after termination.
+     */
+    fun cancelReachabilityProof(callId: String) {
+        val id = callId.trim()
+        if (id.isEmpty()) return
+
+        val toCancel: List<Call>
+        synchronized(reachabilityLock) {
+            canceledReachabilityCallIds.add(id)
+            while (canceledReachabilityCallIds.size > MAX_CANCELED_REACHABILITY_CALL_IDS) {
+                val iterator = canceledReachabilityCallIds.iterator()
+                if (!iterator.hasNext()) break
+                iterator.next()
+                iterator.remove()
+            }
+            toCancel = reachabilityCalls.remove(id)?.toList().orEmpty()
+        }
+
+        toCancel.forEach { pending ->
+            try {
+                pending.cancel()
+            } catch (_: Exception) {
+            }
+        }
+
+        println(
+            "[CN CALL][HTTPS REACHABILITY] canceled call_id=$id pending=${toCancel.size}",
+        )
     }
 
     private fun hasValidatedInternet(context: Context): Boolean {
