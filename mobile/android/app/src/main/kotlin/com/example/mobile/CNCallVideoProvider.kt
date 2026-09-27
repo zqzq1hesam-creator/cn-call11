@@ -75,7 +75,7 @@ class CNCallVideoProvider(
         listener.onRequestCameraCapabilities()
     }
 
-    override fun onRequestCallDataUsage() {
+    override fun onRequestConnectionDataUsage() {
         listener.onRequestCallDataUsage()
     }
 
