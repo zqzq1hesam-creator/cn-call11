@@ -1063,6 +1063,22 @@ async def expire_active_calls():
         status = str(record["status"])
 
         if status == "ringing":
+            # A stale presence lease is the server-side evidence that the
+            # target is no longer reachable. This is separate from the 90s
+            # ringing deadline and is only valid before delivery/reachability
+            # has been confirmed.
+            if (
+                not bool(record.get("delivery_confirmed"))
+                and record.get("reachability_proven_at") is None
+                and str(record["target_id"]) not in connections
+                and not _presence_is_fresh(str(record["target_id"]))
+            ):
+                await _finalize_target_offline(
+                    call_id,
+                    "presence_lease_stale",
+                )
+                continue
+
             if int(record["ring_expires_at"]) <= now:
                 expired_ids.add(call_id)
             continue
