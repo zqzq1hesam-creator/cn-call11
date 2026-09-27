@@ -1362,6 +1362,108 @@ object CNCallEngine {
                     }
                 }
 
+                "call_video_request" -> {
+                    val requestedState =
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY
+                    val wantsVideo =
+                        requestedState and
+                            (VideoProfile.STATE_TX_ENABLED or
+                                VideoProfile.STATE_RX_ENABLED) != 0
+
+                    val connection =
+                        CNCallRegistry.get(frameCallId)?.connection
+                            as? CNCallConnection
+                    if (connection == null) {
+                        return@handleSignalingFrame
+                    }
+
+                    connection.notifyRemoteVideoRequest(requestedState)
+
+                    if (wantsVideo) {
+                        val context = appContext
+                        if (context == null || !hasCameraPermission(context)) {
+                            println(
+                                "[CN CALL][VIDEO] remote request denied " +
+                                    "call_id=" + frameCallId +
+                                    " camera_permission=false",
+                            )
+                            sendVideoResponse(
+                                frameCallId,
+                                false,
+                                VideoProfile.STATE_AUDIO_ONLY,
+                            )
+                            return@handleSignalingFrame
+                        }
+
+                        if (!CNCallVideoService.startForCall(context, frameCallId)) {
+                            sendVideoResponse(
+                                frameCallId,
+                                false,
+                                VideoProfile.STATE_AUDIO_ONLY,
+                            )
+                            return@handleSignalingFrame
+                        }
+                    }
+
+                    NativeLiveKit.setCameraEnabled(wantsVideo) { error ->
+                        val success = error == null
+                        if (success) {
+                            if (!wantsVideo) {
+                                context?.let {
+                                    CNCallVideoService.stopForCall(
+                                        it,
+                                        frameCallId,
+                                    )
+                                }
+                            }
+
+                            connection.updateVideoState(
+                                if (wantsVideo) {
+                                    VideoProfile.STATE_BIDIRECTIONAL
+                                } else {
+                                    VideoProfile.STATE_AUDIO_ONLY
+                                },
+                            )
+                        }
+
+                        sendVideoResponse(
+                            frameCallId,
+                            success,
+                            if (wantsVideo) {
+                                VideoProfile.STATE_BIDIRECTIONAL
+                            } else {
+                                VideoProfile.STATE_AUDIO_ONLY
+                            },
+                        )
+                    }
+                }
+
+                "call_video_response" -> {
+                    val responseState =
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY
+                    val success =
+                        payload["success"]?.trim()?.equals(
+                            "true",
+                            ignoreCase = true,
+                        ) == true
+
+                    val connection =
+                        CNCallRegistry.get(frameCallId)?.connection
+                            as? CNCallConnection
+                    if (connection != null) {
+                        connection.completeVideoSessionModify(
+                            responseState,
+                            success,
+                        )
+                    }
+
+                    if (success) {
+                        handleVideoResponse(frameCallId, responseState)
+                    }
+                }
+
                 "call_started" -> {
                     // Caller-side ack that the server accepted the call.
                     // target_online is the server's presence/delivery result:
