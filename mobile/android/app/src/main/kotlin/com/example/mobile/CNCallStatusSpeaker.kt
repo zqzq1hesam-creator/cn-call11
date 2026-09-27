@@ -106,10 +106,7 @@ object CNCallStatusSpeaker {
         try {
             player.setAudioAttributes(
                 AudioAttributes.Builder()
-                    // Status recordings play before Telecom marks the call
-                    // ACTIVE, so they must use the normal media output path.
-                    // The actual call audio remains owned by Telecom/LiveKit.
-                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build(),
             )
