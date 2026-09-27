@@ -1446,6 +1446,7 @@ object CNCallEngine {
                         reason == "offline" -> "offline"
                         reason == "busy" -> "busy"
                         reason == "user_not_found" -> "user_not_found"
+                        reason == "rejected" -> "rejected"
                         else -> null
                     }
 
