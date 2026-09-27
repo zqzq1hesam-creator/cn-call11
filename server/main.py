@@ -1046,15 +1046,17 @@ async def expire_active_calls():
         status = str(record["status"])
 
         if status == "ringing":
-            # A stale presence lease is the server-side evidence that the
-            # target is no longer reachable. This is separate from the 90s
-            # ringing deadline and is only valid before delivery/reachability
-            # has been confirmed.
+            # A stale presence lease alone is not enough to classify an
+            # FCM-capable target as offline: FCM can wake the device and the
+            # Telecom presentation can be acknowledged after this server-side
+            # lease has expired. Only use the stale-lease shortcut when there
+            # is no FCM registration available for the target.
             if (
                 not bool(record.get("delivery_confirmed"))
                 and record.get("reachability_proven_at") is None
                 and str(record["target_id"]) not in connections
                 and not _presence_is_fresh(str(record["target_id"]))
+                and not bool(FCM_TOKENS.get(str(record["target_id"])))
             ):
                 await _finalize_target_offline(
                     call_id,
