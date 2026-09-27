@@ -1452,16 +1452,14 @@ object CNCallEngine {
                     val connection =
                         CNCallRegistry.get(frameCallId)?.connection
                             as? CNCallConnection
-                    if (connection != null) {
-                        connection.completeVideoSessionModify(
-                            responseState,
-                            success,
-                        )
-                    }
-
-                    if (success) {
-                        handleVideoResponse(frameCallId, responseState)
-                    }
+                    handleVideoResponse(
+                        frameCallId,
+                        if (success) {
+                            responseState
+                        } else {
+                            VideoProfile.STATE_AUDIO_ONLY
+                        },
+                    )
                 }
 
                 "call_started" -> {
@@ -1865,16 +1863,6 @@ object CNCallEngine {
                 return false
             }
 
-            if (wantsVideo &&
-                !CNCallVideoService.startForCall(context, callId)
-            ) {
-                println(
-                    "[CN CALL][VIDEO] video FGS start failed call_id=" +
-                        callId,
-                )
-                return false
-            }
-
             val requestId = UUID.randomUUID().toString()
             val sent = NativeWebSocketClient.send(
                 "call_video_request",
@@ -1886,10 +1874,6 @@ object CNCallEngine {
                     "request_id" to requestId,
                 ),
             )
-
-            if (!sent && wantsVideo) {
-                CNCallVideoService.stopForCall(context, callId)
-            }
 
             println(
                 "[CN CALL][VIDEO] request call_id=" + callId +
@@ -1926,6 +1910,13 @@ object CNCallEngine {
                         "[CN CALL][VIDEO] apply state failed call_id=" +
                             callId + " error=" + error.message,
                     )
+                    CNCallVideoService.stopForCall(context, callId)
+                    CNCallRegistry.get(callId)?.connection
+                        ?.let { it as? CNCallConnection }
+                        ?.completeVideoSessionModify(
+                            VideoProfile.STATE_AUDIO_ONLY,
+                            false,
+                        )
                     return@setCameraEnabled
                 }
 
@@ -1933,14 +1924,17 @@ object CNCallEngine {
                     CNCallVideoService.stopForCall(context, callId)
                 }
 
+                val finalState =
+                    if (wantsVideo) {
+                        VideoProfile.STATE_BIDIRECTIONAL
+                    } else {
+                        VideoProfile.STATE_AUDIO_ONLY
+                    }
+
                 CNCallRegistry.get(callId)?.connection
-                    ?.let { it as? CNCallConnection }
-                    ?.updateVideoState(
-                        if (wantsVideo) {
-                            VideoProfile.STATE_BIDIRECTIONAL
-                        } else {
-                            VideoProfile.STATE_AUDIO_ONLY
-                        },
+                    ?.completeVideoSessionModify(
+                        finalState,
+                        true,
                     )
             }
             return true
