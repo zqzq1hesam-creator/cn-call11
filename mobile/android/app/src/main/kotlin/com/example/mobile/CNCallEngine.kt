@@ -2534,7 +2534,12 @@ object CNCallEngine {
             return unavailable("startIncoming", callId, callbacks, "Native call engine is not initialized")
         }
 
-        return currentDelegate.startIncoming(callId, callerId, callerName)
+        return currentDelegate.startIncoming(
+            callId,
+            callerId,
+            callerName,
+            videoState,
+        )
     }
 
     fun prepareIncomingSignaling(callId: String): Boolean {
@@ -2560,7 +2565,11 @@ object CNCallEngine {
             return unavailable("startOutgoing", callId, callbacks, "Native call engine is not initialized")
         }
 
-        return currentDelegate.startOutgoing(callId, address)
+        return currentDelegate.startOutgoing(
+            callId,
+            address,
+            videoState,
+        )
     }
 
     fun answer(callId: String): Boolean {
