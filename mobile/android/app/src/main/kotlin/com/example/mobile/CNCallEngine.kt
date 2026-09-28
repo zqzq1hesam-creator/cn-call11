@@ -120,6 +120,12 @@ object CNCallEngine {
         fun setSpeaker(callId: String, speaker: Boolean): Boolean
         fun requestVideoState(callId: String, fromVideoState: Int, toVideoState: Int): Boolean
         fun handleVideoResponse(callId: String, videoState: Int): Boolean
+        fun handleRemoteVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+            requestId: String,
+        ): Boolean
         fun switchVideoCamera(callId: String, cameraId: String): Boolean
         fun setLocalVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
         fun setRemoteVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
