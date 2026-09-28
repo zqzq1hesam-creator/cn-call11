@@ -8,6 +8,7 @@ import android.telecom.VideoProfile
 import android.view.Surface
 import livekit.org.webrtc.EglBase
 import livekit.org.webrtc.GlRectDrawer
+import livekit.org.webrtc.EglRenderer
 import livekit.org.webrtc.SurfaceEglRenderer
 import livekit.org.webrtc.ThreadUtils
 import livekit.org.webrtc.VideoSink
@@ -269,26 +270,27 @@ class CNCallVideoProvider(
         }
     }
 
-    private fun sameSurface(first: Surface?, second: Surface): Boolean {
     private fun installRenderDiagnostics(
         renderer: SurfaceEglRenderer,
         label: String,
     ) {
         val renderCount = AtomicInteger(0)
-        renderer.addRenderListener(
-            SurfaceEglRenderer.RenderListener { timestampNs ->
+        val frameListener = object : EglRenderer.FrameListener {
+            override fun onFrame(frame: android.graphics.Bitmap?) {
                 val count = renderCount.incrementAndGet()
                 if (count <= 3 || count % 60 == 0) {
                     println(
                         "[CN CALL][VIDEO RENDER] " + label +
-                            " swapBuffers count=" + count +
-                            " ts=" + timestampNs,
+                            " completed count=" + count,
                     )
                 }
-            },
-        )
+                renderer.addFrameListener(this, 0f)
+            }
+        }
+
+        renderer.addFrameListener(frameListener, 0f)
         renderer.setErrorCallback(
-            object : SurfaceEglRenderer.ErrorCallback {
+            object : EglRenderer.ErrorCallback {
                 override fun onGlOutOfMemory() {
                     println(
                         "[CN CALL][VIDEO RENDER ERROR] " + label +
@@ -299,6 +301,7 @@ class CNCallVideoProvider(
         )
     }
 
+    private fun sameSurface(first: Surface?, second: Surface): Boolean {
         if (first == null) return false
         return first === second || first == second
     }
