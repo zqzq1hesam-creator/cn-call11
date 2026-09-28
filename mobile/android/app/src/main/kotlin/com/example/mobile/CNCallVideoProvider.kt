@@ -231,11 +231,6 @@ class CNCallVideoProvider(
 
             val activeRenderer = renderer ?: return@post
 
-            probeTelecomSurface(
-                surface,
-                if (preview) "LOCAL" else "REMOTE",
-            )
-
             try {
                 // createEglSurface() is asynchronous, but the previous EGL
                 // surface has already been detached above, so this Surface
@@ -271,44 +266,6 @@ class CNCallVideoProvider(
                 "[CN CALL][VIDEO PROVIDER] surface " +
                     "${if (preview) "preview" else "display"} updated " +
                     "call_id=$callId present=true",
-            )
-        }
-    }
-
-    /**
-     * Diagnostic-only probe: verify that the exact Surface supplied by Telecom
-     * accepts a direct producer buffer before EGL takes ownership of it.
-     * This does not touch LiveKit and is intentionally best-effort.
-     */
-    private fun probeTelecomSurface(
-        surface: Surface,
-        label: String,
-    ) {
-        try {
-            val canvas = surface.lockCanvas(null)
-            try {
-                canvas.drawColor(
-                    if (label == "LOCAL") {
-                        android.graphics.Color.rgb(0, 150, 136)
-                    } else {
-                        android.graphics.Color.rgb(63, 81, 181)
-                    },
-                )
-                println(
-                    "[CN CALL][VIDEO SURFACE PROBE] " + label +
-                        " success width=" + canvas.width +
-                        " height=" + canvas.height +
-                        " surface=" + surface,
-                )
-            } finally {
-                surface.unlockCanvasAndPost(canvas)
-            }
-        } catch (error: Throwable) {
-            println(
-                "[CN CALL][VIDEO SURFACE PROBE] " + label +
-                    " FAILED valid=" + surface.isValid +
-                    " surface=" + surface +
-                    " error=" + error,
             )
         }
     }
