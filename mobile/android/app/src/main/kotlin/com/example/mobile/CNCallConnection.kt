@@ -100,6 +100,10 @@ class CNCallConnection(
         override fun onMediaReady() {
             if (terminal || active) return
 
+            // LiveKit now owns a ready EGL context. If Samsung delivered the
+            // Telecom video surface earlier, let the provider bind it now.
+            videoProvider.onLiveKitReady()
+
             if (incoming) {
                 if (answering && CNCallRegistry.markActive(callId)) {
                     active = true
