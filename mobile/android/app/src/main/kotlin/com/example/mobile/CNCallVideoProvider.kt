@@ -275,20 +275,20 @@ class CNCallVideoProvider(
         label: String,
     ) {
         val renderCount = AtomicInteger(0)
-        val frameListener = object : EglRenderer.FrameListener {
-            override fun onFrame(frame: android.graphics.Bitmap?) {
-                val count = renderCount.incrementAndGet()
-                if (count <= 3 || count % 60 == 0) {
-                    println(
-                        "[CN CALL][VIDEO RENDER] " + label +
-                            " completed count=" + count,
-                    )
+        renderer.addRenderListener(
+            object : EglRenderer.RenderListener {
+                override fun onRender(timestampNs: Long) {
+                    val count = renderCount.incrementAndGet()
+                    if (count <= 3 || count % 60 == 0) {
+                        println(
+                            "[CN CALL][VIDEO SWAP] " + label +
+                                " count=" + count +
+                                " ts=" + timestampNs,
+                        )
+                    }
                 }
-                renderer.addFrameListener(this, 0f)
-            }
-        }
-
-        renderer.addFrameListener(frameListener, 0f)
+            },
+        )
         renderer.setErrorCallback(
             object : EglRenderer.ErrorCallback {
                 override fun onGlOutOfMemory() {
@@ -300,7 +300,6 @@ class CNCallVideoProvider(
             },
         )
     }
-
     private fun sameSurface(first: Surface?, second: Surface): Boolean {
         if (first == null) return false
         return first === second || first == second
