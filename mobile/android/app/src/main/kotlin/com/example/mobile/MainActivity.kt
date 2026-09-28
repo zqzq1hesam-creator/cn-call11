@@ -29,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var pendingCallId: String? = null
     private var pendingTargetId: String? = null
+    private var pendingVideoState: Int = android.telecom.VideoProfile.STATE_AUDIO_ONLY
     private var pendingCallResult: MethodChannel.Result? = null
     private var pendingStartupPermissionResult: MethodChannel.Result? = null
     private var startupPermissions = emptyList<String>()
@@ -228,6 +229,7 @@ class MainActivity : FlutterActivity() {
                                 }
                                 pendingCallId = callId
                                 pendingTargetId = targetId
+                                pendingVideoState = videoState
                                 pendingCallResult = result
                                 requestPermissions(
                                     arrayOf(
@@ -546,6 +548,8 @@ class MainActivity : FlutterActivity() {
         val result = pendingCallResult
         pendingCallId = null
         pendingTargetId = null
+        val requestedVideoState = pendingVideoState
+        pendingVideoState = android.telecom.VideoProfile.STATE_AUDIO_ONLY
         pendingCallResult = null
 
         if (callId == null || targetId == null || result == null) return
@@ -553,7 +557,12 @@ class MainActivity : FlutterActivity() {
         if (grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         ) {
-            placeCNCallWithTelecom(callId, targetId, result)
+            placeCNCallWithTelecom(
+                callId,
+                targetId,
+                result,
+                requestedVideoState,
+            )
         } else {
             result.error(
                 "permission_denied",
