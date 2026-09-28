@@ -1580,14 +1580,11 @@ object CNCallEngine {
                 }
 
                 "call_video_request" -> {
-                    val requestedState =
+                    val requestedState = normalizeVideoState(
                         payload["video_state"]?.toIntOrNull()
-                            ?: VideoProfile.STATE_AUDIO_ONLY
-                    val context = appContext
-                    val wantsVideo =
-                        requestedState and
-                            (VideoProfile.STATE_TX_ENABLED or
-                                VideoProfile.STATE_RX_ENABLED) != 0
+                            ?: VideoProfile.STATE_AUDIO_ONLY,
+                    )
+                    val requestId = payload["request_id"]?.trim().orEmpty()
 
                     val connection =
                         CNCallRegistry.get(frameCallId)?.connection
@@ -1596,66 +1593,25 @@ object CNCallEngine {
                         return@handleSignalingFrame
                     }
 
-                    connection.notifyRemoteVideoRequest(requestedState)
-
-                    if (wantsVideo) {
-                        if (context == null || !hasCameraPermission(context)) {
+                    synchronized(lock) {
+                        if (frameCallId != scoredCallId) {
+                            return@handleSignalingFrame
+                        }
+                        if (pendingIncomingVideoState != null) {
                             println(
-                                "[CN CALL][VIDEO] remote request denied " +
-                                    "call_id=" + frameCallId +
-                                    " camera_permission=false",
-                            )
-                            sendVideoResponse(
-                                frameCallId,
-                                false,
-                                VideoProfile.STATE_AUDIO_ONLY,
+                                "[CN CALL][VIDEO] ignoring overlapping remote request " +
+                                    "call_id=$frameCallId",
                             )
                             return@handleSignalingFrame
                         }
-
-                        if (!CNCallVideoService.startForCall(context, frameCallId)) {
-                            sendVideoResponse(
-                                frameCallId,
-                                false,
-                                VideoProfile.STATE_AUDIO_ONLY,
-                            )
-                            return@handleSignalingFrame
-                        }
+                        pendingIncomingVideoState = requestedState
+                        pendingIncomingVideoRequestId = requestId
                     }
 
-                    NativeLiveKit.setCameraEnabled(wantsVideo) { error ->
-                        val success = error == null
-                        if (success) {
-                            if (!wantsVideo) {
-                                context?.let {
-                                    CNCallVideoService.stopForCall(
-                                        it,
-                                        frameCallId,
-                                    )
-                                }
-                            }
-
-                            connection.updateVideoState(
-                                if (wantsVideo) {
-                                    VideoProfile.STATE_BIDIRECTIONAL
-                                } else {
-                                    VideoProfile.STATE_AUDIO_ONLY
-                                },
-                            )
-                        }
-
-                        sendVideoResponse(
-                            frameCallId,
-                            success,
-                            if (wantsVideo) {
-                                VideoProfile.STATE_BIDIRECTIONAL
-                            } else {
-                                VideoProfile.STATE_AUDIO_ONLY
-                            },
-                        )
-                    }
+                    // The request is handed to Telecom/InCallUI only. Camera
+                    // media state and the network response wait for user input.
+                    connection.notifyRemoteVideoRequest(requestedState)
                 }
-
                 "call_video_response" -> {
                     val responseState =
                         payload["video_state"]?.toIntOrNull()
@@ -1665,17 +1621,13 @@ object CNCallEngine {
                             "true",
                             ignoreCase = true,
                         ) == true
+                    val requestId = payload["request_id"]?.trim().orEmpty()
 
-                    val connection =
-                        CNCallRegistry.get(frameCallId)?.connection
-                            as? CNCallConnection
-                    handleVideoResponse(
+                    handleRemoteVideoResponse(
                         frameCallId,
-                        if (success) {
-                            responseState
-                        } else {
-                            VideoProfile.STATE_AUDIO_ONLY
-                        },
+                        success,
+                        responseState,
+                        requestId,
                     )
                 }
 
@@ -2086,6 +2038,12 @@ object CNCallEngine {
             }
 
             val requestId = UUID.randomUUID().toString()
+            synchronized(lock) {
+                if (callId != scoredCallId) return false
+                pendingOutgoingVideoState = normalizeVideoState(toVideoState)
+                pendingOutgoingVideoRequestId = requestId
+            }
+
             val sent = NativeWebSocketClient.send(
                 "call_video_request",
                 mapOf(
@@ -2096,6 +2054,17 @@ object CNCallEngine {
                     "request_id" to requestId,
                 ),
             )
+
+            if (!sent) {
+                synchronized(lock) {
+                    if (callId == scoredCallId &&
+                        pendingOutgoingVideoRequestId == requestId
+                    ) {
+                        pendingOutgoingVideoState = null
+                        pendingOutgoingVideoRequestId = null
+                    }
+                }
+            }
 
             println(
                 "[CN CALL][VIDEO] request call_id=" + callId +
