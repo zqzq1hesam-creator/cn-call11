@@ -5,6 +5,7 @@ import android.telecom.Connection
 import android.telecom.ConnectionRequest
 import android.telecom.ConnectionService
 import android.telecom.DisconnectCause
+import android.telecom.VideoProfile
 import java.util.UUID
 
 class CNCallConnectionService : ConnectionService() {
@@ -16,6 +17,8 @@ class CNCallConnectionService : ConnectionService() {
         val callId = extras.getString(EXTRA_CALL_ID)?.trim().orEmpty()
         val callerId = extras.getString(EXTRA_CALLER_ID)?.trim().orEmpty()
         val callerName = extras.getString(EXTRA_CALLER_NAME)?.trim().orEmpty()
+        val initialVideoState =
+            normalizeVideoState(request.videoState)
 
         if (callId.isEmpty() || callerId.isEmpty()) {
             return Connection.createFailedConnection(
@@ -30,6 +33,7 @@ class CNCallConnectionService : ConnectionService() {
             callerId = callerId,
             callerName = callerName,
             address = request.address ?: Uri.parse("cncall:$callerId"),
+            initialVideoState = initialVideoState,
         )
         if (!CNCallRegistry.put(
                 CNCallRegistry.Entry(callId, connection, incoming = true),
@@ -53,7 +57,13 @@ class CNCallConnectionService : ConnectionService() {
         // Best-effort: if engine init or signaling fails the call still rings,
         // and the answer path retries signaling before sending call_accept.
         if (CNCallEngine.initialize(applicationContext, connection.engineCallbacks)) {
-            if (CNCallEngine.startIncoming(callId, callerId, callerName)) {
+            if (CNCallEngine.startIncoming(
+                    callId,
+                    callerId,
+                    callerName,
+                    initialVideoState,
+                )
+            ) {
                 // At this point Telecom is RINGING and the Native engine already
                 // owns this exact call. Emit delivery now, before any additional
                 // signaling/media preparation, so the caller's prewarmed ringback
@@ -123,6 +133,8 @@ class CNCallConnectionService : ConnectionService() {
         } else {
             UUID.randomUUID().toString()
         }
+        val initialVideoState =
+            normalizeVideoState(request.videoState)
 
         println(
             "[CN CALL][DIAG][OUTGOING CREATE] " +
@@ -146,6 +158,7 @@ class CNCallConnectionService : ConnectionService() {
             callerId = targetId,
             callerName = targetId,
             address = address,
+            initialVideoState = initialVideoState,
         )
 
         if (!CNCallRegistry.put(
@@ -172,7 +185,11 @@ class CNCallConnectionService : ConnectionService() {
         )
 
         val started = initialized &&
-            CNCallEngine.startOutgoing(callId, address.toString())
+            CNCallEngine.startOutgoing(
+                callId,
+                address.toString(),
+                initialVideoState,
+            )
 
         println(
             "[CN CALL][DIAG][OUTGOING START RESULT] " +
@@ -209,5 +226,15 @@ class CNCallConnectionService : ConnectionService() {
         const val EXTRA_CALL_ID = "com.example.mobile.extra.CALL_ID"
         const val EXTRA_CALLER_ID = "com.example.mobile.extra.CALLER_ID"
         const val EXTRA_CALLER_NAME = "com.example.mobile.extra.CALLER_NAME"
+
+        private fun normalizeVideoState(videoState: Int): Int {
+            return when (videoState) {
+                VideoProfile.STATE_AUDIO_ONLY,
+                VideoProfile.STATE_BIDIRECTIONAL,
+                VideoProfile.STATE_TX_ENABLED,
+                VideoProfile.STATE_RX_ENABLED -> videoState
+                else -> VideoProfile.STATE_AUDIO_ONLY
+            }
+        }
     }
 }
