@@ -6,6 +6,7 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
+import io.livekit.android.util.LoggingLevel
 import io.livekit.android.RoomOptions
 import io.livekit.android.AudioOptions
 import io.livekit.android.audio.NoAudioHandler
@@ -162,6 +163,11 @@ object NativeLiveKit {
      * applicationContext; no automatic connection is started here.
      */
     fun initialize(appContext: Context) {
+        // Temporary diagnostic: enable LiveKit + underlying WebRTC logging
+        // before the first Room is created. No media/Surface behavior changes.
+        LiveKit.loggingLevel = LoggingLevel.VERBOSE
+        LiveKit.enableWebRTCLogging = true
+
         synchronized(lock) {
             this.appContext = appContext.applicationContext
         }
