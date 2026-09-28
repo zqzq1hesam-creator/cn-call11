@@ -238,6 +238,18 @@ object CNCallEngine {
         @Volatile
         private var initialVideoState = VideoProfile.STATE_AUDIO_ONLY
 
+        @Volatile
+        private var pendingOutgoingVideoState: Int? = null
+
+        @Volatile
+        private var pendingOutgoingVideoRequestId: String? = null
+
+        @Volatile
+        private var pendingIncomingVideoState: Int? = null
+
+        @Volatile
+        private var pendingIncomingVideoRequestId: String? = null
+
         private data class PendingIncomingCall(
             val callId: String,
             val callerId: String,
