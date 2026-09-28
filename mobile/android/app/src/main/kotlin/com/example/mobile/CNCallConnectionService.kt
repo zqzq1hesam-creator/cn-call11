@@ -172,6 +172,31 @@ class CNCallConnectionService : ConnectionService() {
 
         connection.beginDialing()
 
+        // Direct video calls need the camera foreground service to be created
+        // while the outgoing user action is still in progress. This avoids
+        // waiting until LiveKit connects, which can be too late for Android's
+        // camera/microphone while-in-use foreground-service restrictions.
+        if (initialVideoState and
+            (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+        ) {
+            val videoFgsStarted = try {
+                CNCallVideoService.startForCall(
+                    applicationContext,
+                    callId,
+                )
+            } catch (error: Exception) {
+                println(
+                    "[CN CALL][TELECOM] pre-start outgoing CNCallVideoService exception " +
+                        "call_id=$callId err=$error",
+                )
+                false
+            }
+            println(
+                "[CN CALL][TELECOM] pre-started outgoing CNCallVideoService " +
+                    "call_id=$callId ok=$videoFgsStarted",
+            )
+        }
+
         // Native signaling path only: CNCallEngine.startOutgoing acquires native
         // WS ownership first, then sends the single "call" frame over
         // NativeWebSocketClient → server → callee, and only the callee's
