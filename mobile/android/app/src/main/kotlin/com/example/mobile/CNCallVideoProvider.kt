@@ -278,7 +278,9 @@ class CNCallVideoProvider(
             if (preview) {
                 listener.onPreviewRendererChanged(activeRenderer)
             } else {
-                listener.onDisplayRendererChanged(activeRenderer)
+                listener.onDisplayRendererChanged(
+                    createDimensionReportingSink(activeRenderer),
+                )
             }
 
             println(
@@ -355,6 +357,20 @@ class CNCallVideoProvider(
                 }
             },
         )
+    }
+
+    private fun createDimensionReportingSink(
+        delegate: VideoSink,
+    ): VideoSink {
+        return object : VideoSink {
+            override fun onFrame(frame: livekit.org.webrtc.VideoFrame) {
+                reportPeerDimensions(
+                    frame.rotatedWidth,
+                    frame.rotatedHeight,
+                )
+                delegate.onFrame(frame)
+            }
+        }
     }
 
     /**
