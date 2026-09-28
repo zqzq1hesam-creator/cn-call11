@@ -46,6 +46,14 @@ class CNCallVideoProvider(
     private var previewSurface: Surface? = null
     private var displaySurface: Surface? = null
 
+    // Samsung InCallUI may keep the video view in WAITING state until the
+    // VideoProvider reports that media reception/transmission has started.
+    // Reset these one-shot notifications whenever Telecom supplies a new surface.
+    private val txStartSent = AtomicInteger(0)
+    private val rxResumeSent = AtomicInteger(0)
+    private var lastReportedPeerWidth = 0
+    private var lastReportedPeerHeight = 0
+
     override fun onSendSessionModifyRequest(
         fromProfile: VideoProfile,
         toProfile: VideoProfile,
@@ -128,6 +136,17 @@ class CNCallVideoProvider(
             synchronized(rendererLock) {
                 renderer = if (preview) previewRenderer else displayRenderer
                 previousSurface = if (preview) previewSurface else displaySurface
+            }
+
+            // A new Telecom surface starts a new presentation session.
+            if (preview) {
+                txStartSent.set(0)
+            } else {
+                rxResumeSent.set(0)
+                synchronized(rendererLock) {
+                    lastReportedPeerWidth = 0
+                    lastReportedPeerHeight = 0
+                }
             }
 
             // Samsung can repeat the exact same Surface while entering video
@@ -278,6 +297,76 @@ class CNCallVideoProvider(
         val frameListener = object : EglRenderer.FrameListener {
             override fun onFrame(frame: android.graphics.Bitmap?) {
                 val count = renderCount.incrementAndGet()
+
+                if (label == "REMOTE" && rxResumeSent.compareAndSet(0, 1)) {
+                    try {
+                        handleCallSessionEvent(
+                            Connection.VideoProvider.SESSION_EVENT_RX_RESUME,
+                        )
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] SESSION_EVENT_RX_RESUME " +
+                                "call_id=" + callId,
+                        )
+                    } catch (throwable: Throwable) {
+                        rxResumeSent.set(0)
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] RX_RESUME failed " +
+                                "call_id=" + callId +
+                                " error=" + throwable.message,
+                        )
+                    }
+                } else if (label == "LOCAL" && txStartSent.compareAndSet(0, 1)) {
+                    try {
+                        handleCallSessionEvent(
+                            Connection.VideoProvider.SESSION_EVENT_TX_START,
+                        )
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] SESSION_EVENT_TX_START " +
+                                "call_id=" + callId,
+                        )
+                    } catch (throwable: Throwable) {
+                        txStartSent.set(0)
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] TX_START failed " +
+                                "call_id=" + callId +
+                                " error=" + throwable.message,
+                        )
+                    }
+                }
+
+                if (label == "REMOTE" && frame != null) {
+                    val width = frame.width
+                    val height = frame.height
+                    var shouldReportDimensions = false
+                    synchronized(rendererLock) {
+                        if (width > 0 &&
+                            height > 0 &&
+                            (width != lastReportedPeerWidth ||
+                                height != lastReportedPeerHeight)
+                        ) {
+                            lastReportedPeerWidth = width
+                            lastReportedPeerHeight = height
+                            shouldReportDimensions = true
+                        }
+                    }
+                    if (shouldReportDimensions) {
+                        try {
+                            changePeerDimensions(width, height)
+                            println(
+                                "[CN CALL][VIDEO PROVIDER] peer dimensions " +
+                                    width + "x" + height +
+                                    " call_id=" + callId,
+                            )
+                        } catch (throwable: Throwable) {
+                            println(
+                                "[CN CALL][VIDEO PROVIDER] peer dimensions failed " +
+                                    "call_id=" + callId +
+                                    " error=" + throwable.message,
+                            )
+                        }
+                    }
+                }
+
                 if (count <= 3 || count % 60 == 0) {
                     println(
                         "[CN CALL][VIDEO RENDER] " + label +
