@@ -416,36 +416,66 @@ class CNCallConnection(
     }
 
     override fun onAnswer() {
+        answerIncoming(initialVideoState, "default")
+    }
+
+    /**
+     * Samsung/Telecom calls this overload when the user chooses to answer
+     * directly as a video call. The requested video state must be carried into
+     * the native answer path; the no-argument onAnswer() cannot express that
+     * choice.
+     */
+    override fun onAnswer(videoState: Int) {
+        answerIncoming(videoState, "video")
+    }
+
+    private fun answerIncoming(requestedVideoState: Int, source: String) {
         if (terminal || !incoming || answering || active) return
         if (!CNCallRegistry.claimAnswer(callId)) return
         answering = true
         CNCallNotification.cancel(appContext, callId)
 
+        val normalizedVideoState = when (requestedVideoState) {
+            VideoProfile.STATE_AUDIO_ONLY,
+            VideoProfile.STATE_BIDIRECTIONAL,
+            VideoProfile.STATE_TX_ENABLED,
+            VideoProfile.STATE_RX_ENABLED -> requestedVideoState
+            else -> VideoProfile.STATE_AUDIO_ONLY
+        }
+
+        println(
+            "[CN CALL][TELECOM] answer requested " +
+                "call_id=\$callId source=\$source videoState=\$normalizedVideoState",
+        )
+        if (normalizedVideoState != VideoProfile.STATE_AUDIO_ONLY) {
+            setVideoState(normalizedVideoState)
+        }
+
         val t0 = System.currentTimeMillis()
-        println("[CN CALL][SPEED_METRICS] T0_answer_pressed call_id=$callId ts=$t0")
+        println("[CN CALL][SPEED_METRICS] T0_answer_pressed call_id=\$callId ts=\$t0")
 
         // Pre-start FGS immediately on Main Thread to get microphone context warm
         // before LiveKit attempts track publication.
         try {
             val fgsStarted = CNCallAudioService.startForCall(appContext, callId)
-            println("[CN CALL][TELECOM] pre-started CNCallAudioService onAnswer call_id=$callId ok=$fgsStarted")
+            println("[CN CALL][TELECOM] pre-started CNCallAudioService onAnswer call_id=\$callId ok=\$fgsStarted")
         } catch (e: Exception) {
-            println("[CN CALL][TELECOM] pre-start CNCallAudioService exception call_id=$callId err=$e")
+            println("[CN CALL][TELECOM] pre-start CNCallAudioService exception call_id=\$callId err=\$e")
         }
 
-        val wantsInitialVideo = initialVideoState and
+        val wantsInitialVideo = normalizedVideoState and
             (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
         if (wantsInitialVideo) {
             try {
                 val videoFgsStarted = CNCallVideoService.startForCall(appContext, callId)
                 println(
                     "[CN CALL][TELECOM] pre-started CNCallVideoService onAnswer " +
-                        "call_id=$callId ok=$videoFgsStarted",
+                        "call_id=\$callId ok=\$videoFgsStarted",
                 )
             } catch (e: Exception) {
                 println(
                     "[CN CALL][TELECOM] pre-start CNCallVideoService exception " +
-                        "call_id=$callId err=$e",
+                        "call_id=\$callId err=\$e",
                 )
             }
         }
@@ -459,7 +489,7 @@ class CNCallConnection(
         val owner = NativeWebSocketClient.readOwner(appContext)
         if (owner != "native") {
             println(
-                "[CN CALL][TELECOM] answer refused call_id=$callId owner=${owner ?: "(none)"}",
+                "[CN CALL][TELECOM] answer refused call_id=\$callId owner=\${owner ?: "(none)"}",
             )
             fail(DisconnectCause.ERROR)
             return
@@ -473,7 +503,7 @@ class CNCallConnection(
                 callId,
                 callerId,
                 callerName,
-                initialVideoState,
+                normalizedVideoState,
             )
         ) {
             fail(DisconnectCause.ERROR)
