@@ -334,39 +334,6 @@ class CNCallVideoProvider(
                     }
                 }
 
-                if (label == "REMOTE" && frame != null) {
-                    val width = frame.width
-                    val height = frame.height
-                    var shouldReportDimensions = false
-                    synchronized(rendererLock) {
-                        if (width > 0 &&
-                            height > 0 &&
-                            (width != lastReportedPeerWidth ||
-                                height != lastReportedPeerHeight)
-                        ) {
-                            lastReportedPeerWidth = width
-                            lastReportedPeerHeight = height
-                            shouldReportDimensions = true
-                        }
-                    }
-                    if (shouldReportDimensions) {
-                        try {
-                            changePeerDimensions(width, height)
-                            println(
-                                "[CN CALL][VIDEO PROVIDER] peer dimensions " +
-                                    width + "x" + height +
-                                    " call_id=" + callId,
-                            )
-                        } catch (throwable: Throwable) {
-                            println(
-                                "[CN CALL][VIDEO PROVIDER] peer dimensions failed " +
-                                    "call_id=" + callId +
-                                    " error=" + throwable.message,
-                            )
-                        }
-                    }
-                }
-
                 if (count <= 3 || count % 60 == 0) {
                     println(
                         "[CN CALL][VIDEO RENDER] " + label +
@@ -388,6 +355,50 @@ class CNCallVideoProvider(
                 }
             },
         )
+    }
+
+    /**
+     * Reports dimensions from the actual LiveKit VideoFrame path.
+     *
+     * EglRenderer.FrameListener exposes a Bitmap only after the renderer has
+     * accepted the frame, and that Bitmap is not guaranteed to be available
+     * for every rendered frame. Telecom/Samsung needs the peer dimensions
+     * independently of that diagnostic callback.
+     */
+    internal fun reportPeerDimensions(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+
+        var shouldReport = false
+        synchronized(rendererLock) {
+            if (
+                width != lastReportedPeerWidth ||
+                height != lastReportedPeerHeight
+            ) {
+                lastReportedPeerWidth = width
+                lastReportedPeerHeight = height
+                shouldReport = true
+            }
+        }
+
+        if (!shouldReport) return
+
+        mainHandler.post {
+            if (width <= 0 || height <= 0) return@post
+            try {
+                changePeerDimensions(width, height)
+                println(
+                    "[CN CALL][VIDEO PROVIDER] peer dimensions " +
+                        width + "x" + height +
+                        " call_id=" + callId,
+                )
+            } catch (throwable: Throwable) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] peer dimensions failed " +
+                        "call_id=" + callId +
+                        " error=" + throwable.message,
+                )
+            }
+        }
     }
 
     private fun sameSurface(first: Surface?, second: Surface): Boolean {
