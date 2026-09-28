@@ -51,8 +51,30 @@ class CNCallVideoProvider(
         listener.onSessionModifyResponse(responseProfile)
     }
 
-    override fun onSetCamera(cameraId: String) {
-        listener.onSetCamera(cameraId)
+    override fun onSetCamera(cameraId: String?) {
+        // Telecom reaches this callback from the system VideoProvider handler.
+        // A malformed/null camera id or a downstream runtime exception must
+        // never escape this callback and crash the CN CALL process.
+        val requestedCameraId = cameraId?.trim().orEmpty()
+        if (requestedCameraId.isEmpty()) {
+            println(
+                "[CN CALL][VIDEO PROVIDER] ignoring empty camera id " +
+                    "call_id=$callId",
+            )
+            return
+        }
+
+        mainHandler.post {
+            try {
+                listener.onSetCamera(requestedCameraId)
+            } catch (error: Throwable) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] camera switch failed " +
+                        "call_id=$callId camera_id=$requestedCameraId " +
+                        "error=${error.message}",
+                )
+            }
+        }
     }
 
     override fun onSetPreviewSurface(surface: Surface?) {
