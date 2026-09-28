@@ -3,7 +3,10 @@ package com.example.mobile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.provider.CallLog
 import android.telecom.Connection
 import android.telecom.DisconnectCause
@@ -161,6 +164,25 @@ class CNCallConnection(
 
     init {
         setAudioModeIsVoip(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val connectivityManager =
+                appContext.getSystemService(ConnectivityManager::class.java)
+            val activeNetwork = connectivityManager?.activeNetwork
+            val networkCapabilities =
+                activeNetwork?.let(connectivityManager::getNetworkCapabilities)
+            if (
+                networkCapabilities?.hasTransport(
+                    NetworkCapabilities.TRANSPORT_WIFI,
+                ) == true
+            ) {
+                setConnectionProperties(
+                    getConnectionProperties() or PROPERTY_WIFI,
+                )
+                println(
+                    "[CN CALL][TELECOM] connection network=wifi call_id=$callId",
+                )
+            }
+        }
         setConnectionCapabilities(
             getConnectionCapabilities() or
                 CAPABILITY_SUPPORTS_VT_LOCAL_BIDIRECTIONAL or
