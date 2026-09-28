@@ -323,11 +323,26 @@ object CNCallEngine {
                         current == scoredCallId && wantsVideo(initialVideoState)
                     }
 
+                    // The audio path must become ACTIVE independently of the
+                    // camera path. This matches the working audio->video upgrade:
+                    // Telecom gets an active call as soon as the microphone is ready,
+                    // then video is enabled on top of the already-live call.
+                    completeLiveKitMediaReady(current)
+
                     if (wantsInitialVideo) {
                         val context = appContext
-                        if (context == null || !CNCallVideoService.startForCall(context, current)) {
-                            callbacks?.onError(
-                                "CN CALL video foreground service failed call_id=$current",
+                        if (context == null) {
+                            println(
+                                "[CN CALL][VIDEO] initial video skipped: missing context " +
+                                    "call_id=$current",
+                            )
+                            return@setMicrophoneEnabled
+                        }
+
+                        if (!CNCallVideoService.startForCall(context, current)) {
+                            println(
+                                "[CN CALL][VIDEO] initial video foreground service start failed " +
+                                    "call_id=$current",
                             )
                             return@setMicrophoneEnabled
                         }
@@ -337,19 +352,19 @@ object CNCallEngine {
                             if (!cameraStillCurrent) return@setCameraEnabled
                             if (cameraError != null) {
                                 CNCallVideoService.stopForCall(context, current)
-                                callbacks?.onError(
-                                    "LiveKit camera enable failed: ${cameraError.message}",
+                                println(
+                                    "[CN CALL][VIDEO] initial camera enable failed " +
+                                        "call_id=$current error=" + cameraError.message,
                                 )
+                                // Do not tear down the whole call here. Audio is already
+                                // active, exactly like the working upgrade path.
                                 return@setCameraEnabled
                             }
                             println(
                                 "[CN CALL][VIDEO] initial video camera enabled " +
                                     "call_id=$current",
                             )
-                            completeLiveKitMediaReady(current)
                         }
-                    } else {
-                        completeLiveKitMediaReady(current)
                     }
                 }
             }
