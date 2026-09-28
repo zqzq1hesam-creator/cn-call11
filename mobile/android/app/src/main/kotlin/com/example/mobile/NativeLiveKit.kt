@@ -15,6 +15,7 @@ import io.livekit.android.room.Room
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.RemoteVideoTrack
 import io.livekit.android.room.track.Track
+import livekit.org.webrtc.VideoFrame
 import livekit.org.webrtc.VideoSink
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -120,6 +121,29 @@ object NativeLiveKit {
 
     @Volatile
     private var remoteVideoRenderer: VideoSink? = null
+
+    /**
+     * Keeps the official LocalVideoTrack.addRenderer()/CaptureDispatchObserver
+     * path intact while making frame delivery observable and explicit.
+     */
+    private class ForwardingVideoSink(
+        private val label: String,
+        private val delegate: VideoSink,
+    ) : VideoSink {
+        private val frames = AtomicInteger(0)
+
+        override fun onFrame(frame: VideoFrame) {
+            val count = frames.incrementAndGet()
+            if (count <= 3 || count % 60 == 0) {
+                println(
+                    "[CN CALL][VIDEO FRAME] " + label + " count=" + count +
+                        " size=" + frame.rotatedWidth + "x" + frame.rotatedHeight +
+                        " ts=" + frame.timestampNs,
+                )
+            }
+            delegate.onFrame(frame)
+        }
+    }
 
     private var eventCollectJob: Job? = null
 
@@ -325,36 +349,51 @@ object NativeLiveKit {
     fun setLocalVideoRenderer(renderer: VideoSink?) {
         val oldTrack: LocalVideoTrack?
         val oldRenderer: VideoSink?
+        val attachedRenderer = renderer?.let { ForwardingVideoSink("LOCAL", it) }
         val newTrack: LocalVideoTrack?
         synchronized(lock) {
             oldTrack = localVideoTrack
             oldRenderer = localVideoRenderer
-            localVideoRenderer = renderer
+            localVideoRenderer = attachedRenderer
             newTrack = localVideoTrack
         }
+        println(
+            "[CN CALL][VIDEO RENDERER] local changed " +
+                "renderer_present=" + (renderer != null) +
+                " track_present=" + (newTrack != null),
+        )
         if (oldTrack != null && oldRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] local removeRenderer")
             oldTrack.removeRenderer(oldRenderer)
         }
-        if (newTrack != null && renderer != null) {
-            newTrack.addRenderer(renderer)
+        if (newTrack != null && attachedRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] local addRenderer")
+            newTrack.addRenderer(attachedRenderer)
         }
     }
 
     fun setRemoteVideoRenderer(renderer: VideoSink?) {
         val oldTrack: RemoteVideoTrack?
         val oldRenderer: VideoSink?
+        val attachedRenderer = renderer?.let { ForwardingVideoSink("REMOTE", it) }
         val newTrack: RemoteVideoTrack?
         synchronized(lock) {
             oldTrack = remoteVideoTrack
             oldRenderer = remoteVideoRenderer
-            remoteVideoRenderer = renderer
+            remoteVideoRenderer = attachedRenderer
             newTrack = remoteVideoTrack
         }
+        println(
+            "[CN CALL][VIDEO RENDERER] remote changed " +
+                "renderer_present=" + (renderer != null) +
+                " track_present=" + (newTrack != null),
+        )
         if (oldTrack != null && oldRenderer != null) {
             oldTrack.removeRenderer(oldRenderer)
         }
-        if (newTrack != null && renderer != null) {
-            newTrack.addRenderer(renderer)
+        if (newTrack != null && attachedRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] remote addRenderer")
+            newTrack.addRenderer(attachedRenderer)
         }
     }
 
@@ -619,10 +658,17 @@ object NativeLiveKit {
             localVideoTrack = track
             renderer = localVideoRenderer
         }
+        println(
+            "[CN CALL][VIDEO TRACK] local changed " +
+                "track_present=" + (track != null) +
+                " renderer_present=" + (renderer != null),
+        )
         if (oldTrack != null && renderer != null) {
+            println("[CN CALL][VIDEO TRACK] local removeRenderer")
             oldTrack.removeRenderer(renderer)
         }
         if (track != null && renderer != null) {
+            println("[CN CALL][VIDEO TRACK] local addRenderer")
             track.addRenderer(renderer)
         }
         listener?.onLocalVideoTrackChanged(track)
