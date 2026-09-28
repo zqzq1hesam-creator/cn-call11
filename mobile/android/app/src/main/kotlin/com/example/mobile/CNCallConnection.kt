@@ -545,6 +545,11 @@ class CNCallConnection(
         setVideoState(videoState)
     }
 
+    internal fun retryVideoRendererBindings() {
+        if (terminal) return
+        videoProvider.retryPendingSurfaceBindings()
+    }
+
     internal fun notifyRemoteVideoRequest(videoState: Int) {
         if (terminal) return
         try {
@@ -563,18 +568,12 @@ class CNCallConnection(
     internal fun completeVideoSessionModify(
         requestedVideoState: Int,
         responseVideoState: Int,
-        success: Boolean,
+        status: Int,
     ) {
         if (terminal) return
 
         val requestedProfile = VideoProfile(requestedVideoState)
         val responseProfile = VideoProfile(responseVideoState)
-        val status =
-            if (success) {
-                Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS
-            } else {
-                Connection.VideoProvider.SESSION_MODIFY_REQUEST_FAIL
-            }
 
         try {
             videoProvider.receiveSessionModifyResponse(
@@ -590,7 +589,7 @@ class CNCallConnection(
             )
         }
 
-        if (success) {
+        if (status == Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS) {
             setVideoState(responseVideoState)
         }
     }
