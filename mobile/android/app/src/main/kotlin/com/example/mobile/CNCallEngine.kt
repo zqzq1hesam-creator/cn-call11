@@ -90,7 +90,12 @@ object CNCallEngine {
      */
     interface Delegate {
         fun initialize(context: Context, callbacks: Callbacks): Boolean
-        fun startIncoming(callId: String, callerId: String, callerName: String): Boolean
+        fun startIncoming(
+            callId: String,
+            callerId: String,
+            callerName: String,
+            videoState: Int,
+        ): Boolean
 
         /**
          * Opens (or reuses) the authenticated native WebSocket for an incoming
@@ -101,7 +106,11 @@ object CNCallEngine {
          * the caller (which is what closes the caller's ringing UI).
          */
         fun prepareIncomingSignaling(callId: String): Boolean
-        fun startOutgoing(callId: String, address: String): Boolean
+        fun startOutgoing(
+            callId: String,
+            address: String,
+            videoState: Int,
+        ): Boolean
         fun answer(callId: String): Boolean
         fun reject(callId: String): Boolean
         fun disconnect(callId: String): Boolean
@@ -226,10 +235,14 @@ object CNCallEngine {
         @Volatile
         private var connectedReportedCallId: String? = null
 
+        @Volatile
+        private var initialVideoState = VideoProfile.STATE_AUDIO_ONLY
+
         private data class PendingIncomingCall(
             val callId: String,
             val callerId: String,
             val callerName: String,
+            val videoState: Int,
         )
 
         /** Background worker for blocking LiveKit-token fetches. */
@@ -276,78 +289,54 @@ object CNCallEngine {
                 println("[CN CALL][SPEED_METRICS] T7_mic_publish_start call_id=$current ts=$t7")
 
                 NativeLiveKit.setMicrophoneEnabled(true) { error ->
-                    val stillCurrent = synchronized(lock) {
-                        current == scoredCallId
-                    }
-
+                    val stillCurrent = synchronized(lock) { current == scoredCallId }
                     if (!stillCurrent) return@setMicrophoneEnabled
 
                     if (error != null) {
-                        callbacks?.onError(
-                            "LiveKit microphone enable failed: ${error.message}",
-                        )
+                        callbacks?.onError("LiveKit microphone enable failed: ${error.message}")
                         return@setMicrophoneEnabled
                     }
 
                     val t8 = System.currentTimeMillis()
                     println("[CN CALL][SPEED_METRICS] T8_mic_published call_id=$current ts=$t8")
 
-                    val reportContext = appContext
-                    val reportUserId = reportContext?.let {
-                        NativeCallTokenHelper.restoreUserId(it)
+                    (CNCallRegistry.get(current)?.connection as? CNCallConnection)
+                        ?.retryVideoRendererBindings()
+
+                    val wantsInitialVideo = synchronized(lock) {
+                        current == scoredCallId && wantsVideo(initialVideoState)
                     }
-                    val reportTargetId = if (!reportUserId.isNullOrBlank()) {
-                        synchronized(lock) {
-                            if (current != scoredCallId ||
-                                current == connectedReportedCallId
-                            ) {
-                                null
-                            } else {
-                                val target =
-                                    if (isCaller) {
-                                        outgoingTargetId
-                                    } else {
-                                        pendingIncomingCall?.callerId
-                                    }
-                                if (target.isNullOrBlank()) {
-                                    null
-                                } else {
-                                    connectedReportedCallId = current
-                                    target
-                                }
+
+                    if (wantsInitialVideo) {
+                        val context = appContext
+                        if (context == null || !CNCallVideoService.startForCall(context, current)) {
+                            callbacks?.onError(
+                                "CN CALL video foreground service failed call_id=$current",
+                            )
+                            return@setMicrophoneEnabled
+                        }
+
+                        NativeLiveKit.setCameraEnabled(true) { cameraError ->
+                            val cameraStillCurrent = synchronized(lock) { current == scoredCallId }
+                            if (!cameraStillCurrent) return@setCameraEnabled
+                            if (cameraError != null) {
+                                CNCallVideoService.stopForCall(context, current)
+                                callbacks?.onError(
+                                    "LiveKit camera enable failed: ${cameraError.message}",
+                                )
+                                return@setCameraEnabled
                             }
+                            println(
+                                "[CN CALL][VIDEO] initial video camera enabled " +
+                                    "call_id=$current",
+                            )
+                            completeLiveKitMediaReady(current)
                         }
                     } else {
-                        null
+                        completeLiveKitMediaReady(current)
                     }
-                    if (reportUserId != null && reportTargetId != null) {
-                        val t9 = System.currentTimeMillis()
-                        println("[CN CALL][SPEED_METRICS] T9_connected_signaling_sent call_id=$current ts=$t9")
-                        val sent = NativeWebSocketClient.send(
-                            "connected",
-                            mapOf(
-                                "call_id" to current,
-                                "target_id" to reportTargetId,
-                                "from_id" to reportUserId,
-                            ),
-                        )
-                        println(
-                            "[CN CALL][ENGINE] media connected frame" +
-                                " call_id=$current sent=$sent",
-                        )
-                    }
-
-                    val t10 = System.currentTimeMillis()
-                    println("[CN CALL][SPEED_METRICS] T10_first_usable_audio call_id=$current ts=$t10")
-
-                    println(
-                        "[CN CALL][ENGINE] media ready " +
-                            "call_id=$current microphone=enabled",
-                    )
-                    callbacks?.onMediaReady()
                 }
             }
-
             override fun onDisconnected() {
                 // A LiveKit room drop is NOT a hangup: never auto-send hangup
                 // and never notify onDisconnected from media alone. Call-end
@@ -434,16 +423,20 @@ object CNCallEngine {
             callId: String,
             callerId: String,
             callerName: String,
+            videoState: Int,
         ): Boolean {
             if (callId.isBlank() || callerId.isBlank()) return false
+            val normalizedVideoState = normalizeVideoState(videoState)
             synchronized(lock) {
-                if (callId == scoredCallId) return true
-                // Phase WS-ring: for an Online target the invite already arrived
-                // over the native WebSocket (handleSignalingFrame "call" recorded
-                // it in pendingIncomingCall) BEFORE Telecom created this
-                // Connection. Promote the existing pending call to scored instead
-                // of refusing it, so answer()/reject() (which require scoredCallId)
-                // keep working exactly as they do on the FCM path.
+                if (callId == scoredCallId) {
+                    initialVideoState =
+                        pendingIncomingCall
+                            ?.takeIf { it.callId == callId }
+                            ?.videoState
+                            ?: normalizedVideoState
+                    return true
+                }
+
                 val pending = pendingIncomingCall
                 if (pending != null && pending.callId == callId) {
                     ++generation
@@ -451,11 +444,10 @@ object CNCallEngine {
                     isCaller = false
                     outgoingTargetId = null
                     acceptedCallId = null
+                    initialVideoState = pending.videoState
                     return true
                 }
-                // Single-call policy at the engine level: refuse a second
-                // incoming while the engine already orchestrates another call
-                // (ringing or active). Mirrors the outgoing guard below.
+
                 if (scoredCallId != null || pendingIncomingCall != null) {
                     val current = scoredCallId ?: pendingIncomingCall?.callId
                     println(
@@ -464,18 +456,29 @@ object CNCallEngine {
                     )
                     return false
                 }
+
                 ++generation
                 scoredCallId = callId
                 isCaller = false
                 outgoingTargetId = null
                 acceptedCallId = null
+                initialVideoState = normalizedVideoState
                 pendingIncomingCall =
-                    PendingIncomingCall(callId, callerId, callerName)
+                    PendingIncomingCall(
+                        callId,
+                        callerId,
+                        callerName,
+                        normalizedVideoState,
+                    )
             }
             return true
         }
 
-        override fun startOutgoing(callId: String, address: String): Boolean {
+        override fun startOutgoing(
+            callId: String,
+            address: String,
+            videoState: Int,
+        ): Boolean {
             println(
                 "[CN CALL][DIAG][ENGINE startOutgoing] " +
                     "call_id=$callId address=$address",
@@ -488,6 +491,7 @@ object CNCallEngine {
                 return false
             }
             val targetId = parseTargetId(address)
+            val normalizedVideoState = normalizeVideoState(videoState)
             if (targetId.isBlank()) {
                 println(
                     "[CN CALL][DIAG][ENGINE startOutgoing REJECT] " +
@@ -511,8 +515,6 @@ object CNCallEngine {
 
             synchronized(lock) {
                 if (callId == scoredCallId && isCaller) return true
-                // Single-call policy at the engine level too: refuse a second
-                // outgoing while the engine already orchestrates another call.
                 if (scoredCallId != null && scoredCallId != callId) {
                     println(
                         "[CN CALL][ENGINE] outgoing refused: another call scored" +
@@ -526,6 +528,7 @@ object CNCallEngine {
                 outgoingTargetId = targetId
                 pendingIncomingCall = null
                 acceptedCallId = null
+                initialVideoState = normalizedVideoState
             }
 
             val signalingReady = ensureSignalingConnected()
@@ -549,6 +552,7 @@ object CNCallEngine {
                     "target_id" to targetId,
                     "from_id" to ownUserId,
                     "caller_name" to callerName,
+                    "video_state" to normalizedVideoState.toString(),
                 ),
             )
             println(
@@ -875,6 +879,7 @@ object CNCallEngine {
                     acceptedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             // Frees call resources only: the WebSocket session is session-
@@ -954,6 +959,85 @@ object CNCallEngine {
          * This intentionally does NOT send call_reject/offline to the peer,
          * does not terminate the call, and does not affect incoming calls.
          */
+        private fun completeLiveKitMediaReady(current: String) {
+            val stillCurrent = synchronized(lock) {
+                current == scoredCallId
+            }
+            if (!stillCurrent) return
+
+            val reportContext = appContext
+            val reportUserId = reportContext?.let {
+                NativeCallTokenHelper.restoreUserId(it)
+            }
+            val reportTargetId = if (!reportUserId.isNullOrBlank()) {
+                synchronized(lock) {
+                    if (current != scoredCallId ||
+                        current == connectedReportedCallId
+                    ) {
+                        null
+                    } else {
+                        val target =
+                            if (isCaller) outgoingTargetId
+                            else pendingIncomingCall?.callerId
+                        if (target.isNullOrBlank()) null
+                        else {
+                            connectedReportedCallId = current
+                            target
+                        }
+                    }
+                }
+            } else null
+
+            if (reportUserId != null && reportTargetId != null) {
+                val t9 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T9_connected_signaling_sent call_id=$current ts=$t9")
+                val sent = NativeWebSocketClient.send(
+                    "connected",
+                    mapOf(
+                        "call_id" to current,
+                        "target_id" to reportTargetId,
+                        "from_id" to reportUserId,
+                    ),
+                )
+                println(
+                    "[CN CALL][ENGINE] media connected frame" +
+                        " call_id=$current sent=$sent",
+                )
+            }
+
+            val t10 = System.currentTimeMillis()
+            println("[CN CALL][SPEED_METRICS] T10_first_usable_audio call_id=$current ts=$t10")
+            println(
+                "[CN CALL][ENGINE] media ready " +
+                    "call_id=$current microphone=enabled",
+            )
+            callbacks?.onMediaReady()
+        }
+
+        private fun normalizeVideoState(videoState: Int): Int {
+            return when (videoState) {
+                VideoProfile.STATE_AUDIO_ONLY,
+                VideoProfile.STATE_BIDIRECTIONAL,
+                VideoProfile.STATE_TX_ENABLED,
+                VideoProfile.STATE_RX_ENABLED -> videoState
+                else -> VideoProfile.STATE_AUDIO_ONLY
+            }
+        }
+
+        private fun wantsVideo(videoState: Int): Boolean {
+            return videoState and
+                (VideoProfile.STATE_TX_ENABLED or
+                    VideoProfile.STATE_RX_ENABLED) != 0
+        }
+
+        private fun resetVideoNegotiationStateLocked() {
+            initialVideoState = VideoProfile.STATE_AUDIO_ONLY
+            pendingOutgoingVideoState = null
+            pendingOutgoingVideoRequestId = null
+            pendingIncomingVideoState = null
+            pendingIncomingVideoRequestId = null
+        }
+
         private fun maybeAnnounceCallerOffline() {
             val context = appContext ?: return
 
@@ -1271,6 +1355,11 @@ object CNCallEngine {
                             ?.trim()
                             ?.takeIf { it.isNotEmpty() }
                             ?: "مستخدم CN CALL"
+                    val requestedVideoState = normalizeVideoState(
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY,
+                    )
+
                     val context = appContext
                     val ownerIsNative =
                         context != null &&
@@ -1295,7 +1384,12 @@ object CNCallEngine {
                         if (!sameAsPending) {
                             ++generation
                             pendingIncomingCall =
-                                PendingIncomingCall(frameCallId, callerId, callerName)
+                                PendingIncomingCall(
+                                    frameCallId,
+                                    callerId,
+                                    callerName,
+                                    requestedVideoState,
+                                )
                         }
                         // Exactly one presenting side wins the per-call ticket
                         // (this WS path or the FCM path, whichever is first);
@@ -1348,7 +1442,12 @@ object CNCallEngine {
                         )
                     }
                     if (acceptedForPresentation) {
-                        presentIncomingCallToTelecom(frameCallId, callerId, callerName)
+                        presentIncomingCallToTelecom(
+                            frameCallId,
+                            callerId,
+                            callerName,
+                            requestedVideoState,
+                        )
                     }
                 }
 
@@ -1699,6 +1798,7 @@ object CNCallEngine {
             callId: String,
             callerId: String,
             callerName: String,
+            videoState: Int,
         ) {
             val context = appContext ?: run {
                 CNCallRegistry.releaseTelecomPresentation(callId)
@@ -1721,6 +1821,10 @@ object CNCallEngine {
                         putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
                         putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
                         putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                        putInt(
+                            TelecomManager.EXTRA_INCOMING_VIDEO_STATE,
+                            normalizeVideoState(videoState),
+                        )
                     },
                 )
                 println(
@@ -2330,6 +2434,7 @@ object CNCallEngine {
         callId: String,
         callerId: String,
         callerName: String,
+        videoState: Int,
     ): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("startIncoming", callId, callbacks)
@@ -2352,7 +2457,11 @@ object CNCallEngine {
         return currentDelegate.prepareIncomingSignaling(callId)
     }
 
-    fun startOutgoing(callId: String, address: String): Boolean {
+    fun startOutgoing(
+        callId: String,
+        address: String,
+        videoState: Int,
+    ): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("startOutgoing", callId, callbacks)
 
