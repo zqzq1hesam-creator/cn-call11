@@ -8,6 +8,7 @@ import android.provider.CallLog
 import android.telecom.Connection
 import android.telecom.DisconnectCause
 import android.telecom.VideoProfile
+import livekit.org.webrtc.VideoFrame
 import livekit.org.webrtc.VideoSink
 import java.io.IOException
 
@@ -56,7 +57,21 @@ class CNCallConnection(
             }
 
             override fun onDisplayRendererChanged(renderer: VideoSink?) {
-                CNCallEngine.setRemoteVideoRenderer(callId, renderer)
+                val reportingRenderer = renderer?.let { displayRenderer ->
+                    object : VideoSink {
+                        override fun onFrame(frame: VideoFrame) {
+                            videoProvider.reportPeerDimensions(
+                                frame.rotatedWidth,
+                                frame.rotatedHeight,
+                            )
+                            displayRenderer.onFrame(frame)
+                        }
+                    }
+                }
+                CNCallEngine.setRemoteVideoRenderer(
+                    callId,
+                    reportingRenderer,
+                )
             }
 
             override fun onRequestCameraCapabilities() {
