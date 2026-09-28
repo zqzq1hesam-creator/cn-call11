@@ -99,6 +99,27 @@ class CNCallVideoProvider(
         updateRenderer(surface, preview = false)
     }
 
+    /**
+     * Telecom may provide the video surfaces before the LiveKit Room has
+     * created its shared EGL context. Keep those surfaces and retry once the
+     * media room is connected instead of dropping the first binding.
+     */
+    fun retryPendingSurfaceBindings() {
+        val pendingPreview: Surface?
+        val pendingDisplay: Surface?
+        synchronized(rendererLock) {
+            pendingPreview = previewSurface
+            pendingDisplay = displaySurface
+        }
+
+        if (pendingPreview != null) {
+            updateRenderer(pendingPreview, preview = true)
+        }
+        if (pendingDisplay != null) {
+            updateRenderer(pendingDisplay, preview = false)
+        }
+    }
+
     override fun onSetDeviceOrientation(rotation: Int) {
         listener.onSetDeviceOrientation(rotation)
     }
@@ -259,9 +280,18 @@ class CNCallVideoProvider(
             if (renderer == null) {
                 val sharedEglContext = NativeLiveKit.getVideoEglBaseContext()
                 if (sharedEglContext == null) {
+                    synchronized(rendererLock) {
+                        if (preview) {
+                            previewSurface = surface
+                        } else {
+                            displaySurface = surface
+                        }
+                    }
                     println(
-                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready " +
-                            "call_id=$callId",
+                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready; " +
+                            "surface queued " +
+                            (if (preview) "preview" else "display") +
+                            " call_id=$callId",
                     )
                     return@post
                 }
