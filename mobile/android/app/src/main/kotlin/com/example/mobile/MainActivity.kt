@@ -90,6 +90,10 @@ class MainActivity : FlutterActivity() {
                         val callerName =
                             call.argument<String>("callerName")?.trim().orEmpty()
                                 .ifEmpty { "مستخدم CN CALL" }
+                        val videoState = normalizeVideoState(
+                            call.argument<Int>("videoState")
+                                ?: android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+                        )
 
                         if (callId.isEmpty() || callerId.isEmpty()) {
                             result.error(
@@ -105,7 +109,8 @@ class MainActivity : FlutterActivity() {
                                 NativeWebSocketClient.tryAcquireNativeOwnership(this)
                             println(
                                 "[CN CALL][TELECOM] Flutter incoming handoff" +
-                                    " call_id=$callId caller_id=$callerId native_owner=$acquired",
+                                    " call_id=$callId caller_id=$callerId" +
+                                    " video_state=$videoState native_owner=$acquired",
                             )
 
                             if (!acquired) {
@@ -146,6 +151,10 @@ class MainActivity : FlutterActivity() {
                                     putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
                                     putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
                                     putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                                    putInt(
+                                        TelecomManager.EXTRA_INCOMING_VIDEO_STATE,
+                                        videoState,
+                                    )
                                 },
                             )
 
