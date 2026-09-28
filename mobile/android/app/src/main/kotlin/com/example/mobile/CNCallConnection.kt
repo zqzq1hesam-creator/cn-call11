@@ -688,6 +688,8 @@ class CNCallConnection(
         CNCallRegistry.remove(callId)
         CNCallNotification.cancel(appContext, callId)
         CNCallEngine.notifyTelecomCallEnded(callId)
+        CNCallVideoService.stopForCall(appContext, callId)
+        println("[CN CALL][VIDEO SERVICE] stopped for ended call call_id=$callId")
         videoProvider.release()
         destroy()
     }
