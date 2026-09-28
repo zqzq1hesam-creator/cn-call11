@@ -177,6 +177,10 @@ class MainActivity : FlutterActivity() {
                     "placeCNCall" -> {
                         val callId = call.argument<String>("callId")?.trim().orEmpty()
                         val targetId = call.argument<String>("targetId")?.trim().orEmpty()
+                        val videoState = normalizeVideoState(
+                            call.argument<Int>("videoState")
+                                ?: android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+                        )
 
                         if (callId.isEmpty() || targetId.isEmpty()) {
                             result.error(
@@ -235,7 +239,12 @@ class MainActivity : FlutterActivity() {
                                 return@setMethodCallHandler
                             }
 
-                            placeCNCallWithTelecom(callId, targetId, result)
+                            placeCNCallWithTelecom(
+                                callId,
+                                targetId,
+                                result,
+                                videoState,
+                            )
                         } catch (error: SecurityException) {
                             result.error(
                                 "telecom_security",
@@ -433,6 +442,16 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    private fun normalizeVideoState(videoState: Int): Int {
+        return when (videoState) {
+            android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+            android.telecom.VideoProfile.STATE_BIDIRECTIONAL,
+            android.telecom.VideoProfile.STATE_TX_ENABLED,
+            android.telecom.VideoProfile.STATE_RX_ENABLED -> videoState
+            else -> android.telecom.VideoProfile.STATE_AUDIO_ONLY
+        }
+    }
+
     private fun hasCallPermission(): Boolean {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
@@ -471,6 +490,7 @@ class MainActivity : FlutterActivity() {
         callId: String,
         targetId: String,
         result: MethodChannel.Result,
+        videoState: Int = android.telecom.VideoProfile.STATE_AUDIO_ONLY,
     ) {
         try {
             val telecomManager =
@@ -486,6 +506,10 @@ class MainActivity : FlutterActivity() {
             val address = Uri.parse("cncall:$targetId")
             val extras = Bundle().apply {
                 putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
+                putInt(
+                    android.telecom.TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE,
+                    normalizeVideoState(videoState),
+                )
             }
             telecomManager.placeCall(address, extras)
             result.success(true)
