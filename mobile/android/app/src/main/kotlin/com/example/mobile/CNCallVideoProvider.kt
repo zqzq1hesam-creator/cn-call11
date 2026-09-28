@@ -12,6 +12,7 @@ import livekit.org.webrtc.SurfaceEglRenderer
 import livekit.org.webrtc.ThreadUtils
 import livekit.org.webrtc.VideoSink
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Bridges Android Telecom's video controls/surfaces to CN CALL's native
@@ -225,6 +226,11 @@ class CNCallVideoProvider(
 
             val activeRenderer = renderer ?: return@post
 
+            installRenderDiagnostics(
+                activeRenderer,
+                if (preview) "LOCAL" else "REMOTE",
+            )
+
             try {
                 // createEglSurface() is asynchronous, but the previous EGL
                 // surface has already been detached above, so this Surface
@@ -265,6 +271,35 @@ class CNCallVideoProvider(
     }
 
     private fun sameSurface(first: Surface?, second: Surface): Boolean {
+    private fun installRenderDiagnostics(
+        renderer: SurfaceEglRenderer,
+        label: String,
+    ) {
+        val renderCount = AtomicInteger(0)
+        renderer.addRenderListener(
+            SurfaceEglRenderer.RenderListener { timestampNs ->
+                val count = renderCount.incrementAndGet()
+                if (count <= 3 || count % 60 == 0) {
+                    println(
+                        "[CN CALL][VIDEO RENDER] " + label +
+                            " swapBuffers count=" + count +
+                            " ts=" + timestampNs,
+                    )
+                }
+            },
+        )
+        renderer.setErrorCallback(
+            object : SurfaceEglRenderer.ErrorCallback {
+                override fun onGlOutOfMemory() {
+                    println(
+                        "[CN CALL][VIDEO RENDER ERROR] " + label +
+                            " GL_OUT_OF_MEMORY",
+                    )
+                }
+            },
+        )
+    }
+
         if (first == null) return false
         return first === second || first == second
     }
