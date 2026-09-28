@@ -68,38 +68,13 @@ jobs:
 
           echo "ARM64_V8A_SPLIT_APK_ZIP_OK"
           ls -lh "$APK" "$ZIP"
-          unzip -Z1 "$APK" | grep '^lib/.*[.]so
-
-      - name: Upload universal APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: cn-call11-universal-release-apk
-          path: mobile/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          compression-level: 9
-
-      - name: Upload universal ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: cn-call11-universal-release-zip
-          path: mobile/build/app/outputs/flutter-apk/cn-call11-universal-release.zip
-          if-no-files-found: error
-          compression-level: 9
- | sort
+          unzip -Z1 "$APK" | grep '^lib/.*[.]so$' | sort
           unzip -l "$ZIP"
 
-      - name: Upload universal APK
+      - name: Upload arm64-v8a ZIP only
         uses: actions/upload-artifact@v4
         with:
-          name: cn-call11-universal-release-apk
-          path: mobile/build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-          compression-level: 9
-
-      - name: Upload universal ZIP
-        uses: actions/upload-artifact@v4
-        with:
-          name: cn-call11-universal-release-zip
-          path: mobile/build/app/outputs/flutter-apk/cn-call11-universal-release.zip
+          name: cn-call11-arm64-v8a-release-zip
+          path: mobile/build/app/outputs/flutter-apk/cn-call11-arm64-v8a-release.zip
           if-no-files-found: error
           compression-level: 9
