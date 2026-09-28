@@ -3240,6 +3240,11 @@ async def websocket_endpoint(
             elif message_type == "connected":
                 allowed = status in {"accepted", "negotiating"}
                 next_status = "connected"
+            elif message_type in {"call_video_request", "call_video_response"}:
+                # Video negotiation is media/UI control only. It never changes
+                # the authoritative call state; both endpoints must already be
+                # in an accepted/negotiating/connected call.
+                allowed = status in {"accepted", "negotiating", "connected"}
             elif message_type == "timeout":
                 allowed = status == "ringing"
                 next_status = "timeout"
