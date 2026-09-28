@@ -318,9 +318,6 @@ object CNCallEngine {
                     val t8 = System.currentTimeMillis()
                     println("[CN CALL][SPEED_METRICS] T8_mic_published call_id=$current ts=$t8")
 
-                    (CNCallRegistry.get(current)?.connection as? CNCallConnection)
-                        ?.retryVideoRendererBindings()
-
                     val wantsInitialVideo = synchronized(lock) {
                         current == scoredCallId && wantsVideo(initialVideoState)
                     }
@@ -481,6 +478,10 @@ object CNCallEngine {
                 outgoingTargetId = null
                 acceptedCallId = null
                 initialVideoState = normalizedVideoState
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
                 pendingIncomingCall =
                     PendingIncomingCall(
                         callId,
@@ -547,6 +548,10 @@ object CNCallEngine {
                 pendingIncomingCall = null
                 acceptedCallId = null
                 initialVideoState = normalizedVideoState
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
             }
 
             val signalingReady = ensureSignalingConnected()
@@ -773,6 +778,7 @@ object CNCallEngine {
                     callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             stopCallAudioService(callId)
@@ -1018,6 +1024,7 @@ object CNCallEngine {
             synchronized(lock) {
                 ++generation
                 scoredCallId = callId
+                resetVideoNegotiationStateLocked()
             }
         }
 
@@ -2206,6 +2213,7 @@ object CNCallEngine {
                     acceptedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             println(
@@ -2258,6 +2266,7 @@ object CNCallEngine {
                     callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 } else {
                     endedCallId = null
                 }
