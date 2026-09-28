@@ -11,7 +11,6 @@ import livekit.org.webrtc.GlRectDrawer
 import livekit.org.webrtc.EglRenderer
 import livekit.org.webrtc.SurfaceEglRenderer
 import livekit.org.webrtc.ThreadUtils
-import livekit.org.webrtc.VideoFrame
 import livekit.org.webrtc.VideoSink
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicInteger
@@ -25,12 +24,6 @@ class CNCallVideoProvider(
     private val callId: String,
     private val listener: Listener,
 ) : Connection.VideoProvider() {
-    companion object {
-        // LiveKit 2.11.0's default VideoPreset169.H720 is 1280x720.
-        private const val CAMERA_WIDTH = 1280
-        private const val CAMERA_HEIGHT = 720
-    }
-
 
     interface Listener {
         fun onSessionModifyRequest(fromProfile: VideoProfile, toProfile: VideoProfile)
@@ -80,7 +73,6 @@ class CNCallVideoProvider(
         mainHandler.post {
             try {
                 listener.onSetCamera(requestedCameraId)
-                reportCameraCapabilities()
             } catch (error: Throwable) {
                 println(
                     "[CN CALL][VIDEO PROVIDER] camera switch failed " +
@@ -99,27 +91,6 @@ class CNCallVideoProvider(
         updateRenderer(surface, preview = false)
     }
 
-    /**
-     * Telecom may provide the video surfaces before the LiveKit Room has
-     * created its shared EGL context. Keep those surfaces and retry once the
-     * media room is connected instead of dropping the first binding.
-     */
-    fun retryPendingSurfaceBindings() {
-        val pendingPreview: Surface?
-        val pendingDisplay: Surface?
-        synchronized(rendererLock) {
-            pendingPreview = previewSurface
-            pendingDisplay = displaySurface
-        }
-
-        if (pendingPreview != null) {
-            updateRenderer(pendingPreview, preview = true)
-        }
-        if (pendingDisplay != null) {
-            updateRenderer(pendingDisplay, preview = false)
-        }
-    }
-
     override fun onSetDeviceOrientation(rotation: Int) {
         listener.onSetDeviceOrientation(rotation)
     }
@@ -129,65 +100,7 @@ class CNCallVideoProvider(
     }
 
     override fun onRequestCameraCapabilities() {
-        reportCameraCapabilities()
         listener.onRequestCameraCapabilities()
-    }
-
-    private fun reportCameraCapabilities() {
-        try {
-            changeCameraCapabilities(
-                VideoProfile.CameraCapabilities(CAMERA_WIDTH, CAMERA_HEIGHT),
-            )
-            println(
-                "[CN CALL][VIDEO PROVIDER] camera capabilities reported " +
-                    "call_id=" + callId + " size=" +
-                    CAMERA_WIDTH + "x" + CAMERA_HEIGHT,
-            )
-        } catch (error: Throwable) {
-            println(
-                "[CN CALL][VIDEO PROVIDER] camera capabilities report failed " +
-                    "call_id=" + callId + " error=" + error.message,
-            )
-        }
-    }
-
-    private class PeerDimensionReportingSink(
-        private val provider: CNCallVideoProvider,
-        private val delegate: VideoSink,
-    ) : VideoSink {
-        private var lastWidth = 0
-        private var lastHeight = 0
-
-        override fun onFrame(frame: VideoFrame) {
-            val width = frame.rotatedWidth
-            val height = frame.rotatedHeight
-            if (width > 0 && height > 0 &&
-                (width != lastWidth || height != lastHeight)
-            ) {
-                lastWidth = width
-                lastHeight = height
-                provider.reportPeerDimensions(width, height)
-            }
-            delegate.onFrame(frame)
-        }
-    }
-
-    private fun reportPeerDimensions(width: Int, height: Int) {
-        if (width <= 0 || height <= 0) return
-        mainHandler.post {
-            try {
-                changePeerDimensions(width, height)
-                println(
-                    "[CN CALL][VIDEO PROVIDER] peer dimensions reported " +
-                        "call_id=" + callId + " size=" + width + "x" + height,
-                )
-            } catch (error: Throwable) {
-                println(
-                    "[CN CALL][VIDEO PROVIDER] peer dimensions report failed " +
-                        "call_id=" + callId + " error=" + error.message,
-                )
-            }
-        }
     }
 
     override fun onRequestConnectionDataUsage() {
@@ -280,18 +193,9 @@ class CNCallVideoProvider(
             if (renderer == null) {
                 val sharedEglContext = NativeLiveKit.getVideoEglBaseContext()
                 if (sharedEglContext == null) {
-                    synchronized(rendererLock) {
-                        if (preview) {
-                            previewSurface = surface
-                        } else {
-                            displaySurface = surface
-                        }
-                    }
                     println(
-                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready; " +
-                            "surface queued " +
-                            (if (preview) "preview" else "display") +
-                            " call_id=$callId",
+                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready " +
+                            "call_id=$callId",
                     )
                     return@post
                 }
@@ -355,9 +259,7 @@ class CNCallVideoProvider(
             if (preview) {
                 listener.onPreviewRendererChanged(activeRenderer)
             } else {
-                listener.onDisplayRendererChanged(
-                    PeerDimensionReportingSink(this@CNCallVideoProvider, activeRenderer),
-                )
+                listener.onDisplayRendererChanged(activeRenderer)
             }
 
             println(
