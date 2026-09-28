@@ -304,6 +304,24 @@ object NativeLiveKit {
         }
     }
 
+    /**
+     * Returns the EGL context owned by the current LiveKit Room.
+     * LiveKit's own Room.initVideoRenderer() uses this same context when
+     * initializing video renderers; sharing it keeps camera/decoder textures
+     * in the same EGL context as the output renderer.
+     */
+    fun getVideoEglBaseContext(): livekit.org.webrtc.EglBase.Context? {
+        val target = room ?: return null
+        return try {
+            target.lkObjects.eglBase.eglBaseContext
+        } catch (error: Throwable) {
+            println(
+                "[CN CALL][VIDEO] shared EGL context unavailable " +
+                    "error=\${error.message}",
+            )
+            null
+        }
+    }
     fun setLocalVideoRenderer(renderer: VideoSink?) {
         val oldTrack: LocalVideoTrack?
         val oldRenderer: VideoSink?
