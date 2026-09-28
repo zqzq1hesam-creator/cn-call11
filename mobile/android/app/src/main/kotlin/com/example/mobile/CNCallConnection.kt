@@ -429,6 +429,23 @@ class CNCallConnection(
             println("[CN CALL][TELECOM] pre-start CNCallAudioService exception call_id=$callId err=$e")
         }
 
+        val wantsInitialVideo = initialVideoState and
+            (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+        if (wantsInitialVideo) {
+            try {
+                val videoFgsStarted = CNCallVideoService.startForCall(appContext, callId)
+                println(
+                    "[CN CALL][TELECOM] pre-started CNCallVideoService onAnswer " +
+                        "call_id=$callId ok=$videoFgsStarted",
+                )
+            } catch (e: Exception) {
+                println(
+                    "[CN CALL][TELECOM] pre-start CNCallVideoService exception " +
+                        "call_id=$callId err=$e",
+                )
+            }
+        }
+
         // Phase 3: only the native signaling owner may answer. If Flutter still
         // owns the socket (a live/ringing Flutter call, or an app that reclaimed
         // ownership in the meantime), refuse here: call_accept is sent exactly
