@@ -155,13 +155,12 @@ class CNCallVideoProvider(
             }
 
             if (renderer != null) {
-                // Samsung may replace Telecom's Surface while the video call
-                // stays active. Fully detach AND release the old renderer,
-                // then create a fresh renderer for the new Surface. This keeps
-                // stale EGL state from surviving a Surface replacement.
-                releaseEglSurfaceBlocking(renderer!!)
-                releaseRenderer(renderer!!)
-                renderer = null
+                if (!releaseEglSurfaceBlocking(renderer!!)) {
+                    // The renderer is no longer safe to reuse if EGL detach
+                    // failed. Fully release it before creating a replacement.
+                    releaseRenderer(renderer!!)
+                    renderer = null
+                }
             }
 
             if (surface == null) {
@@ -190,6 +189,15 @@ class CNCallVideoProvider(
             }
 
             if (renderer == null) {
+                val sharedEglContext = NativeLiveKit.getVideoEglBaseContext()
+                if (sharedEglContext == null) {
+                    println(
+                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready " +
+                            "call_id=$callId",
+                    )
+                    return@post
+                }
+
                 try {
                     renderer = SurfaceEglRenderer(
                         if (preview) {
@@ -199,7 +207,7 @@ class CNCallVideoProvider(
                         },
                     ).also { newRenderer ->
                         newRenderer.init(
-                            null,
+                            sharedEglContext,
                             null,
                             EglBase.CONFIG_PLAIN,
                             GlRectDrawer(),
@@ -218,10 +226,10 @@ class CNCallVideoProvider(
             val activeRenderer = renderer ?: return@post
 
             try {
-                // The previous renderer has been fully released before
-                // this new renderer receives the replacement Surface.
+                // createEglSurface() is asynchronous, but the previous EGL
+                // surface has already been detached above, so this Surface
+                // cannot be double-connected by our old renderer.
                 activeRenderer.createEglSurface(surface)
-                activeRenderer.disableFpsReduction()
             } catch (error: Throwable) {
                 println(
                     "[CN CALL][VIDEO PROVIDER] renderer surface bind failed " +
