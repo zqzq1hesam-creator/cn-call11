@@ -545,11 +545,6 @@ class CNCallConnection(
         setVideoState(videoState)
     }
 
-    internal fun retryVideoRendererBindings() {
-        if (terminal) return
-        videoProvider.retryPendingSurfaceBindings()
-    }
-
     internal fun notifyRemoteVideoRequest(videoState: Int) {
         if (terminal) return
         try {
