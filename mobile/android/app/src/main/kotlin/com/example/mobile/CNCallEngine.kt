@@ -2661,6 +2661,32 @@ object CNCallEngine {
         return currentDelegate.handleVideoResponse(callId, videoState)
     }
 
+    fun handleRemoteVideoResponse(
+        callId: String,
+        success: Boolean,
+        videoState: Int,
+        requestId: String,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("handleRemoteVideoResponse", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "handleRemoteVideoResponse",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.handleRemoteVideoResponse(
+            callId,
+            success,
+            videoState,
+            requestId,
+        )
+    }
+
     fun switchVideoCamera(callId: String, cameraId: String): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("switchVideoCamera", callId, callbacks)
