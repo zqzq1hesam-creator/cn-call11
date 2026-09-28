@@ -189,6 +189,8 @@ class CNCallVideoProvider(
                 return@post
             }
 
+            var diagnosticsInstalled = false
+
             if (renderer == null) {
                 val sharedEglContext = NativeLiveKit.getVideoEglBaseContext()
                 if (sharedEglContext == null) {
@@ -213,6 +215,11 @@ class CNCallVideoProvider(
                             EglBase.CONFIG_PLAIN,
                             GlRectDrawer(),
                         )
+                        installRenderDiagnostics(
+                            newRenderer,
+                            if (preview) "LOCAL" else "REMOTE",
+                        )
+                        diagnosticsInstalled = true
                     }
                 } catch (error: Throwable) {
                     println(
@@ -226,10 +233,9 @@ class CNCallVideoProvider(
 
             val activeRenderer = renderer ?: return@post
 
-            installRenderDiagnostics(
-                activeRenderer,
-                if (preview) "LOCAL" else "REMOTE",
-            )
+            if (!diagnosticsInstalled && renderer !== null) {
+                // Existing renderer already has its diagnostics listener.
+            }
 
             try {
                 // createEglSurface() is asynchronous, but the previous EGL
