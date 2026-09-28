@@ -821,7 +821,101 @@ object CNCallEngine {
             videoState: Int,
         ): Boolean {
             if (!isScored(callId)) return false
-            return applyVideoState(callId, videoState)
+
+            val requestedState: Int
+            val requestId: String
+            synchronized(lock) {
+                requestedState = pendingIncomingVideoState ?: return false
+                requestId = pendingIncomingVideoRequestId.orEmpty()
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
+            }
+
+            val requestedVideo = wantsVideo(requestedState)
+            val responseVideo = wantsVideo(videoState)
+
+            if (requestedVideo != responseVideo) {
+                sendVideoResponse(
+                    callId,
+                    false,
+                    VideoProfile.STATE_AUDIO_ONLY,
+                    requestId,
+                )
+                println(
+                    "[CN CALL][VIDEO] local user declined remote request " +
+                        "call_id=$callId request_id=$requestId",
+                )
+                return true
+            }
+
+            return applyVideoMediaState(callId, videoState) { success, finalState ->
+                sendVideoResponse(
+                    callId,
+                    success,
+                    finalState,
+                    requestId,
+                )
+            }
+        }
+
+        override fun handleRemoteVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+            requestId: String,
+        ): Boolean {
+            if (!isScored(callId)) return false
+
+            val requestedState: Int
+            val expectedRequestId: String
+            synchronized(lock) {
+                requestedState = pendingOutgoingVideoState ?: return false
+                expectedRequestId = pendingOutgoingVideoRequestId.orEmpty()
+
+                if (expectedRequestId.isNotEmpty() &&
+                    requestId.isNotEmpty() &&
+                    expectedRequestId != requestId
+                ) {
+                    println(
+                        "[CN CALL][VIDEO] remote response request_id mismatch " +
+                            "call_id=$callId expected=$expectedRequestId actual=$requestId",
+                    )
+                    return false
+                }
+
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+            }
+
+            val connection =
+                CNCallRegistry.get(callId)?.connection as? CNCallConnection
+            val requestedVideo = wantsVideo(requestedState)
+            val responseVideo = wantsVideo(videoState)
+
+            if (!success || requestedVideo != responseVideo) {
+                connection?.completeVideoSessionModify(
+                    requestedState,
+                    videoState,
+                    Connection.VideoProvider.SESSION_MODIFY_REQUEST_REJECTED_BY_REMOTE,
+                )
+                println(
+                    "[CN CALL][VIDEO] remote video request rejected " +
+                        "call_id=$callId requested=$requestedState response=$videoState success=$success",
+                )
+                return true
+            }
+
+            return applyVideoMediaState(callId, videoState) { mediaSuccess, finalState ->
+                connection?.completeVideoSessionModify(
+                    requestedState,
+                    finalState,
+                    if (mediaSuccess) {
+                        Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS
+                    } else {
+                        Connection.VideoProvider.SESSION_MODIFY_REQUEST_FAIL
+                    },
+                )
+            }
         }
 
         override fun switchVideoCamera(
@@ -2013,57 +2107,61 @@ object CNCallEngine {
             return sent
         }
 
-        private fun applyVideoState(
+        private fun applyVideoMediaState(
             callId: String,
             videoState: Int,
+            onResult: (Boolean, Int) -> Unit,
         ): Boolean {
-            val context = appContext ?: return false
-            val wantsVideo =
-                videoState and
-                    (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+            val context = appContext ?: run {
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
+            }
+            val wantsVideo = wantsVideo(videoState)
 
             if (wantsVideo && !hasCameraPermission(context)) {
-                return false
+                println(
+                    "[CN CALL][VIDEO] apply state denied: camera permission missing " +
+                        "call_id=$callId",
+                )
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
             }
 
-            if (wantsVideo &&
-                !CNCallVideoService.startForCall(context, callId)
-            ) {
-                return false
+            if (wantsVideo && !CNCallVideoService.startForCall(context, callId)) {
+                println(
+                    "[CN CALL][VIDEO] video service unavailable " +
+                        "call_id=$callId",
+                )
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
             }
 
             NativeLiveKit.setCameraEnabled(wantsVideo) { error ->
+                if (callId != synchronizedVideoCallId()) return@setCameraEnabled
+
                 if (error != null) {
+                    if (wantsVideo) {
+                        CNCallVideoService.stopForCall(context, callId)
+                    }
                     println(
                         "[CN CALL][VIDEO] apply state failed call_id=" +
                             callId + " error=" + error.message,
                     )
-                    CNCallVideoService.stopForCall(context, callId)
-                    CNCallRegistry.get(callId)?.connection
-                        ?.let { it as? CNCallConnection }
-                        ?.completeVideoSessionModify(
-                            VideoProfile.STATE_AUDIO_ONLY,
-                            false,
-                        )
+                    onResult(false, VideoProfile.STATE_AUDIO_ONLY)
                     return@setCameraEnabled
-                }
-
-                if (!wantsVideo) {
-                    CNCallVideoService.stopForCall(context, callId)
                 }
 
                 val finalState =
                     if (wantsVideo) {
                         VideoProfile.STATE_BIDIRECTIONAL
                     } else {
+                        CNCallVideoService.stopForCall(context, callId)
                         VideoProfile.STATE_AUDIO_ONLY
                     }
 
                 (CNCallRegistry.get(callId)?.connection as? CNCallConnection)
-                    ?.completeVideoSessionModify(
-                        finalState,
-                        true,
-                    )
+                    ?.updateVideoState(finalState)
+                onResult(true, finalState)
             }
             return true
         }
@@ -2072,6 +2170,7 @@ object CNCallEngine {
             callId: String,
             success: Boolean,
             videoState: Int,
+            requestId: String = "",
         ) {
             val context = appContext ?: return
             val userId = NativeCallTokenHelper.restoreUserId(context)
@@ -2089,15 +2188,20 @@ object CNCallEngine {
 
             if (userId.isEmpty() || targetId.isEmpty()) return
 
+            val payload = mutableMapOf(
+                "call_id" to callId,
+                "target_id" to targetId,
+                "from_id" to userId,
+                "success" to success.toString(),
+                "video_state" to videoState.toString(),
+            )
+            if (requestId.isNotBlank()) {
+                payload["request_id"] = requestId
+            }
+
             val sent = NativeWebSocketClient.send(
                 "call_video_response",
-                mapOf(
-                    "call_id" to callId,
-                    "target_id" to targetId,
-                    "from_id" to userId,
-                    "success" to success.toString(),
-                    "video_state" to videoState.toString(),
-                ),
+                payload,
             )
 
             println(
