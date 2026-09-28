@@ -18,6 +18,7 @@ class CNCallConnection(
     private val callerId: String,
     private val callerName: String,
     private val address: Uri,
+    private val initialVideoState: Int,
 ) : Connection() {
     @Volatile
     private var terminal = false
@@ -166,7 +167,15 @@ class CNCallConnection(
                 CAPABILITY_SUPPORTS_VT_REMOTE_BIDIRECTIONAL,
         )
         setVideoProvider(videoProvider)
-        setVideoState(VideoProfile.STATE_AUDIO_ONLY)
+        setVideoState(
+            when (initialVideoState) {
+                VideoProfile.STATE_AUDIO_ONLY,
+                VideoProfile.STATE_BIDIRECTIONAL,
+                VideoProfile.STATE_TX_ENABLED,
+                VideoProfile.STATE_RX_ENABLED -> initialVideoState
+                else -> VideoProfile.STATE_AUDIO_ONLY
+            },
+        )
         setAddress(address, CallLog.Calls.PRESENTATION_ALLOWED)
         if (!incoming) {
             prepareOutgoingRingback()
@@ -417,7 +426,12 @@ class CNCallConnection(
             return
         }
         if (!CNCallEngine.initialize(appContext, engineCallbacks) ||
-            !CNCallEngine.startIncoming(callId, callerId, callerName)
+            !CNCallEngine.startIncoming(
+                callId,
+                callerId,
+                callerName,
+                initialVideoState,
+            )
         ) {
             fail(DisconnectCause.ERROR)
             return
@@ -547,13 +561,14 @@ class CNCallConnection(
     }
 
     internal fun completeVideoSessionModify(
-        videoState: Int,
+        requestedVideoState: Int,
+        responseVideoState: Int,
         success: Boolean,
     ) {
         if (terminal) return
 
-        val responseProfile = VideoProfile(videoState)
-        val requestedProfile = VideoProfile(videoState)
+        val requestedProfile = VideoProfile(requestedVideoState)
+        val responseProfile = VideoProfile(responseVideoState)
         val status =
             if (success) {
                 Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS
@@ -564,8 +579,8 @@ class CNCallConnection(
         try {
             videoProvider.receiveSessionModifyResponse(
                 status,
-                responseProfile,
                 requestedProfile,
+                responseProfile,
             )
         } catch (error: Exception) {
             println(
@@ -576,7 +591,7 @@ class CNCallConnection(
         }
 
         if (success) {
-            setVideoState(videoState)
+            setVideoState(responseVideoState)
         }
     }
 
