@@ -9,7 +9,9 @@ import android.view.Surface
 import livekit.org.webrtc.EglBase
 import livekit.org.webrtc.GlRectDrawer
 import livekit.org.webrtc.SurfaceEglRenderer
+import livekit.org.webrtc.ThreadUtils
 import livekit.org.webrtc.VideoSink
+import java.util.concurrent.CountDownLatch
 
 /**
  * Bridges Android Telecom's video controls/surfaces to CN CALL's native
@@ -39,6 +41,8 @@ class CNCallVideoProvider(
 
     private var previewRenderer: SurfaceEglRenderer? = null
     private var displayRenderer: SurfaceEglRenderer? = null
+    private var previewSurface: Surface? = null
+    private var displaySurface: Surface? = null
 
     override fun onSendSessionModifyRequest(
         fromProfile: VideoProfile,
@@ -107,54 +111,173 @@ class CNCallVideoProvider(
 
     /**
      * Replace a Telecom-provided Surface with a renderer attached to that
-     * surface. Renderer lifecycle is kept on Android's main thread because the
-     * WebRTC renderer requires main-thread initialization.
+     * surface. Android Telecom may deliver the same Surface more than once,
+     * and may deliver a new Surface before the previous EGL surface has been
+     * fully detached. WebRTC's EglRenderer queues createEglSurface() on its
+     * render thread, while releaseEglSurface() waits for that thread to stop
+     * touching the old Surface. We therefore reuse one renderer per endpoint
+     * and synchronously detach the old EGL surface before attaching a new one.
      */
     private fun updateRenderer(surface: Surface?, preview: Boolean) {
         mainHandler.post {
-            var rendererToRelease: SurfaceEglRenderer? = null
-            val newRenderer = if (surface == null) {
-                null
-            } else {
-                SurfaceEglRenderer(
-                    if (preview) "CN CALL Local Video" else "CN CALL Remote Video",
-                ).also { renderer ->
-                    renderer.init(
-                        null,
-                        null,
-                        EglBase.CONFIG_PLAIN,
-                        GlRectDrawer(),
-                    )
-                    renderer.createEglSurface(surface)
+            var renderer: SurfaceEglRenderer?
+            val previousSurface: Surface?
+
+            synchronized(rendererLock) {
+                renderer = if (preview) previewRenderer else displayRenderer
+                previousSurface = if (preview) previewSurface else displaySurface
+            }
+
+            // Samsung can repeat the exact same Surface while entering video
+            // mode. Do not ask WebRTC to create a second EGL window surface.
+            if (
+                surface != null &&
+                renderer != null &&
+                sameSurface(previousSurface, surface)
+            ) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] surface unchanged " +
+                        "${if (preview) "preview" else "display"} " +
+                        "call_id=$callId",
+                )
+                return@post
+            }
+
+            // Never detach a valid current surface just because Telecom sent
+            // an invalid replacement surface.
+            if (surface != null && !surface.isValid) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] ignoring invalid " +
+                        "${if (preview) "preview" else "display"} surface " +
+                        "call_id=$callId",
+                )
+                return@post
+            }
+
+            if (renderer != null) {
+                if (!releaseEglSurfaceBlocking(renderer!!)) {
+                    // The renderer is no longer safe to reuse if EGL detach
+                    // failed. Fully release it before creating a replacement.
+                    releaseRenderer(renderer!!)
+                    renderer = null
                 }
+            }
+
+            if (surface == null) {
+                synchronized(rendererLock) {
+                    if (preview) {
+                        previewSurface = null
+                        previewRenderer = renderer
+                    } else {
+                        displaySurface = null
+                        displayRenderer = renderer
+                    }
+                }
+
+                if (preview) {
+                    listener.onPreviewRendererChanged(null)
+                } else {
+                    listener.onDisplayRendererChanged(null)
+                }
+
+                println(
+                    "[CN CALL][VIDEO PROVIDER] surface " +
+                        "${if (preview) "preview" else "display"} cleared " +
+                        "call_id=$callId",
+                )
+                return@post
+            }
+
+            if (renderer == null) {
+                try {
+                    renderer = SurfaceEglRenderer(
+                        if (preview) {
+                            "CN CALL Local Video"
+                        } else {
+                            "CN CALL Remote Video"
+                        },
+                    ).also { newRenderer ->
+                        newRenderer.init(
+                            null,
+                            null,
+                            EglBase.CONFIG_PLAIN,
+                            GlRectDrawer(),
+                        )
+                    }
+                } catch (error: Throwable) {
+                    println(
+                        "[CN CALL][VIDEO PROVIDER] renderer init failed " +
+                            "call_id=$callId " +
+                            "error=${error.message}",
+                    )
+                    return@post
+                }
+            }
+
+            val activeRenderer = renderer ?: return@post
+
+            try {
+                // createEglSurface() is asynchronous, but the previous EGL
+                // surface has already been detached above, so this Surface
+                // cannot be double-connected by our old renderer.
+                activeRenderer.createEglSurface(surface)
+            } catch (error: Throwable) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] renderer surface bind failed " +
+                        "call_id=$callId " +
+                        "error=${error.message}",
+                )
+                releaseRenderer(activeRenderer)
+                return@post
             }
 
             synchronized(rendererLock) {
                 if (preview) {
-                    rendererToRelease = previewRenderer
-                    previewRenderer = newRenderer
+                    previewRenderer = activeRenderer
+                    previewSurface = surface
                 } else {
-                    rendererToRelease = displayRenderer
-                    displayRenderer = newRenderer
+                    displayRenderer = activeRenderer
+                    displaySurface = surface
                 }
             }
 
-            val oldRenderer = rendererToRelease
-            if (oldRenderer != null) {
-                releaseRenderer(oldRenderer)
-            }
-
             if (preview) {
-                listener.onPreviewRendererChanged(newRenderer)
+                listener.onPreviewRendererChanged(activeRenderer)
             } else {
-                listener.onDisplayRendererChanged(newRenderer)
+                listener.onDisplayRendererChanged(activeRenderer)
             }
 
             println(
                 "[CN CALL][VIDEO PROVIDER] surface " +
                     "${if (preview) "preview" else "display"} updated " +
-                    "call_id=$callId present=${surface != null}",
+                    "call_id=$callId present=true",
             )
+        }
+    }
+
+    private fun sameSurface(first: Surface?, second: Surface): Boolean {
+        if (first == null) return false
+        return first === second || first == second
+    }
+
+    /**
+     * WebRTC explicitly guarantees that releaseEglSurface() does not return
+     * until the render thread has stopped touching the old Surface.
+     */
+    private fun releaseEglSurfaceBlocking(renderer: SurfaceEglRenderer): Boolean {
+        return try {
+            val completionLatch = CountDownLatch(1)
+            renderer.releaseEglSurface {
+                completionLatch.countDown()
+            }
+            ThreadUtils.awaitUninterruptibly(completionLatch)
+            true
+        } catch (error: Throwable) {
+            println(
+                "[CN CALL][VIDEO PROVIDER] EGL surface release failed " +
+                    "call_id=$callId error=${error.message}",
+            )
+            false
         }
     }
 
