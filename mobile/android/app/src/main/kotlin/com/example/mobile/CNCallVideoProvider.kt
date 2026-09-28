@@ -46,6 +46,12 @@ class CNCallVideoProvider(
     private var previewSurface: Surface? = null
     private var displaySurface: Surface? = null
 
+    // Samsung can provide the Telecom surface before LiveKit has created its
+    // EGL context. Keep that valid surface until LiveKit is ready instead of
+    // dropping it and waiting for Samsung to send it again.
+    private var pendingPreviewSurface: Surface? = null
+    private var pendingDisplaySurface: Surface? = null
+
     // Samsung InCallUI may keep the video view in WAITING state until the
     // VideoProvider reports that media reception/transmission has started.
     // Reset these one-shot notifications whenever Telecom supplies a new surface.
@@ -120,6 +126,37 @@ class CNCallVideoProvider(
     }
 
     /**
+     * Called when LiveKit media is ready. Telecom may have supplied its video
+     * surface before that point, so retry any valid surface that was queued.
+     */
+    internal fun onLiveKitReady() {
+        mainHandler.post {
+            val pendingPreview: Surface?
+            val pendingDisplay: Surface?
+            synchronized(rendererLock) {
+                pendingPreview = pendingPreviewSurface
+                pendingDisplay = pendingDisplaySurface
+            }
+
+            if (pendingPreview != null) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] retry queued preview surface " +
+                        "call_id=$callId",
+                )
+                updateRenderer(pendingPreview, preview = true)
+            }
+
+            if (pendingDisplay != null) {
+                println(
+                    "[CN CALL][VIDEO PROVIDER] retry queued display surface " +
+                        "call_id=$callId",
+                )
+                updateRenderer(pendingDisplay, preview = false)
+            }
+        }
+    }
+
+    /**
      * Replace a Telecom-provided Surface with a renderer attached to that
      * surface. Android Telecom may deliver the same Surface more than once,
      * and may deliver a new Surface before the previous EGL surface has been
@@ -189,9 +226,11 @@ class CNCallVideoProvider(
                     if (preview) {
                         previewSurface = null
                         previewRenderer = renderer
+                        pendingPreviewSurface = null
                     } else {
                         displaySurface = null
                         displayRenderer = renderer
+                        pendingDisplaySurface = null
                     }
                 }
 
@@ -212,9 +251,18 @@ class CNCallVideoProvider(
             if (renderer == null) {
                 val sharedEglContext = NativeLiveKit.getVideoEglBaseContext()
                 if (sharedEglContext == null) {
+                    synchronized(rendererLock) {
+                        if (preview) {
+                            pendingPreviewSurface = surface
+                        } else {
+                            pendingDisplaySurface = surface
+                        }
+                    }
                     println(
-                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready " +
-                            "call_id=$callId",
+                        "[CN CALL][VIDEO PROVIDER] shared EGL context not ready; " +
+                            "surface queued endpoint=" +
+                            (if (preview) "preview" else "display") +
+                            " call_id=$callId",
                     )
                     return@post
                 }
@@ -269,9 +317,11 @@ class CNCallVideoProvider(
                 if (preview) {
                     previewRenderer = activeRenderer
                     previewSurface = surface
+                    pendingPreviewSurface = null
                 } else {
                     displayRenderer = activeRenderer
                     displaySurface = surface
+                    pendingDisplaySurface = null
                 }
             }
 
@@ -452,6 +502,10 @@ class CNCallVideoProvider(
                 oldDisplay = displayRenderer
                 previewRenderer = null
                 displayRenderer = null
+                previewSurface = null
+                displaySurface = null
+                pendingPreviewSurface = null
+                pendingDisplaySurface = null
             }
             if (oldPreview != null) {
                 listener.onPreviewRendererChanged(null)
