@@ -1421,6 +1421,7 @@ def init_db():
             created_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
             status TEXT NOT NULL,
+            video_state INTEGER NOT NULL DEFAULT 0,
             negotiation_expires_at INTEGER,
             connection_expires_at INTEGER,
             media_ready_users TEXT NOT NULL DEFAULT '[]',
@@ -1479,6 +1480,7 @@ def init_db():
     # ALTER TABLE syntax differs.
     if db.is_postgres:
         for statement in (
+            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS video_state INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS negotiation_expires_at INTEGER",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
             "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
@@ -1493,6 +1495,10 @@ def init_db():
         ):
             db.execute(statement)
     else:
+        try:
+            db.execute("ALTER TABLE call_records ADD COLUMN video_state INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         try:
             db.execute("ALTER TABLE call_records ADD COLUMN negotiation_expires_at INTEGER")
         except Exception:
@@ -1567,7 +1573,7 @@ def rebuild_active_calls_from_db():
         rows = db.execute(
             """
             SELECT call_id, caller_id, target_id, caller_name, created_at,
-                   expires_at, status, negotiation_expires_at,
+                   expires_at, status, video_state, negotiation_expires_at,
                    connection_expires_at, media_ready_users,
                    delivery_confirmed_at, delivery_deadline_at,
                    reachability_proven_at, state_version
@@ -1587,6 +1593,12 @@ def rebuild_active_calls_from_db():
             caller_id = str(row["caller_id"])
             target_id = str(row["target_id"])
             status = str(row["status"])
+            try:
+                video_state = int(row["video_state"] or 0)
+            except (TypeError, ValueError):
+                video_state = 0
+            if video_state not in (0, 1, 2, 3):
+                video_state = 0
             expires_at = row["expires_at"]
             negotiation_expires_at = row["negotiation_expires_at"]
             connection_expires_at = row["connection_expires_at"]
@@ -1685,6 +1697,7 @@ def rebuild_active_calls_from_db():
                 "target_id": target_id,
                 "caller_name": row["caller_name"],
                 "status": status,
+                "video_state": video_state,
                 "created_at": row["created_at"],
                 "ring_expires_at": expires_at,
                 "negotiation_expires_at": negotiation_expires_at,
@@ -2340,6 +2353,7 @@ def send_call_notification(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    video_state: int | None = None,
     reachability_challenge_id: str | None = None,
     reachability_nonce: str | None = None,
     reason: str | None = None,
@@ -2404,6 +2418,13 @@ def send_call_notification(
                     and reachability_nonce
                     else {}
                 ),
+                **(
+                    {
+                        "video_state": str(video_state),
+                    }
+                    if message_type == "incoming_call" and video_state is not None
+                    else {}
+                ),
             },
             android=messaging.AndroidConfig(
                 priority="high",
@@ -2454,6 +2475,7 @@ async def send_call_notification_async(
     call_id: str,
     message_type: str = "incoming_call",
     event_id: str | None = None,
+    video_state: int | None = None,
     reachability_challenge_id: str | None = None,
     reachability_nonce: str | None = None,
     reason: str | None = None,
@@ -2467,6 +2489,7 @@ async def send_call_notification_async(
         call_id=call_id,
         message_type=message_type,
         event_id=event_id,
+        video_state=video_state,
         reachability_challenge_id=reachability_challenge_id,
         reachability_nonce=reachability_nonce,
         reason=reason,
@@ -2698,6 +2721,7 @@ async def websocket_endpoint(
                         "target_id": target_id,
                         "from_id": caller_id,
                         "caller_name": str(rec.get("caller_name", "مستخدم CN CALL")),
+                        "video_state": int(rec.get("video_state", 0) or 0),
                         "ring_expires_at": rec.get("ring_expires_at"),
                         "reachability_challenge_id": rec.get("reachability_challenge_id", ""),
                         "reachability_nonce": rec.get("reachability_nonce", ""),
@@ -3016,16 +3040,25 @@ async def websocket_endpoint(
                 reachability_nonce = secrets.token_urlsafe(24)
                 target_reachability_proven = _presence_is_fresh(target_id)
 
+                raw_video_state = message.get("video_state", 0)
+                try:
+                    video_state = int(raw_video_state)
+                except (TypeError, ValueError):
+                    video_state = 0
+                if video_state not in (0, 1, 2, 3):
+                    video_state = 0
+                message["video_state"] = video_state
+
                 created_at = int(time.time() * 1000)
                 db = get_db()
                 db.execute(
                     """
                     INSERT INTO call_records
                     (call_id, caller_id, target_id, caller_name,
-                     created_at, expires_at, status, media_ready_users,
+                     created_at, expires_at, status, video_state, media_ready_users,
                      delivery_confirmed_at, delivery_deadline_at,
                      reachability_proven_at, state_version)
-                    VALUES (?, ?, ?, ?, ?, ?, 'ringing', '[]', NULL, NULL, NULL, 1)
+                    VALUES (?, ?, ?, ?, ?, ?, 'ringing', ?, '[]', NULL, NULL, NULL, 1)
                     """,
                     (
                         call_id,
@@ -3034,6 +3067,7 @@ async def websocket_endpoint(
                         str(message.get("caller_name", "مستخدم CN CALL")),
                         created_at,
                         ring_expires_at,
+                        video_state,
                     ),
                 )
                 db.commit()
@@ -3044,6 +3078,7 @@ async def websocket_endpoint(
                     "caller_id": user_id,
                     "target_id": target_id,
                     "status": "ringing",
+                    "video_state": video_state,
                     "created_at": created_at,
                     "ring_expires_at": ring_expires_at,
                     "negotiation_expires_at": None,
@@ -3070,6 +3105,7 @@ async def websocket_endpoint(
                     "target_id": target_id,
                     "from_id": user_id,
                     "ring_expires_at": ring_expires_at,
+                    "video_state": video_state,
                     "target_online": target_socket is not None,
                     "target_reachability_proven": target_reachability_proven,
                 })
@@ -3124,6 +3160,7 @@ async def websocket_endpoint(
                         ),
                         call_id=call_id,
                         message_type="incoming_call",
+                        video_state=video_state,
                         reachability_challenge_id=reachability_challenge_id,
                         reachability_nonce=reachability_nonce,
                     )
@@ -3145,6 +3182,7 @@ async def websocket_endpoint(
                         ),
                         call_id=call_id,
                         message_type="incoming_call",
+                        video_state=video_state,
                         reachability_challenge_id=reachability_challenge_id,
                         reachability_nonce=reachability_nonce,
                     )
