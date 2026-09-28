@@ -7,6 +7,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
+import android.telecom.Connection
 import android.telecom.TelecomManager
 import android.telecom.VideoProfile
 import androidx.core.content.ContextCompat
@@ -1132,6 +1133,9 @@ object CNCallEngine {
             )
             callbacks?.onMediaReady()
         }
+
+        private fun synchronizedVideoCallId(): String? =
+            synchronized(lock) { scoredCallId }
 
         private fun normalizeVideoState(videoState: Int): Int {
             return when (videoState) {
