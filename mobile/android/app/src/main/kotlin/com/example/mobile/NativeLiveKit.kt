@@ -16,6 +16,9 @@ import io.livekit.android.room.Room
 import io.livekit.android.room.track.LocalVideoTrack
 import io.livekit.android.room.track.RemoteVideoTrack
 import io.livekit.android.room.track.Track
+import io.livekit.android.room.participant.VideoTrackPublishDefaults
+import io.livekit.android.room.track.LocalVideoTrackOptions
+import io.livekit.android.room.track.VideoPreset169
 import livekit.org.webrtc.VideoFrame
 import livekit.org.webrtc.VideoSink
 import java.util.concurrent.atomic.AtomicInteger
@@ -211,6 +214,20 @@ object NativeLiveKit {
                     RoomOptions(
                         adaptiveStream = false,
                         dynacast = false,
+                        // Two-party Telecom calls use one video layer. The
+                        // previous default Simulcast path could leave the
+                        // remote endpoint on the 160x90 layer (observed as
+                        // 90x160 after rotation). H540 keeps a clear image
+                        // while using far less bandwidth than the H720/30
+                        // default and avoids sending extra simulcast layers.
+                        videoTrackCaptureDefaults = LocalVideoTrackOptions(
+                            position = io.livekit.android.room.track.CameraPosition.FRONT,
+                            captureParams = VideoPreset169.H540.capture,
+                        ),
+                        videoTrackPublishDefaults = VideoTrackPublishDefaults(
+                            videoEncoding = VideoPreset169.H540.encoding,
+                            simulcast = false,
+                        ),
                     ),
                     overrides(),
                 )
