@@ -326,7 +326,9 @@ class CNCallVideoProvider(
             }
 
             if (preview) {
-                listener.onPreviewRendererChanged(activeRenderer)
+                listener.onPreviewRendererChanged(
+                    createLocalPreviewSink(activeRenderer),
+                )
             } else {
                 listener.onDisplayRendererChanged(
                     createDimensionReportingSink(activeRenderer),
@@ -338,6 +340,40 @@ class CNCallVideoProvider(
                     "${if (preview) "preview" else "display"} updated " +
                     "call_id=$callId present=true",
             )
+        }
+    }
+
+    /**
+     * Deliver the first local frame to Telecom before handing it to WebRTC's
+     * renderer. Some older Samsung InCallUI builds can keep the local preview
+     * visually inactive until the TX_START session event has been received.
+     */
+    private fun createLocalPreviewSink(
+        delegate: VideoSink,
+    ): VideoSink {
+        return object : VideoSink {
+            override fun onFrame(frame: livekit.org.webrtc.VideoFrame) {
+                if (txStartSent.compareAndSet(0, 1)) {
+                    try {
+                        handleCallSessionEvent(
+                            Connection.VideoProvider.SESSION_EVENT_TX_START,
+                        )
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] SESSION_EVENT_TX_START " +
+                                "call_id=" + callId +
+                                " source=before_local_render",
+                        )
+                    } catch (throwable: Throwable) {
+                        txStartSent.set(0)
+                        println(
+                            "[CN CALL][VIDEO PROVIDER] TX_START failed " +
+                                "call_id=" + callId +
+                                " error=" + throwable.message,
+                        )
+                    }
+                }
+                delegate.onFrame(frame)
+            }
         }
     }
 
@@ -363,30 +399,6 @@ class CNCallVideoProvider(
                         rxResumeSent.set(0)
                         println(
                             "[CN CALL][VIDEO PROVIDER] RX_RESUME failed " +
-                                "call_id=" + callId +
-                                " error=" + throwable.message,
-                        )
-                    }
-                }
-
-                if (label == "LOCAL" && txStartSent.compareAndSet(0, 1)) {
-                    try {
-                        // Notify Telecom as soon as the first local frame reaches
-                        // the renderer callback. Older Samsung InCallUI builds
-                        // can keep the preview surface visually inactive until
-                        // this transmission-start event has been received.
-                        handleCallSessionEvent(
-                            Connection.VideoProvider.SESSION_EVENT_TX_START,
-                        )
-                        println(
-                            "[CN CALL][VIDEO PROVIDER] SESSION_EVENT_TX_START " +
-                                "call_id=" + callId +
-                                " source=first_local_frame",
-                        )
-                    } catch (throwable: Throwable) {
-                        txStartSent.set(0)
-                        println(
-                            "[CN CALL][VIDEO PROVIDER] TX_START failed " +
                                 "call_id=" + callId +
                                 " error=" + throwable.message,
                         )
