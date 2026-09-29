@@ -87,6 +87,11 @@ class CNCallVideoProvider(
         mainHandler.post {
             try {
                 listener.onSetCamera(requestedCameraId)
+                // Android Telecom expects the VideoProvider to report the
+                // capabilities of the newly selected camera. Samsung InCallUI
+                // can otherwise leave the camera-switch control disabled after
+                // the first setCamera() request.
+                reportCurrentCameraCapabilities("setCamera")
             } catch (error: Throwable) {
                 println(
                     "[CN CALL][VIDEO PROVIDER] camera switch failed " +
@@ -115,6 +120,30 @@ class CNCallVideoProvider(
 
     override fun onRequestCameraCapabilities() {
         listener.onRequestCameraCapabilities()
+        reportCurrentCameraCapabilities("request")
+    }
+
+    /**
+     * Telecom/InCallUI must be informed about the current camera capabilities
+     * after a camera request and whenever it asks for them. The call media
+     * pipeline is fixed to the H540 (960x540) video profile, so report that
+     * supported presentation size without inventing zoom support.
+     */
+    private fun reportCurrentCameraCapabilities(source: String) {
+        try {
+            changeCameraCapabilities(
+                VideoProfile.CameraCapabilities(960, 540),
+            )
+            println(
+                "[CN CALL][VIDEO PROVIDER] camera capabilities reported " +
+                    "call_id=$callId source=$source size=960x540",
+            )
+        } catch (error: Throwable) {
+            println(
+                "[CN CALL][VIDEO PROVIDER] camera capabilities report failed " +
+                    "call_id=$callId source=$source error=${error.message}",
+            )
+        }
     }
 
     override fun onRequestConnectionDataUsage() {
