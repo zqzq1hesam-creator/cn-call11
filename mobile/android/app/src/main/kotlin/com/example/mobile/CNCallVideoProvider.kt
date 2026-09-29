@@ -367,14 +367,21 @@ class CNCallVideoProvider(
                                 " error=" + throwable.message,
                         )
                     }
-                } else if (label == "LOCAL" && txStartSent.compareAndSet(0, 1)) {
+                }
+
+                if (label == "LOCAL" && txStartSent.compareAndSet(0, 1)) {
                     try {
+                        // Notify Telecom as soon as the first local frame reaches
+                        // the renderer callback. Older Samsung InCallUI builds
+                        // can keep the preview surface visually inactive until
+                        // this transmission-start event has been received.
                         handleCallSessionEvent(
                             Connection.VideoProvider.SESSION_EVENT_TX_START,
                         )
                         println(
                             "[CN CALL][VIDEO PROVIDER] SESSION_EVENT_TX_START " +
-                                "call_id=" + callId,
+                                "call_id=" + callId +
+                                " source=first_local_frame",
                         )
                     } catch (throwable: Throwable) {
                         txStartSent.set(0)
