@@ -18,6 +18,8 @@ import io.livekit.android.room.track.RemoteVideoTrack
 import io.livekit.android.room.track.Track
 import io.livekit.android.room.participant.VideoTrackPublishDefaults
 import io.livekit.android.room.track.LocalVideoTrackOptions
+import io.livekit.android.room.track.VideoCodec
+import io.livekit.android.room.track.VideoEncoding
 import io.livekit.android.room.track.VideoPreset169
 import livekit.org.webrtc.VideoFrame
 import livekit.org.webrtc.VideoSink
@@ -209,6 +211,11 @@ object NativeLiveKit {
 
         scope.launch {
             val newRoom = try {
+                println(
+                    "[CN CALL][VIDEO] publish profile " +
+                        "codec=${VideoCodec.VP9.codecName} bitrate=700000 fps=24 " +
+                        "degradation=MAINTAIN_RESOLUTION simulcast=false",
+                )
                 LiveKit.create(
                     context,
                     RoomOptions(
@@ -225,8 +232,19 @@ object NativeLiveKit {
                             captureParams = VideoPreset169.H540.capture,
                         ),
                         videoTrackPublishDefaults = VideoTrackPublishDefaults(
-                            videoEncoding = VideoPreset169.H540.encoding,
+                            // VP9 improves compression efficiency over the
+                            // previous VP8 profile. Keep H540 capture, cap
+                            // the encoder to 700 kbps / 24 FPS, and prefer
+                            // retaining resolution when bandwidth is tight.
+                            videoEncoding = VideoEncoding(
+                                maxBitrate = 700_000,
+                                maxFps = 24,
+                            ),
                             simulcast = false,
+                            videoCodec = VideoCodec.VP9.codecName,
+                            degradationPreference =
+                                livekit.org.webrtc.RtpParameters.DegradationPreference
+                                    .MAINTAIN_RESOLUTION,
                         ),
                     ),
                     overrides(),
