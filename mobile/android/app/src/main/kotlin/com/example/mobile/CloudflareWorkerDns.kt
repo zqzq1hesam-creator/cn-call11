@@ -28,25 +28,35 @@ internal object CloudflareWorkerDns : Dns {
             return Dns.SYSTEM.lookup(hostname)
         }
 
-        try {
-            val systemAddresses = Dns.SYSTEM.lookup(hostname)
-            if (systemAddresses.isNotEmpty()) return systemAddresses
-        } catch (systemError: UnknownHostException) {
-            val fallback = fallbackAddresses.mapNotNull { address ->
-                try {
-                    InetAddress.getByName(address)
-                } catch (_: Exception) {
-                    null
-                }
-            }
-
-            if (fallback.isNotEmpty()) return fallback
-
-            throw UnknownHostException(
-                "Unable to resolve CN CALL Worker by DNS or fallback addresses"
-            ).also { it.initCause(systemError) }
+        // Include the verified fallback IPs even when DNS succeeds. Some
+        // networks return a valid DNS answer but cannot route to that address.
+        // OkHttp can then try each candidate while TLS still validates the
+        // original workers.dev hostname.
+        var dnsError: UnknownHostException? = null
+        val systemAddresses = try {
+            Dns.SYSTEM.lookup(hostname)
+        } catch (error: UnknownHostException) {
+            dnsError = error
+            emptyList()
         }
 
-        throw UnknownHostException("No IP addresses returned for CN CALL Worker")
+        val fallback = fallbackAddresses.mapNotNull { address ->
+            try {
+                InetAddress.getByName(address)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+        val candidates = (systemAddresses + fallback)
+            .distinctBy { it.hostAddress }
+
+        if (candidates.isNotEmpty()) return candidates
+
+        throw UnknownHostException(
+            "Unable to resolve CN CALL Worker by DNS or fallback addresses"
+        ).also { error ->
+            dnsError?.let { error.initCause(it) }
+        }
     }
 }
