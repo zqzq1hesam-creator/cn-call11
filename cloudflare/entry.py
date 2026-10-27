@@ -1,22 +1,10 @@
 """Cloudflare entry point for the production CN CALL backend."""
+import importlib
 import os
 
-from workers import DurableObject, WorkerEntrypoint, asgi, env
+from workers import DurableObject, WorkerEntrypoint, asgi
 
-
-def _copy_binding_to_environment(name: str) -> None:
-    try:
-        value = getattr(env, name)
-    except Exception:
-        return
-    if value is None:
-        return
-    text_value = str(value)
-    if text_value.strip():
-        os.environ[name] = text_value
-
-
-for _setting in (
+_SETTING_NAMES = (
     "CN_CALL_DB_HOST",
     "CN_CALL_DB_PORT",
     "CN_CALL_DB_NAME",
@@ -31,14 +19,41 @@ for _setting in (
     "CN_CALL_DEVELOPER_NAME",
     "CN_CALL_DEVELOPER_BADGE",
     "CN_CALL_MIGRATION_MODE",
-):
-    _copy_binding_to_environment(_setting)
+)
 
-os.environ["CN_CALL_PLATFORM"] = "cloudflare"
+_app = None
 
-# Import after copying bindings because server_main reads its configuration at
-# import time. Missing database/Firebase/LiveKit values cause safe maintenance.
-from server_main import app  # noqa: E402
+
+def _get_app(runtime_env):
+    """Load FastAPI only after copying this Durable Object's real bindings.
+
+    Module-level imports run before request-scoped Worker environment bindings
+    are reliably available. server_main reads its configuration at import time,
+    so importing it earlier caused every setting to look missing even when
+    secrets had been saved on the Worker.
+    """
+    global _app
+    if _app is not None:
+        return _app
+
+    for name in _SETTING_NAMES:
+        try:
+            value = getattr(runtime_env, name)
+        except Exception:
+            continue
+        if value is None:
+            continue
+        text_value = str(value)
+        if text_value.strip():
+            os.environ[name] = text_value
+
+    os.environ["CN_CALL_PLATFORM"] = "cloudflare"
+
+    # Import after the runtime bindings are available. server_main initializes
+    # the configuration and database schema during import.
+    module = importlib.import_module("server_main")
+    _app = module.app
+    return _app
 
 
 class CNCallHub(DurableObject):
@@ -50,6 +65,7 @@ class CNCallHub(DurableObject):
         self.env = env
 
     async def fetch(self, request):
+        app = _get_app(self.env)
         return await asgi.fetch(app, request, self.env)
 
 
