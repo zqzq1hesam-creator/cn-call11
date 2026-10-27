@@ -6,8 +6,6 @@ on:
       - main
     paths:
       - ".github/workflows/cn-call11-cloudflare-error-audit.yml"
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       lookback_hours:
@@ -27,13 +25,13 @@ jobs:
       - name: Query Cloudflare Workers Observability (read-only)
         shell: bash
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_OBSERVABILITY_API_TOKEN: ${{ secrets.CLOUDFLARE_OBSERVABILITY_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           LOOKBACK_HOURS: ${{ inputs.lookback_hours || '168' }}
         run: |
           set -euo pipefail
-          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
-            echo "::error::Required Cloudflare GitHub Actions secrets are missing. No secret values were printed."
+          if [ -z "${CLOUDFLARE_OBSERVABILITY_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Add CLOUDFLARE_OBSERVABILITY_API_TOKEN and verify CLOUDFLARE_ACCOUNT_ID in GitHub Actions secrets. No secret values were printed."
             exit 1
           fi
           python - <<'PY'
@@ -46,7 +44,7 @@ jobs:
           import urllib.error
           import urllib.request
 
-          token = os.environ["CLOUDFLARE_API_TOKEN"]
+          token = os.environ["CLOUDFLARE_OBSERVABILITY_API_TOKEN"]
           account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
           try:
               hours = int(os.environ.get("LOOKBACK_HOURS", "168"))
