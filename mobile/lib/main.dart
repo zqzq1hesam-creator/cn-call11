@@ -11,6 +11,7 @@ import 'firebase_options.dart';
 import 'services/call_session.dart';
 import 'services/firebase_messaging_service.dart';
 import 'services/account_api.dart';
+import 'services/cloudflare_worker_http_overrides.dart';
 import 'services/rtc_call_manager.dart';
 
 import 'package:shared_preferences/shared_preferences.dart';
@@ -61,6 +62,7 @@ void _installTelecomEventHandler() {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  installCloudflareWorkerHttpOverrides();
 
   FirebaseMessaging.onBackgroundMessage(firebaseMessagingBackgroundHandler);
 
