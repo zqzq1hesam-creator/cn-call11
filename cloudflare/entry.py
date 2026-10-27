@@ -1,6 +1,14 @@
 """Cloudflare entry point for the production CN CALL backend."""
 import importlib
 import os
+import workers
+
+# Runtime compatibility guard: some Workers Python runtime snapshots expose
+# waitUntil while the vendored ASGI adapter imports wait_until. Normalize the
+# alias before importing ASGI so an SDK/runtime version skew cannot crash every
+# Worker invocation with error 1101.
+if not hasattr(workers, "wait_until") and hasattr(workers, "waitUntil"):
+    workers.wait_until = workers.waitUntil
 
 from workers import DurableObject, WorkerEntrypoint, asgi
 
