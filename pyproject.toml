@@ -1,0 +1,20 @@
+[project]
+name = "cn-call11-cloudflare"
+version = "1.0.0"
+description = "CN CALL production Cloudflare Workers entry point"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+    "firebase-admin==7.5.0",
+    "livekit-api",
+    "psycopg",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]
+
+[tool.uv]
+package = false

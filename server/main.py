@@ -50,14 +50,22 @@ async def migration_maintenance_middleware(request, call_next):
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-CN_CALL_MIGRATION_MODE = os.getenv("CN_CALL_MIGRATION_MODE", "").strip().lower() in {"1", "true", "yes"}
+CN_CALL_PLATFORM = os.getenv("CN_CALL_PLATFORM", "").strip().lower()
+CN_CALL_MIGRATION_MODE = (
+    os.getenv("CN_CALL_MIGRATION_MODE", "").strip().lower() in {"1", "true", "yes"}
+    or (CN_CALL_PLATFORM == "cloudflare" and not DATABASE_URL)
+)
 VOLUME_DIR = Path("/app/data")
 DB_PATH = VOLUME_DIR / "cn_call.db"
 LEGACY_DB_PATH = BASE_DIR / "cn_call.db"
 
-# PostgreSQL is the preferred persistent database. SQLite/Volume remains as
-# a temporary fallback until DATABASE_URL is configured in Railway.
-if not DATABASE_URL:
+# Railway retains its existing SQLite/Volume fallback. Cloudflare Workers do
+# not provide a persistent local disk, so they must not create a local SQLite
+# database when DATABASE_URL is absent. In that situation the Worker fails
+# closed in maintenance mode until a persistent database is configured.
+if not DATABASE_URL and CN_CALL_PLATFORM == "cloudflare":
+    print("[CN CALL][DB] Cloudflare has no DATABASE_URL; maintenance mode enabled")
+elif not DATABASE_URL:
     VOLUME_DIR.mkdir(parents=True, exist_ok=True)
 
     if not DB_PATH.exists() and LEGACY_DB_PATH.exists():
@@ -1181,6 +1189,10 @@ async def _call_expiry_loop():
 @app.on_event("startup")
 async def start_call_expiry_loop():
     global call_expiry_task, terminal_outbox_task, fcm_token_cleanup_task
+    if CN_CALL_MIGRATION_MODE:
+        print("[CN CALL][STARTUP] Background loops withheld while in maintenance mode")
+        return
+
     load_fcm_tokens()
     load_access_tokens()
     rebuild_active_calls_from_db()
@@ -1561,7 +1573,10 @@ def init_db():
         db.close()
 
 
-init_db()
+if not (CN_CALL_PLATFORM == "cloudflare" and not DATABASE_URL):
+    init_db()
+else:
+    print("[CN CALL][DB] Skipped local schema initialization on Cloudflare")
 
 
 def rebuild_active_calls_from_db():

@@ -1,0 +1,39 @@
+name: Cloudflare main build check
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/**"
+      - "server/main.py"
+      - "wrangler.jsonc"
+      - "pyproject.toml"
+      - ".github/workflows/cloudflare-main-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Resolve Cloudflare Worker dependencies
+        run: uv sync
+
+      - name: Build the real CN CALL Worker bundle without deploying
+        run: uv run pywrangler deploy --dry-run

@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cn-call11",
+  "main": "cloudflare/entry.py",
+  "compatibility_date": "2026-10-27",
+  "compatibility_flags": ["python_workers"],
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "CALL_HUB",
+        "class_name": "CNCallHub"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["CNCallHub"]
+    }
+  ],
+  "exports": {
+    "CNCallHub": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
+}
