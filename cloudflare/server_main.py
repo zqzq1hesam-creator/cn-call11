@@ -1859,24 +1859,44 @@ if not CN_CALL_MIGRATION_MODE:
 # PASSWORD SECURITY
 # ============================================================
 
-def hash_password(password: str, salt: bytes | None = None):
+async def hash_password(password: str, salt: bytes | None = None):
+    """PBKDF2-SHA256 using Cloudflare Web Crypto, preserving stored hash format.
+
+    Native Web Crypto avoids running a CPU-heavy PBKDF2 loop in Python/WASM
+    under Cloudflare Workers' per-request CPU budget. The algorithm, iteration
+    count, salt size, and output hex format match the legacy hashlib version,
+    so existing password hashes remain verifiable.
+    """
+    from js import crypto, Object, Uint8Array
+    from pyodide.ffi import to_js
+
     if salt is None:
         salt = os.urandom(16)
 
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        200_000,
+    def _uint8_array(data: bytes):
+        return Uint8Array.new(to_js(list(data)))
+
+    algorithm = Object.new()
+    algorithm.name = "PBKDF2"
+    algorithm.salt = _uint8_array(salt)
+    algorithm.iterations = 200_000
+    algorithm.hash = "SHA-256"
+
+    raw_password = _uint8_array(password.encode("utf-8"))
+    key = await crypto.subtle.importKey(
+        "raw",
+        raw_password,
+        "PBKDF2",
+        False,
+        to_js(["deriveBits"]),
     )
+    derived = await crypto.subtle.deriveBits(algorithm, key, 256)
+    password_hash = bytes(Uint8Array.new(derived).to_py())
 
-    return (
-        password_hash.hex(),
-        salt.hex(),
-    )
+    return password_hash.hex(), salt.hex()
 
 
-def verify_password(
+async def verify_password(
     password: str,
     password_hash: str,
     password_salt: str,
@@ -1886,7 +1906,7 @@ def verify_password(
     except ValueError:
         return False
 
-    calculated, _ = hash_password(password, salt)
+    calculated, _ = await hash_password(password, salt)
 
     return hmac.compare_digest(
         calculated,
@@ -2223,7 +2243,7 @@ async def register(request: RegisterRequest):
             "message": "ID المستخدم مستخدم بالفعل",
         }
 
-    password_hash, password_salt = hash_password(password)
+    password_hash, password_salt = await hash_password(password)
 
     db.execute(
         """
@@ -2291,7 +2311,7 @@ async def login(request: LoginRequest):
             "message": "ID المستخدم أو كلمة المرور غير صحيحة",
         }
 
-    if not verify_password(
+    if not await verify_password(
         password,
         user["password_hash"],
         user["password_salt"],
