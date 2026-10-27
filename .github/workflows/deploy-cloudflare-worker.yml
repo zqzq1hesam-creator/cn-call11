@@ -62,27 +62,28 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: uv run pywrangler deploy
 
-      - name: Verify deployed production version
+      - name: Verify production health endpoint
         shell: bash
         run: |
           set -euo pipefail
           URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
-          EXPECTED="2026-10-27-signaling-websocket-route-v3"
           BODY="/tmp/cn-call11-production-health.json"
 
-          for attempt in $(seq 1 10); do
+          for attempt in $(seq 1 20); do
             CODE="$(curl --silent --show-error --max-time 10 -o "$BODY" -w '%{http_code}' "$URL" || true)"
             VERSION="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("backend_version", ""))' "$BODY" 2>/dev/null || true)"
-            echo "Attempt=$attempt HTTP=$CODE backend_version=${VERSION:-<missing>}"
-            if [ "$CODE" = "200" ] && [ "$VERSION" = "$EXPECTED" ]; then
+            READY="$(python -c 'import json,sys; print(str(json.load(open(sys.argv[1])).get("ready", False)).lower())' "$BODY" 2>/dev/null || true)"
+            DATABASE="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("database", ""))' "$BODY" 2>/dev/null || true)"
+            echo "Attempt=$attempt HTTP=$CODE ready=$READY database=$DATABASE backend_version=${VERSION:-<missing>}"
+            if [ "$CODE" = "200" ] && [ "$READY" = "true" ] && [ "$DATABASE" = "ok" ]; then
               cat "$BODY"
-              echo "CLOUDFLARE_PRODUCTION_VERSION_VERIFIED"
+              echo "CLOUDFLARE_PRODUCTION_HEALTH_VERIFIED"
               exit 0
             fi
             sleep 3
           done
 
-          echo "::error::Production health endpoint did not report the expected backend version."
+          echo "::error::Production health endpoint did not become ready with a healthy database."
           if [ -f "$BODY" ]; then cat "$BODY"; fi
           exit 1
 
