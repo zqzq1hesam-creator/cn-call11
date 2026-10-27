@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 
 app = FastAPI(title="CN CALL Server")
 
+CN_CALL_BACKEND_VERSION = "2026-10-27-register-diagnostics-v1"
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -2182,6 +2184,7 @@ async def health():
         "missing_configuration": missing,
         "database": database_status,
         "users": len(connections),
+        "backend_version": CN_CALL_BACKEND_VERSION,
     }
 
 
@@ -2201,7 +2204,7 @@ async def register(request: RegisterRequest):
             "message": "ID المستخدم مطلوب",
         }
 
-    if not re.fullmatch(r"\d+", user_id):
+    if not re.fullmatch(r"\\d+", user_id):
         return {
             "success": False,
             "message": "ID المستخدم يجب أن يكون أرقامًا فقط",
@@ -2228,43 +2231,83 @@ async def register(request: RegisterRequest):
             "message": "كلمة المرور يجب أن تكون 6 أحرف على الأقل",
         }
 
-    db = get_db()
+    db = None
+    stage = "open_database"
+    try:
+        db = get_db()
 
-    existing = db.execute(
-        "SELECT user_id FROM users WHERE user_id = ?",
-        (user_id,),
-    ).fetchone()
+        stage = "check_existing_user"
+        existing = db.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
 
-    if existing is not None:
-        db.close()
+        if existing is not None:
+            return {
+                "success": False,
+                "message": "ID المستخدم مستخدم بالفعل",
+            }
 
-        return {
-            "success": False,
-            "message": "ID المستخدم مستخدم بالفعل",
-        }
+        stage = "hash_password"
+        password_hash, password_salt = await hash_password(password)
 
-    password_hash, password_salt = await hash_password(password)
-
-    db.execute(
-        """
-        INSERT INTO users (
-            user_id,
-            username,
-            password_hash,
-            password_salt
+        stage = "insert_user"
+        db.execute(
+            """
+            INSERT INTO users (
+                user_id,
+                username,
+                password_hash,
+                password_salt
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                username,
+                password_hash,
+                password_salt,
+            ),
         )
-        VALUES (?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            username,
-            password_hash,
-            password_salt,
-        ),
-    )
 
-    db.commit()
-    db.close()
+        stage = "commit_database"
+        db.commit()
+
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        error_type = type(exc).__name__
+        print(
+            "[CN CALL][REGISTER] failed; stage=",
+            stage,
+            "type=",
+            error_type,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": (
+                    "تعذر إنشاء الحساب عند مرحلة "
+                    + stage
+                    + " ("
+                    + error_type
+                    + ")"
+                ),
+                "error_code": "register_" + stage,
+                "backend_version": CN_CALL_BACKEND_VERSION,
+            },
+        )
+
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
 
     is_developer, developer_badge = _developer_profile_for_user(user_id)
     return {
