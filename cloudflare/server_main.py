@@ -127,6 +127,8 @@ active_calls: dict[str, dict[str, object]] = {}
 active_call_users: dict[str, str] = {}
 access_tokens: dict[str, str] = {}
 user_access_tokens: dict[str, str] = {}
+# Track successful in-memory accept deliveries; the database remains authoritative.
+accepted_signal_deliveries: dict[str, set[str]] = {}
 call_expiry_task: asyncio.Task | None = None
 fcm_token_cleanup_task: asyncio.Task | None = None
 
@@ -185,6 +187,11 @@ def _mark_active_user(user_id: str, call_id: str, role: str) -> None:
 
 
 def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
+    sent_for_user = accepted_signal_deliveries.get(user_id)
+    if sent_for_user is not None:
+        sent_for_user.discard(call_id)
+        if not sent_for_user:
+            accepted_signal_deliveries.pop(user_id, None)
     if active_call_users.get(user_id) != call_id:
         return
     active_call_users.pop(user_id, None)
@@ -196,6 +203,13 @@ def _unmark_active_user(user_id: str, call_id: str, reason: str) -> None:
         "reason=",
         reason,
     )
+
+
+def _mark_accepted_signal_delivered(user_id: str, call_id: str) -> None:
+    user_id = str(user_id).strip()
+    call_id = str(call_id).strip()
+    if user_id and call_id:
+        accepted_signal_deliveries.setdefault(user_id, set()).add(call_id)
 
 
 def _record_presence_lease(user_id: str, network_validated: bool) -> None:
@@ -1837,6 +1851,81 @@ def rebuild_active_calls_from_db():
         "finalized_expired=", recovered_terminals,
     )
 
+
+def refresh_active_call_from_db(call_id: str) -> dict[str, object] | None:
+    """Refresh one call from durable state before accepting a callee response."""
+    call_id = str(call_id).strip()
+    if not call_id:
+        return None
+
+    db = get_db()
+    try:
+        row = db.execute(
+            """
+            SELECT call_id, caller_id, target_id, caller_name, created_at,
+                   expires_at, status, video_state, negotiation_expires_at,
+                   connection_expires_at, media_ready_users,
+                   delivery_confirmed_at, delivery_deadline_at,
+                   reachability_proven_at, state_version
+            FROM call_records
+            WHERE call_id = ?
+            """,
+            (call_id,),
+        ).fetchone()
+    finally:
+        db.close()
+
+    current = active_calls.get(call_id)
+    active_statuses = {"ringing", "accepted", "negotiating", "connected"}
+    if row is None or str(row["status"]) not in active_statuses:
+        stale = active_calls.pop(call_id, None)
+        if stale is not None:
+            _unmark_active_user(str(stale.get("caller_id", "")), call_id, "db_not_active")
+            _unmark_active_user(str(stale.get("target_id", "")), call_id, "db_not_active")
+        print(
+            "[CN CALL][CALL DB REFRESH] call_id=", call_id,
+            "result=not_active",
+            "db_status=", str(row["status"]) if row is not None else "missing",
+        )
+        return None
+
+    caller_id = str(row["caller_id"])
+    target_id = str(row["target_id"])
+    record: dict[str, object] = {
+        "call_id": call_id,
+        "caller_id": caller_id,
+        "target_id": target_id,
+        "caller_name": row["caller_name"],
+        "status": str(row["status"]),
+        "video_state": int(row["video_state"] or 0),
+        "created_at": row["created_at"],
+        "ring_expires_at": row["expires_at"],
+        "negotiation_expires_at": row["negotiation_expires_at"],
+        "connection_expires_at": row["connection_expires_at"],
+        "caller_token": user_access_tokens.get(caller_id),
+        "target_token": user_access_tokens.get(target_id),
+        "media_ready_users": _ready_users_from_json(row["media_ready_users"]),
+        "delivery_confirmed": row["delivery_confirmed_at"] is not None,
+        "delivery_confirmed_at": row["delivery_confirmed_at"],
+        "delivery_deadline_at": row["delivery_deadline_at"],
+        "reachability_proven_at": row["reachability_proven_at"],
+        "state_version": int(row["state_version"] or 1),
+        # These nonce values are ephemeral and only exist on the isolate that created the call.
+        "reachability_challenge_id": (current or {}).get("reachability_challenge_id", ""),
+        "reachability_nonce": (current or {}).get("reachability_nonce", ""),
+    }
+    active_calls[call_id] = record
+    if active_call_users.get(caller_id) != call_id:
+        _mark_active_user(caller_id, call_id, "caller")
+    if active_call_users.get(target_id) != call_id:
+        _mark_active_user(target_id, call_id, "callee")
+    print(
+        "[CN CALL][CALL DB REFRESH] call_id=", call_id,
+        "status=", record["status"],
+    )
+    return record
+
+
 def load_fcm_tokens():
     db = get_db()
     rows = db.execute(
@@ -2903,6 +2992,8 @@ async def websocket_endpoint(
                             "room": user_creds["room"],
                         })
                     await websocket.send_json(payload)
+                    if replay_type == "call_accept":
+                        _mark_accepted_signal_delivered(user_id, active_call_id)
 
         # Missed calls remain durable in call_records. Replay them when an
         # authenticated user reconnects so the native layer can notify them
@@ -2933,6 +3024,62 @@ async def websocket_endpoint(
                 ),
                 "created_at": missed_row["created_at"],
             })
+
+    async def replay_accepted_calls_to_caller():
+        """Deliver accepted-call signaling from PostgreSQL when the peer socket is on another isolate."""
+        db = get_db()
+        try:
+            rows = db.execute(
+                """
+                SELECT call_id, target_id, status
+                FROM call_records
+                WHERE caller_id = ?
+                  AND status IN ('accepted', 'negotiating')
+                ORDER BY created_at DESC
+                LIMIT 10
+                """,
+                (user_id,),
+            ).fetchall()
+        finally:
+            db.close()
+
+        for row in rows:
+            active_call_id = str(row["call_id"])
+            if active_call_id in accepted_signal_deliveries.get(user_id, set()):
+                continue
+            caller_creds = _generate_livekit_token_for_user(user_id, active_call_id)
+            payload = {
+                "type": "call_accept",
+                "call_id": active_call_id,
+                "target_id": user_id,
+                "from_id": str(row["target_id"]),
+                "replayed": True,
+                "durable_replay": True,
+            }
+            if caller_creds:
+                payload.update({
+                    "livekit_url": caller_creds["url"],
+                    "livekit_token": caller_creds["token"],
+                    "room": caller_creds["room"],
+                })
+            try:
+                await websocket.send_json(payload)
+            except Exception as exc:
+                print(
+                    "[CN CALL][CALL_ACCEPT DURABLE REPLAY FAILED]",
+                    "call_id=", active_call_id,
+                    "caller=", user_id,
+                    "error_type=", type(exc).__name__,
+                )
+                continue
+            _mark_accepted_signal_delivered(user_id, active_call_id)
+            print(
+                "[CN CALL][CALL_ACCEPT DURABLE REPLAY]",
+                "call_id=", active_call_id,
+                "caller=", user_id,
+                "status=", str(row["status"]),
+                "embedded_creds=", caller_creds is not None,
+            )
 
     try:
         await websocket.send_json({
@@ -2991,6 +3138,8 @@ async def websocket_endpoint(
                     "user_id": user_id,
                     "network_validated": network_validated,
                 })
+                if network_validated:
+                    await replay_accepted_calls_to_caller()
                 continue
 
             if message_type == "reachability_response":
@@ -3346,8 +3495,17 @@ async def websocket_endpoint(
 
                 continue
 
-            record = active_calls.get(call_id)
+            record = (
+                refresh_active_call_from_db(call_id)
+                if message_type == "call_accept"
+                else active_calls.get(call_id)
+            )
             if record is None:
+                print(
+                    "[CN CALL][SIGNALING_REJECTED] call_id=", call_id,
+                    "type=", message_type,
+                    "reason=unknown_or_ended_call",
+                )
                 await websocket.send_json({
                     "type": "signaling_rejected",
                     "call_id": call_id,
@@ -3367,7 +3525,20 @@ async def websocket_endpoint(
                 record["caller_token"] if sender_role == "caller" else
                 record["target_token"] if sender_role == "target" else None
             )
-            if sender_role is None or expected_token != token:
+            token_matches_call = expected_token == token
+            accepted_target_has_valid_session = (
+                message_type == "call_accept"
+                and sender_role == "target"
+                and access_tokens.get(token) == user_id
+            )
+            if sender_role is None or (not token_matches_call and not accepted_target_has_valid_session):
+                print(
+                    "[CN CALL][SIGNALING_REJECTED] call_id=", call_id,
+                    "type=", message_type,
+                    "reason=sender_not_call_owner",
+                    "role=", sender_role,
+                    "token_matches_call=", token_matches_call,
+                )
                 await websocket.send_json({
                     "type": "signaling_rejected",
                     "call_id": call_id,
@@ -3375,15 +3546,38 @@ async def websocket_endpoint(
                     "reason": "sender_not_call_owner",
                 })
                 continue
+            if accepted_target_has_valid_session and not token_matches_call:
+                # The WebSocket auth check above already proved this token belongs to this user.
+                # Allow the authenticated callee to answer even if the call snapshot has an older token.
+                record["target_token"] = token
+                print(
+                    "[CN CALL][CALL_ACCEPT TOKEN REFRESH] call_id=", call_id,
+                    "target=", user_id,
+                )
 
             if target_id != expected_target:
-                await websocket.send_json({
-                    "type": "signaling_rejected",
-                    "call_id": call_id,
-                    "message_type": message_type,
-                    "reason": "invalid_target",
-                })
-                continue
+                if message_type == "call_accept" and sender_role == "target":
+                    print(
+                        "[CN CALL][CALL_ACCEPT TARGET NORMALIZED] call_id=", call_id,
+                        "supplied_target=", target_id,
+                        "expected_target=", expected_target,
+                    )
+                    target_id = expected_target
+                else:
+                    print(
+                        "[CN CALL][SIGNALING_REJECTED] call_id=", call_id,
+                        "type=", message_type,
+                        "reason=invalid_target",
+                        "expected_target=", expected_target,
+                        "supplied_target=", target_id,
+                    )
+                    await websocket.send_json({
+                        "type": "signaling_rejected",
+                        "call_id": call_id,
+                        "message_type": message_type,
+                        "reason": "invalid_target",
+                    })
+                    continue
 
             status = str(record["status"])
             allowed = False
@@ -3396,8 +3590,11 @@ async def websocket_endpoint(
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "ringing"
             elif message_type == "call_accept":
-                allowed = sender_role == "target" and status == "ringing"
-                next_status = "accepted"
+                # A duplicate accept may be needed to replay signaling after a socket race.
+                allowed = sender_role == "target" and status in {
+                    "ringing", "accepted", "negotiating", "connected"
+                }
+                next_status = "accepted" if status == "ringing" else status
             elif message_type == "call_reject":
                 allowed = sender_role == "target" and status == "ringing"
                 next_status = "rejected"
@@ -3436,6 +3633,13 @@ async def websocket_endpoint(
                 terminal = True
 
             if not allowed:
+                print(
+                    "[CN CALL][SIGNALING_REJECTED] call_id=", call_id,
+                    "type=", message_type,
+                    "reason=invalid_state_or_direction",
+                    "status=", status,
+                    "role=", sender_role,
+                )
                 await websocket.send_json({
                     "type": "signaling_rejected",
                     "call_id": call_id,
@@ -3459,12 +3663,18 @@ async def websocket_endpoint(
                 continue
 
             if message_type == "call_accept":
-                transition_call_state(
-                    call_id,
-                    "accepted",
-                    negotiation_expires_at=int(time.time() * 1000) + 30000,
+                accept_is_replay = status in {"accepted", "negotiating", "connected"}
+                if not accept_is_replay:
+                    transition_call_state(
+                        call_id,
+                        "accepted",
+                        negotiation_expires_at=int(time.time() * 1000) + 30000,
+                    )
+                print(
+                    "[CN CALL][CALL_ACCEPT SERVER] call_id=", call_id,
+                    "status=", status if accept_is_replay else "accepted",
+                    "replay=", accept_is_replay,
                 )
-                print("[CN CALL][CALL_ACCEPT SERVER] call_id=", call_id)
 
                 # Design C: Generate distinct LiveKit credentials for callee and caller.
                 # Secrets and tokens are kept out of server logs.
@@ -3514,6 +3724,7 @@ async def websocket_endpoint(
                         })
                     try:
                         await caller_socket.send_json(caller_accept_payload)
+                        _mark_accepted_signal_delivered(caller_id, call_id)
                         print(
                             "[CN CALL][CALL_ACCEPT FORWARDED TO CALLER] "
                             f"call_id={call_id} caller={caller_id} embedded_creds={caller_creds is not None}"
@@ -3521,8 +3732,15 @@ async def websocket_endpoint(
                     except Exception as exc:
                         print(
                             "[CN CALL][CALL_ACCEPT FORWARD FAILED] "
-                            f"call_id={call_id} caller={caller_id} error={exc}"
+                            f"call_id={call_id} caller={caller_id} error_type={type(exc).__name__}"
                         )
+                else:
+                    print(
+                        "[CN CALL][CALL_ACCEPT CALLER SOCKET MISSING]",
+                        "call_id=", call_id,
+                        "caller=", caller_id,
+                        "durable_replay=waiting_for_caller_heartbeat",
+                    )
             elif message_type in {"offer", "answer"}:
                 transition_call_state(
                     call_id,
