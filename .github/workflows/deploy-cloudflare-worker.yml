@@ -1,0 +1,87 @@
+name: Deploy CN CALL Cloudflare Worker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "cloudflare/**"
+      - "wrangler.jsonc"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/deploy-cloudflare-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Set up uv and Python
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13"
+
+      - name: Verify deployment secrets are present
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ]; then
+            echo "::error::Missing GitHub Actions secret CLOUDFLARE_API_TOKEN. Add a scoped Cloudflare Workers deployment API token in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          if [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Missing GitHub Actions secret CLOUDFLARE_ACCOUNT_ID. Add the Cloudflare account ID in Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          echo "Cloudflare deployment credentials are present (values not printed)."
+
+      - name: Resolve Python Worker deployment dependencies
+        run: uv sync
+
+      - name: Compile backend Python before deployment
+        run: python -m compileall -q cloudflare
+
+      - name: Deploy production Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: uv run pywrangler deploy
+
+      - name: Verify deployed production version
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
+          EXPECTED="2026-10-27-register-diagnostics-v1"
+          BODY="/tmp/cn-call11-production-health.json"
+
+          for attempt in $(seq 1 10); do
+            CODE="$(curl --silent --show-error --max-time 10 -o "$BODY" -w '%{http_code}' "$URL" || true)"
+            VERSION="$(python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("backend_version", ""))' "$BODY" 2>/dev/null || true)"
+            echo "Attempt=$attempt HTTP=$CODE backend_version=${VERSION:-<missing>}"
+            if [ "$CODE" = "200" ] && [ "$VERSION" = "$EXPECTED" ]; then
+              cat "$BODY"
+              echo "CLOUDFLARE_PRODUCTION_VERSION_VERIFIED"
+              exit 0
+            fi
+            sleep 3
+          done
+
+          echo "::error::Production health endpoint did not report the expected backend version."
+          if [ -f "$BODY" ]; then cat "$BODY"; fi
+          exit 1
