@@ -9,6 +9,14 @@ on:
       - "wrangler.jsonc"
       - "pyproject.toml"
       - ".github/workflows/cloudflare-main-build.yml"
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "cloudflare/**"
+      - "wrangler.jsonc"
+      - "pyproject.toml"
+      - ".github/workflows/cloudflare-main-build.yml"
   workflow_dispatch:
 
 permissions:
