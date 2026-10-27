@@ -4,6 +4,7 @@
   "main": "cloudflare/entry.py",
   "compatibility_date": "2026-10-27",
   "compatibility_flags": ["python_workers"],
+  // Production workers.dev URL stays enabled; preview URLs stay disabled.
   "workers_dev": true,
   "preview_urls": false,
   "observability": {
