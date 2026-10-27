@@ -442,14 +442,21 @@ jobs:
               trace_time = event_timestamp(event)
               if trace_time is not None:
                   trace_event_timestamps.append(trace_time)
-              normalized = scrub(trace_text)
-              # Retain only a line with a known signaling milestone. scrub() masks
-              # URLs, IDs, tokens and long numeric strings before it reaches Actions.
-              lines = [line.strip() for line in normalized.splitlines() if line.strip()]
-              keep_lines = [
-                  line for line in lines
-                  if trace_keyword_re.search(line)
-              ]
+              # Match on raw text first, then retain only a short context window
+              # around the allowlisted milestone. Scrub each excerpt individually so
+              # an early long traceback cannot truncate the actual signaling message.
+              keep_lines = []
+              for raw_line in trace_text.splitlines():
+                  match = trace_keyword_re.search(raw_line)
+                  if not match:
+                      continue
+                  excerpt_start = max(0, match.start() - 60)
+                  excerpt_end = min(len(raw_line), match.end() + 120)
+                  excerpt = scrub(raw_line[excerpt_start:excerpt_end])
+                  if excerpt:
+                      keep_lines.append(excerpt)
+                  if len(keep_lines) >= 4:
+                      break
               if keep_lines:
                   trace_signatures[" | ".join(keep_lines[:2])[:240]] += 1
               for keyword in matched_keywords:
