@@ -29,6 +29,7 @@ class MainActivity : FlutterActivity() {
     private var audioFocusRequest: AudioFocusRequest? = null
     private var pendingCallId: String? = null
     private var pendingTargetId: String? = null
+    private var pendingVideoState: Int = android.telecom.VideoProfile.STATE_AUDIO_ONLY
     private var pendingCallResult: MethodChannel.Result? = null
     private var pendingStartupPermissionResult: MethodChannel.Result? = null
     private var startupPermissions = emptyList<String>()
@@ -89,6 +90,10 @@ class MainActivity : FlutterActivity() {
                         val callerName =
                             call.argument<String>("callerName")?.trim().orEmpty()
                                 .ifEmpty { "مستخدم CN CALL" }
+                        val videoState = normalizeVideoState(
+                            call.argument<Int>("videoState")
+                                ?: android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+                        )
 
                         if (callId.isEmpty() || callerId.isEmpty()) {
                             result.error(
@@ -104,7 +109,8 @@ class MainActivity : FlutterActivity() {
                                 NativeWebSocketClient.tryAcquireNativeOwnership(this)
                             println(
                                 "[CN CALL][TELECOM] Flutter incoming handoff" +
-                                    " call_id=$callId caller_id=$callerId native_owner=$acquired",
+                                    " call_id=$callId caller_id=$callerId" +
+                                    " video_state=$videoState native_owner=$acquired",
                             )
 
                             if (!acquired) {
@@ -145,6 +151,10 @@ class MainActivity : FlutterActivity() {
                                     putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
                                     putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
                                     putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                                    putInt(
+                                        TelecomManager.EXTRA_INCOMING_VIDEO_STATE,
+                                        videoState,
+                                    )
                                 },
                             )
 
@@ -177,6 +187,10 @@ class MainActivity : FlutterActivity() {
                     "placeCNCall" -> {
                         val callId = call.argument<String>("callId")?.trim().orEmpty()
                         val targetId = call.argument<String>("targetId")?.trim().orEmpty()
+                        val videoState = normalizeVideoState(
+                            call.argument<Int>("videoState")
+                                ?: android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+                        )
 
                         if (callId.isEmpty() || targetId.isEmpty()) {
                             result.error(
@@ -224,6 +238,7 @@ class MainActivity : FlutterActivity() {
                                 }
                                 pendingCallId = callId
                                 pendingTargetId = targetId
+                                pendingVideoState = videoState
                                 pendingCallResult = result
                                 requestPermissions(
                                     arrayOf(
@@ -235,7 +250,12 @@ class MainActivity : FlutterActivity() {
                                 return@setMethodCallHandler
                             }
 
-                            placeCNCallWithTelecom(callId, targetId, result)
+                            placeCNCallWithTelecom(
+                                callId,
+                                targetId,
+                                result,
+                                videoState,
+                            )
                         } catch (error: SecurityException) {
                             result.error(
                                 "telecom_security",
@@ -306,6 +326,12 @@ class MainActivity : FlutterActivity() {
                                     PackageManager.PERMISSION_GRANTED
                             ) {
                                 add(android.Manifest.permission.RECORD_AUDIO)
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
+                                checkSelfPermission(android.Manifest.permission.CAMERA) !=
+                                    PackageManager.PERMISSION_GRANTED
+                            ) {
+                                add(android.Manifest.permission.CAMERA)
                             }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
                                 checkSelfPermission(android.Manifest.permission.READ_PHONE_NUMBERS) !=
@@ -427,6 +453,16 @@ class MainActivity : FlutterActivity() {
             }
     }
 
+    private fun normalizeVideoState(videoState: Int): Int {
+        return when (videoState) {
+            android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+            android.telecom.VideoProfile.STATE_BIDIRECTIONAL,
+            android.telecom.VideoProfile.STATE_TX_ENABLED,
+            android.telecom.VideoProfile.STATE_RX_ENABLED -> videoState
+            else -> android.telecom.VideoProfile.STATE_AUDIO_ONLY
+        }
+    }
+
     private fun hasCallPermission(): Boolean {
         return Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
@@ -437,10 +473,13 @@ class MainActivity : FlutterActivity() {
         val hasAudio = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
             checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
                 PackageManager.PERMISSION_GRANTED
+        val hasCamera = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+            checkSelfPermission(android.Manifest.permission.CAMERA) ==
+                PackageManager.PERMISSION_GRANTED
         val hasPhoneNumbers = Build.VERSION.SDK_INT < Build.VERSION_CODES.O ||
             checkSelfPermission(android.Manifest.permission.READ_PHONE_NUMBERS) ==
                 PackageManager.PERMISSION_GRANTED
-        return hasAudio && hasPhoneNumbers
+        return hasAudio && hasCamera && hasPhoneNumbers
     }
 
     private fun requestNextStartupPermission() {
@@ -462,6 +501,7 @@ class MainActivity : FlutterActivity() {
         callId: String,
         targetId: String,
         result: MethodChannel.Result,
+        videoState: Int = android.telecom.VideoProfile.STATE_AUDIO_ONLY,
     ) {
         try {
             val telecomManager =
@@ -477,6 +517,10 @@ class MainActivity : FlutterActivity() {
             val address = Uri.parse("cncall:$targetId")
             val extras = Bundle().apply {
                 putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
+                putInt(
+                    android.telecom.TelecomManager.EXTRA_START_CALL_WITH_VIDEO_STATE,
+                    normalizeVideoState(videoState),
+                )
             }
             telecomManager.placeCall(address, extras)
             result.success(true)
@@ -513,6 +557,8 @@ class MainActivity : FlutterActivity() {
         val result = pendingCallResult
         pendingCallId = null
         pendingTargetId = null
+        val requestedVideoState = pendingVideoState
+        pendingVideoState = android.telecom.VideoProfile.STATE_AUDIO_ONLY
         pendingCallResult = null
 
         if (callId == null || targetId == null || result == null) return
@@ -520,7 +566,12 @@ class MainActivity : FlutterActivity() {
         if (grantResults.isNotEmpty() &&
             grantResults[0] == PackageManager.PERMISSION_GRANTED
         ) {
-            placeCNCallWithTelecom(callId, targetId, result)
+            placeCNCallWithTelecom(
+                callId,
+                targetId,
+                result,
+                requestedVideoState,
+            )
         } else {
             result.error(
                 "permission_denied",

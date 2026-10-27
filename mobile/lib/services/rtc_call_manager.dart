@@ -343,6 +343,11 @@ class RtcCallManager {
         return;
       }
 
+      final rawVideoState = message['video_state'];
+      final videoState = rawVideoState is int
+          ? rawVideoState
+          : int.tryParse(rawVideoState?.toString() ?? '') ?? 0;
+
       try {
         final accepted = await const MethodChannel('cn_call/call').invokeMethod<bool>(
           'presentIncomingCall',
@@ -350,12 +355,14 @@ class RtcCallManager {
             'callId': messageCallId,
             'callerId': callerId,
             'callerName': callerName,
+            'videoState': videoState,
           },
         );
 
         print(
           '[CN CALL][CALL RECEIVE] handed to native Telecom '
-          'call_id=$messageCallId caller_id=$callerId accepted=$accepted',
+          'call_id=$messageCallId caller_id=$callerId '
+          'video_state=$videoState accepted=$accepted',
         );
       } catch (e) {
         print(

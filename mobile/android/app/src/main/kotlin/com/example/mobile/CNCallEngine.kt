@@ -7,8 +7,11 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.Bundle
+import android.telecom.Connection
 import android.telecom.TelecomManager
+import android.telecom.VideoProfile
 import androidx.core.content.ContextCompat
+import java.util.UUID
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -88,7 +91,12 @@ object CNCallEngine {
      */
     interface Delegate {
         fun initialize(context: Context, callbacks: Callbacks): Boolean
-        fun startIncoming(callId: String, callerId: String, callerName: String): Boolean
+        fun startIncoming(
+            callId: String,
+            callerId: String,
+            callerName: String,
+            videoState: Int,
+        ): Boolean
 
         /**
          * Opens (or reuses) the authenticated native WebSocket for an incoming
@@ -99,7 +107,11 @@ object CNCallEngine {
          * the caller (which is what closes the caller's ringing UI).
          */
         fun prepareIncomingSignaling(callId: String): Boolean
-        fun startOutgoing(callId: String, address: String): Boolean
+        fun startOutgoing(
+            callId: String,
+            address: String,
+            videoState: Int,
+        ): Boolean
         fun answer(callId: String): Boolean
         fun reject(callId: String): Boolean
         fun disconnect(callId: String): Boolean
@@ -107,6 +119,22 @@ object CNCallEngine {
         fun unhold(callId: String): Boolean
         fun setMute(callId: String, muted: Boolean): Boolean
         fun setSpeaker(callId: String, speaker: Boolean): Boolean
+        fun requestVideoState(callId: String, fromVideoState: Int, toVideoState: Int): Boolean
+        fun handleVideoResponse(callId: String, videoState: Int): Boolean
+        fun handleRemoteVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+            requestId: String,
+        ): Boolean
+        fun switchVideoCamera(callId: String, cameraId: String): Boolean
+        fun setLocalVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
+        fun setRemoteVideoRenderer(callId: String, renderer: livekit.org.webrtc.VideoSink?): Boolean
+        fun reportCameraCapabilities(callId: String)
+        fun setVideoOrientation(callId: String, rotation: Int)
+        fun setVideoZoom(callId: String, value: Float)
+        fun reportVideoDataUsage(callId: String)
+        fun setVideoPauseImage(callId: String, uri: android.net.Uri?)
         fun release(callId: String): Boolean
     }
 
@@ -214,10 +242,26 @@ object CNCallEngine {
         @Volatile
         private var connectedReportedCallId: String? = null
 
+        @Volatile
+        private var initialVideoState = VideoProfile.STATE_AUDIO_ONLY
+
+        @Volatile
+        private var pendingOutgoingVideoState: Int? = null
+
+        @Volatile
+        private var pendingOutgoingVideoRequestId: String? = null
+
+        @Volatile
+        private var pendingIncomingVideoState: Int? = null
+
+        @Volatile
+        private var pendingIncomingVideoRequestId: String? = null
+
         private data class PendingIncomingCall(
             val callId: String,
             val callerId: String,
             val callerName: String,
+            val videoState: Int,
         )
 
         /** Background worker for blocking LiveKit-token fetches. */
@@ -264,78 +308,66 @@ object CNCallEngine {
                 println("[CN CALL][SPEED_METRICS] T7_mic_publish_start call_id=$current ts=$t7")
 
                 NativeLiveKit.setMicrophoneEnabled(true) { error ->
-                    val stillCurrent = synchronized(lock) {
-                        current == scoredCallId
-                    }
-
+                    val stillCurrent = synchronized(lock) { current == scoredCallId }
                     if (!stillCurrent) return@setMicrophoneEnabled
 
                     if (error != null) {
-                        callbacks?.onError(
-                            "LiveKit microphone enable failed: ${error.message}",
-                        )
+                        callbacks?.onError("LiveKit microphone enable failed: ${error.message}")
                         return@setMicrophoneEnabled
                     }
 
                     val t8 = System.currentTimeMillis()
                     println("[CN CALL][SPEED_METRICS] T8_mic_published call_id=$current ts=$t8")
 
-                    val reportContext = appContext
-                    val reportUserId = reportContext?.let {
-                        NativeCallTokenHelper.restoreUserId(it)
+                    val wantsInitialVideo = synchronized(lock) {
+                        current == scoredCallId && wantsVideo(initialVideoState)
                     }
-                    val reportTargetId = if (!reportUserId.isNullOrBlank()) {
-                        synchronized(lock) {
-                            if (current != scoredCallId ||
-                                current == connectedReportedCallId
-                            ) {
-                                null
-                            } else {
-                                val target =
-                                    if (isCaller) {
-                                        outgoingTargetId
-                                    } else {
-                                        pendingIncomingCall?.callerId
-                                    }
-                                if (target.isNullOrBlank()) {
-                                    null
-                                } else {
-                                    connectedReportedCallId = current
-                                    target
-                                }
-                            }
+
+                    // The audio path must become ACTIVE independently of the
+                    // camera path. This matches the working audio->video upgrade:
+                    // Telecom gets an active call as soon as the microphone is ready,
+                    // then video is enabled on top of the already-live call.
+                    completeLiveKitMediaReady(current)
+
+                    if (wantsInitialVideo) {
+                        val context = appContext
+                        if (context == null) {
+                            println(
+                                "[CN CALL][VIDEO] initial video skipped: missing context " +
+                                    "call_id=$current",
+                            )
+                            return@setMicrophoneEnabled
                         }
-                    } else {
-                        null
-                    }
-                    if (reportUserId != null && reportTargetId != null) {
-                        val t9 = System.currentTimeMillis()
-                        println("[CN CALL][SPEED_METRICS] T9_connected_signaling_sent call_id=$current ts=$t9")
-                        val sent = NativeWebSocketClient.send(
-                            "connected",
-                            mapOf(
-                                "call_id" to current,
-                                "target_id" to reportTargetId,
-                                "from_id" to reportUserId,
-                            ),
-                        )
-                        println(
-                            "[CN CALL][ENGINE] media connected frame" +
-                                " call_id=$current sent=$sent",
-                        )
-                    }
 
-                    val t10 = System.currentTimeMillis()
-                    println("[CN CALL][SPEED_METRICS] T10_first_usable_audio call_id=$current ts=$t10")
+                        if (!CNCallVideoService.startForCall(context, current)) {
+                            println(
+                                "[CN CALL][VIDEO] initial video foreground service start failed " +
+                                    "call_id=$current",
+                            )
+                            return@setMicrophoneEnabled
+                        }
 
-                    println(
-                        "[CN CALL][ENGINE] media ready " +
-                            "call_id=$current microphone=enabled",
-                    )
-                    callbacks?.onMediaReady()
+                        NativeLiveKit.setCameraEnabled(true) { cameraError ->
+                            val cameraStillCurrent = synchronized(lock) { current == scoredCallId }
+                            if (!cameraStillCurrent) return@setCameraEnabled
+                            if (cameraError != null) {
+                                CNCallVideoService.stopForCall(context, current)
+                                println(
+                                    "[CN CALL][VIDEO] initial camera enable failed " +
+                                        "call_id=$current error=" + cameraError.message,
+                                )
+                                // Do not tear down the whole call here. Audio is already
+                                // active, exactly like the working upgrade path.
+                                return@setCameraEnabled
+                            }
+                            println(
+                                "[CN CALL][VIDEO] initial video camera enabled " +
+                                    "call_id=$current",
+                            )
+                        }
+                    }
                 }
             }
-
             override fun onDisconnected() {
                 // A LiveKit room drop is NOT a hangup: never auto-send hangup
                 // and never notify onDisconnected from media alone. Call-end
@@ -422,16 +454,20 @@ object CNCallEngine {
             callId: String,
             callerId: String,
             callerName: String,
+            videoState: Int,
         ): Boolean {
             if (callId.isBlank() || callerId.isBlank()) return false
+            val normalizedVideoState = normalizeVideoState(videoState)
             synchronized(lock) {
-                if (callId == scoredCallId) return true
-                // Phase WS-ring: for an Online target the invite already arrived
-                // over the native WebSocket (handleSignalingFrame "call" recorded
-                // it in pendingIncomingCall) BEFORE Telecom created this
-                // Connection. Promote the existing pending call to scored instead
-                // of refusing it, so answer()/reject() (which require scoredCallId)
-                // keep working exactly as they do on the FCM path.
+                if (callId == scoredCallId) {
+                    initialVideoState =
+                        pendingIncomingCall
+                            ?.takeIf { it.callId == callId }
+                            ?.videoState
+                            ?: normalizedVideoState
+                    return true
+                }
+
                 val pending = pendingIncomingCall
                 if (pending != null && pending.callId == callId) {
                     ++generation
@@ -439,11 +475,10 @@ object CNCallEngine {
                     isCaller = false
                     outgoingTargetId = null
                     acceptedCallId = null
+                    initialVideoState = pending.videoState
                     return true
                 }
-                // Single-call policy at the engine level: refuse a second
-                // incoming while the engine already orchestrates another call
-                // (ringing or active). Mirrors the outgoing guard below.
+
                 if (scoredCallId != null || pendingIncomingCall != null) {
                     val current = scoredCallId ?: pendingIncomingCall?.callId
                     println(
@@ -452,18 +487,33 @@ object CNCallEngine {
                     )
                     return false
                 }
+
                 ++generation
                 scoredCallId = callId
                 isCaller = false
                 outgoingTargetId = null
                 acceptedCallId = null
+                initialVideoState = normalizedVideoState
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
                 pendingIncomingCall =
-                    PendingIncomingCall(callId, callerId, callerName)
+                    PendingIncomingCall(
+                        callId,
+                        callerId,
+                        callerName,
+                        normalizedVideoState,
+                    )
             }
             return true
         }
 
-        override fun startOutgoing(callId: String, address: String): Boolean {
+        override fun startOutgoing(
+            callId: String,
+            address: String,
+            videoState: Int,
+        ): Boolean {
             println(
                 "[CN CALL][DIAG][ENGINE startOutgoing] " +
                     "call_id=$callId address=$address",
@@ -476,6 +526,7 @@ object CNCallEngine {
                 return false
             }
             val targetId = parseTargetId(address)
+            val normalizedVideoState = normalizeVideoState(videoState)
             if (targetId.isBlank()) {
                 println(
                     "[CN CALL][DIAG][ENGINE startOutgoing REJECT] " +
@@ -499,8 +550,6 @@ object CNCallEngine {
 
             synchronized(lock) {
                 if (callId == scoredCallId && isCaller) return true
-                // Single-call policy at the engine level too: refuse a second
-                // outgoing while the engine already orchestrates another call.
                 if (scoredCallId != null && scoredCallId != callId) {
                     println(
                         "[CN CALL][ENGINE] outgoing refused: another call scored" +
@@ -514,6 +563,11 @@ object CNCallEngine {
                 outgoingTargetId = targetId
                 pendingIncomingCall = null
                 acceptedCallId = null
+                initialVideoState = normalizedVideoState
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
             }
 
             val signalingReady = ensureSignalingConnected()
@@ -537,6 +591,7 @@ object CNCallEngine {
                     "target_id" to targetId,
                     "from_id" to ownUserId,
                     "caller_name" to callerName,
+                    "video_state" to normalizedVideoState.toString(),
                 ),
             )
             println(
@@ -660,6 +715,7 @@ object CNCallEngine {
                 }
             }
             stopCallAudioService(callId)
+            appContext?.let { CNCallVideoService.stopForCall(it, callId) }
             // Keep native signaling ownership/session alive so a terminal frame
             // queued during the WebSocket handshake cannot be cleared before
             // it reaches the server.
@@ -738,9 +794,11 @@ object CNCallEngine {
                     callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             stopCallAudioService(callId)
+            appContext?.let { CNCallVideoService.stopForCall(it, callId) }
             // Keep native signaling ownership/session alive so a queued terminal
             // frame can flush after the WebSocket handshake.
             return sent
@@ -767,6 +825,183 @@ object CNCallEngine {
             return true
         }
 
+        override fun requestVideoState(
+            callId: String,
+            fromVideoState: Int,
+            toVideoState: Int,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            return sendVideoRequest(
+                callId,
+                fromVideoState,
+                toVideoState,
+            )
+        }
+
+        override fun handleVideoResponse(
+            callId: String,
+            videoState: Int,
+        ): Boolean {
+            if (!isScored(callId)) return false
+
+            val requestedState: Int
+            val requestId: String
+            synchronized(lock) {
+                requestedState = pendingIncomingVideoState ?: return false
+                requestId = pendingIncomingVideoRequestId.orEmpty()
+                pendingIncomingVideoState = null
+                pendingIncomingVideoRequestId = null
+            }
+
+            val requestedVideo = wantsVideo(requestedState)
+            val responseVideo = wantsVideo(videoState)
+
+            if (requestedVideo != responseVideo) {
+                sendVideoResponse(
+                    callId,
+                    false,
+                    VideoProfile.STATE_AUDIO_ONLY,
+                    requestId,
+                )
+                println(
+                    "[CN CALL][VIDEO] local user declined remote request " +
+                        "call_id=$callId request_id=$requestId",
+                )
+                return true
+            }
+
+            return applyVideoMediaState(callId, videoState) { success, finalState ->
+                sendVideoResponse(
+                    callId,
+                    success,
+                    finalState,
+                    requestId,
+                )
+            }
+        }
+
+        override fun handleRemoteVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+            requestId: String,
+        ): Boolean {
+            if (!isScored(callId)) return false
+
+            val requestedState: Int
+            val expectedRequestId: String
+            synchronized(lock) {
+                requestedState = pendingOutgoingVideoState ?: return false
+                expectedRequestId = pendingOutgoingVideoRequestId.orEmpty()
+
+                if (expectedRequestId.isNotEmpty() &&
+                    requestId.isNotEmpty() &&
+                    expectedRequestId != requestId
+                ) {
+                    println(
+                        "[CN CALL][VIDEO] remote response request_id mismatch " +
+                            "call_id=$callId expected=$expectedRequestId actual=$requestId",
+                    )
+                    return false
+                }
+
+                pendingOutgoingVideoState = null
+                pendingOutgoingVideoRequestId = null
+            }
+
+            val connection =
+                CNCallRegistry.get(callId)?.connection as? CNCallConnection
+            val requestedVideo = wantsVideo(requestedState)
+            val responseVideo = wantsVideo(videoState)
+
+            if (!success || requestedVideo != responseVideo) {
+                connection?.completeVideoSessionModify(
+                    requestedState,
+                    videoState,
+                    Connection.VideoProvider.SESSION_MODIFY_REQUEST_REJECTED_BY_REMOTE,
+                )
+                println(
+                    "[CN CALL][VIDEO] remote video request rejected " +
+                        "call_id=$callId requested=$requestedState response=$videoState success=$success",
+                )
+                return true
+            }
+
+            return applyVideoMediaState(callId, videoState) { mediaSuccess, finalState ->
+                connection?.completeVideoSessionModify(
+                    requestedState,
+                    finalState,
+                    if (mediaSuccess) {
+                        Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS
+                    } else {
+                        Connection.VideoProvider.SESSION_MODIFY_REQUEST_FAIL
+                    },
+                )
+            }
+        }
+
+        override fun switchVideoCamera(
+            callId: String,
+            cameraId: String,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.switchCamera(cameraId)
+            return true
+        }
+
+        override fun setLocalVideoRenderer(
+            callId: String,
+            renderer: livekit.org.webrtc.VideoSink?,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.setLocalVideoRenderer(renderer)
+            return true
+        }
+
+        override fun setRemoteVideoRenderer(
+            callId: String,
+            renderer: livekit.org.webrtc.VideoSink?,
+        ): Boolean {
+            if (!isScored(callId)) return false
+            NativeLiveKit.setRemoteVideoRenderer(renderer)
+            return true
+        }
+
+        override fun reportCameraCapabilities(callId: String) {
+            println(
+                "[CN CALL][VIDEO] camera capabilities requested call_id=" +
+                    callId,
+            )
+        }
+
+        override fun setVideoOrientation(callId: String, rotation: Int) {
+            println(
+                "[CN CALL][VIDEO] orientation call_id=" +
+                    callId + " rotation=" + rotation,
+            )
+        }
+
+        override fun setVideoZoom(callId: String, value: Float) {
+            println(
+                "[CN CALL][VIDEO] zoom call_id=" +
+                    callId + " value=" + value,
+            )
+        }
+
+        override fun reportVideoDataUsage(callId: String) {
+            println(
+                "[CN CALL][VIDEO] data usage requested call_id=" +
+                    callId,
+            )
+        }
+
+        override fun setVideoPauseImage(callId: String, uri: android.net.Uri?) {
+            println(
+                "[CN CALL][VIDEO] pause image requested call_id=" +
+                    callId + " uri=" + uri,
+            )
+        }
+
         override fun release(callId: String): Boolean {
             val released: Boolean
             synchronized(lock) {
@@ -778,6 +1013,7 @@ object CNCallEngine {
                     acceptedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             // Frees call resources only: the WebSocket session is session-
@@ -788,6 +1024,7 @@ object CNCallEngine {
                 appContext?.let { markCallEndedLocally(it, callId) }
                 CNCallRegistry.releaseTelecomPresentation(callId)
                 stopCallAudioService(callId)
+                appContext?.let { CNCallVideoService.stopForCall(it, callId) }
                 releaseNativeOwnershipIfOwned()
                 // Phase 2.3 (E1): call finished; no queued frame may be flushed.
                 NativeWebSocketClient.clearPendingFrames()
@@ -803,6 +1040,7 @@ object CNCallEngine {
             synchronized(lock) {
                 ++generation
                 scoredCallId = callId
+                resetVideoNegotiationStateLocked()
             }
         }
 
@@ -835,6 +1073,9 @@ object CNCallEngine {
                 CNCallRegistry.releaseTelecomPresentation(endedCallId)
             }
             stopCallAudioService(endedCallId)
+            if (endedCallId != null) {
+                appContext?.let { CNCallVideoService.stopForCall(it, endedCallId) }
+            }
             releaseNativeOwnershipIfOwned()
             // Phase 2.3 (E1): hard end; no queued frame may be flushed after
             // the call is over.
@@ -853,6 +1094,88 @@ object CNCallEngine {
          * This intentionally does NOT send call_reject/offline to the peer,
          * does not terminate the call, and does not affect incoming calls.
          */
+        private fun completeLiveKitMediaReady(current: String) {
+            val stillCurrent = synchronized(lock) {
+                current == scoredCallId
+            }
+            if (!stillCurrent) return
+
+            val reportContext = appContext
+            val reportUserId = reportContext?.let {
+                NativeCallTokenHelper.restoreUserId(it)
+            }
+            val reportTargetId = if (!reportUserId.isNullOrBlank()) {
+                synchronized(lock) {
+                    if (current != scoredCallId ||
+                        current == connectedReportedCallId
+                    ) {
+                        null
+                    } else {
+                        val target =
+                            if (isCaller) outgoingTargetId
+                            else pendingIncomingCall?.callerId
+                        if (target.isNullOrBlank()) null
+                        else {
+                            connectedReportedCallId = current
+                            target
+                        }
+                    }
+                }
+            } else null
+
+            if (reportUserId != null && reportTargetId != null) {
+                val t9 = System.currentTimeMillis()
+                println("[CN CALL][SPEED_METRICS] T9_connected_signaling_sent call_id=$current ts=$t9")
+                val sent = NativeWebSocketClient.send(
+                    "connected",
+                    mapOf(
+                        "call_id" to current,
+                        "target_id" to reportTargetId,
+                        "from_id" to reportUserId,
+                    ),
+                )
+                println(
+                    "[CN CALL][ENGINE] media connected frame" +
+                        " call_id=$current sent=$sent",
+                )
+            }
+
+            val t10 = System.currentTimeMillis()
+            println("[CN CALL][SPEED_METRICS] T10_first_usable_audio call_id=$current ts=$t10")
+            println(
+                "[CN CALL][ENGINE] media ready " +
+                    "call_id=$current microphone=enabled",
+            )
+            callbacks?.onMediaReady()
+        }
+
+        private fun synchronizedVideoCallId(): String? =
+            synchronized(lock) { scoredCallId }
+
+        private fun normalizeVideoState(videoState: Int): Int {
+            return when (videoState) {
+                VideoProfile.STATE_AUDIO_ONLY,
+                VideoProfile.STATE_BIDIRECTIONAL,
+                VideoProfile.STATE_TX_ENABLED,
+                VideoProfile.STATE_RX_ENABLED -> videoState
+                else -> VideoProfile.STATE_AUDIO_ONLY
+            }
+        }
+
+        private fun wantsVideo(videoState: Int): Boolean {
+            return videoState and
+                (VideoProfile.STATE_TX_ENABLED or
+                    VideoProfile.STATE_RX_ENABLED) != 0
+        }
+
+        private fun resetVideoNegotiationStateLocked() {
+            initialVideoState = VideoProfile.STATE_AUDIO_ONLY
+            pendingOutgoingVideoState = null
+            pendingOutgoingVideoRequestId = null
+            pendingIncomingVideoState = null
+            pendingIncomingVideoRequestId = null
+        }
+
         private fun maybeAnnounceCallerOffline() {
             val context = appContext ?: return
 
@@ -1170,6 +1493,11 @@ object CNCallEngine {
                             ?.trim()
                             ?.takeIf { it.isNotEmpty() }
                             ?: "مستخدم CN CALL"
+                    val requestedVideoState = normalizeVideoState(
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY,
+                    )
+
                     val context = appContext
                     val ownerIsNative =
                         context != null &&
@@ -1194,7 +1522,12 @@ object CNCallEngine {
                         if (!sameAsPending) {
                             ++generation
                             pendingIncomingCall =
-                                PendingIncomingCall(frameCallId, callerId, callerName)
+                                PendingIncomingCall(
+                                    frameCallId,
+                                    callerId,
+                                    callerName,
+                                    requestedVideoState,
+                                )
                         }
                         // Exactly one presenting side wins the per-call ticket
                         // (this WS path or the FCM path, whichever is first);
@@ -1247,7 +1580,12 @@ object CNCallEngine {
                         )
                     }
                     if (acceptedForPresentation) {
-                        presentIncomingCallToTelecom(frameCallId, callerId, callerName)
+                        presentIncomingCallToTelecom(
+                            frameCallId,
+                            callerId,
+                            callerName,
+                            requestedVideoState,
+                        )
                     }
                 }
 
@@ -1265,6 +1603,58 @@ object CNCallEngine {
                                 (payload["from_id"] ?: ""),
                         )
                     }
+                }
+
+                "call_video_request" -> {
+                    val requestedState = normalizeVideoState(
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY,
+                    )
+                    val requestId = payload["request_id"]?.trim().orEmpty()
+
+                    val connection =
+                        CNCallRegistry.get(frameCallId)?.connection
+                            as? CNCallConnection
+                    if (connection == null) {
+                        return@handleSignalingFrame
+                    }
+
+                    synchronized(lock) {
+                        if (frameCallId != scoredCallId) {
+                            return@handleSignalingFrame
+                        }
+                        if (pendingIncomingVideoState != null) {
+                            println(
+                                "[CN CALL][VIDEO] ignoring overlapping remote request " +
+                                    "call_id=$frameCallId",
+                            )
+                            return@handleSignalingFrame
+                        }
+                        pendingIncomingVideoState = requestedState
+                        pendingIncomingVideoRequestId = requestId
+                    }
+
+                    // The request is handed to Telecom/InCallUI only. Camera
+                    // media state and the network response wait for user input.
+                    connection.notifyRemoteVideoRequest(requestedState)
+                }
+                "call_video_response" -> {
+                    val responseState =
+                        payload["video_state"]?.toIntOrNull()
+                            ?: VideoProfile.STATE_AUDIO_ONLY
+                    val success =
+                        payload["success"]?.trim()?.equals(
+                            "true",
+                            ignoreCase = true,
+                        ) == true
+                    val requestId = payload["request_id"]?.trim().orEmpty()
+
+                    handleRemoteVideoResponse(
+                        frameCallId,
+                        success,
+                        responseState,
+                        requestId,
+                    )
                 }
 
                 "call_started" -> {
@@ -1498,6 +1888,7 @@ object CNCallEngine {
             callId: String,
             callerId: String,
             callerName: String,
+            videoState: Int,
         ) {
             val context = appContext ?: run {
                 CNCallRegistry.releaseTelecomPresentation(callId)
@@ -1520,6 +1911,10 @@ object CNCallEngine {
                         putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
                         putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
                         putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                        putInt(
+                            TelecomManager.EXTRA_INCOMING_VIDEO_STATE,
+                            normalizeVideoState(videoState),
+                        )
                     },
                 )
                 println(
@@ -1635,6 +2030,190 @@ object CNCallEngine {
             return sent
         }
 
+        private fun sendVideoRequest(
+            callId: String,
+            fromVideoState: Int,
+            toVideoState: Int,
+        ): Boolean {
+            val context = appContext ?: return false
+            val userId = NativeCallTokenHelper.restoreUserId(context)
+                ?.trim()
+                .orEmpty()
+            if (userId.isEmpty()) return false
+
+            val targetId = synchronized(lock) {
+                if (callId != scoredCallId) {
+                    null
+                } else if (isCaller) {
+                    outgoingTargetId
+                } else {
+                    pendingIncomingCall?.callerId
+                }
+            }?.trim().orEmpty()
+            if (targetId.isEmpty()) return false
+
+            val wantsVideo =
+                toVideoState and
+                    (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+            if (wantsVideo && !hasCameraPermission(context)) {
+                println(
+                    "[CN CALL][VIDEO] request denied: camera permission missing " +
+                        "call_id=" + callId,
+                )
+                return false
+            }
+
+            val requestId = UUID.randomUUID().toString()
+            synchronized(lock) {
+                if (callId != scoredCallId) return false
+                pendingOutgoingVideoState = normalizeVideoState(toVideoState)
+                pendingOutgoingVideoRequestId = requestId
+            }
+
+            val sent = NativeWebSocketClient.send(
+                "call_video_request",
+                mapOf(
+                    "call_id" to callId,
+                    "target_id" to targetId,
+                    "from_id" to userId,
+                    "video_state" to toVideoState.toString(),
+                    "request_id" to requestId,
+                ),
+            )
+
+            if (!sent) {
+                synchronized(lock) {
+                    if (callId == scoredCallId &&
+                        pendingOutgoingVideoRequestId == requestId
+                    ) {
+                        pendingOutgoingVideoState = null
+                        pendingOutgoingVideoRequestId = null
+                    }
+                }
+            }
+
+            println(
+                "[CN CALL][VIDEO] request call_id=" + callId +
+                    " from=" + fromVideoState +
+                    " to=" + toVideoState +
+                    " target=" + targetId +
+                    " sent=" + sent,
+            )
+            return sent
+        }
+
+        private fun applyVideoMediaState(
+            callId: String,
+            videoState: Int,
+            onResult: (Boolean, Int) -> Unit,
+        ): Boolean {
+            val context = appContext ?: run {
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
+            }
+            val wantsVideo = wantsVideo(videoState)
+
+            if (wantsVideo && !hasCameraPermission(context)) {
+                println(
+                    "[CN CALL][VIDEO] apply state denied: camera permission missing " +
+                        "call_id=$callId",
+                )
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
+            }
+
+            if (wantsVideo && !CNCallVideoService.startForCall(context, callId)) {
+                println(
+                    "[CN CALL][VIDEO] video service unavailable " +
+                        "call_id=$callId",
+                )
+                onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                return true
+            }
+
+            NativeLiveKit.setCameraEnabled(wantsVideo) { error ->
+                if (callId != synchronizedVideoCallId()) return@setCameraEnabled
+
+                if (error != null) {
+                    if (wantsVideo) {
+                        CNCallVideoService.stopForCall(context, callId)
+                    }
+                    println(
+                        "[CN CALL][VIDEO] apply state failed call_id=" +
+                            callId + " error=" + error.message,
+                    )
+                    onResult(false, VideoProfile.STATE_AUDIO_ONLY)
+                    return@setCameraEnabled
+                }
+
+                val finalState =
+                    if (wantsVideo) {
+                        VideoProfile.STATE_BIDIRECTIONAL
+                    } else {
+                        CNCallVideoService.stopForCall(context, callId)
+                        VideoProfile.STATE_AUDIO_ONLY
+                    }
+
+                (CNCallRegistry.get(callId)?.connection as? CNCallConnection)
+                    ?.updateVideoState(finalState)
+                onResult(true, finalState)
+            }
+            return true
+        }
+
+        private fun sendVideoResponse(
+            callId: String,
+            success: Boolean,
+            videoState: Int,
+            requestId: String = "",
+        ) {
+            val context = appContext ?: return
+            val userId = NativeCallTokenHelper.restoreUserId(context)
+                ?.trim()
+                .orEmpty()
+            val targetId = synchronized(lock) {
+                if (callId != scoredCallId) {
+                    null
+                } else if (isCaller) {
+                    outgoingTargetId
+                } else {
+                    pendingIncomingCall?.callerId
+                }
+            }?.trim().orEmpty()
+
+            if (userId.isEmpty() || targetId.isEmpty()) return
+
+            val payload = mutableMapOf(
+                "call_id" to callId,
+                "target_id" to targetId,
+                "from_id" to userId,
+                "success" to success.toString(),
+                "video_state" to videoState.toString(),
+            )
+            if (requestId.isNotBlank()) {
+                payload["request_id"] = requestId
+            }
+
+            val sent = NativeWebSocketClient.send(
+                "call_video_response",
+                payload,
+            )
+
+            println(
+                "[CN CALL][VIDEO] response call_id=" + callId +
+                    " success=" + success +
+                    " state=" + videoState +
+                    " sent=" + sent,
+            )
+        }
+
+        private fun hasCameraPermission(context: Context): Boolean {
+            return ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA,
+            ) == PackageManager.PERMISSION_GRANTED
+        }
+
         private fun clearScoredCall(
             callId: String,
             event: String,
@@ -1653,6 +2232,7 @@ object CNCallEngine {
                     acceptedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 }
             }
             println(
@@ -1705,6 +2285,7 @@ object CNCallEngine {
                     callerOfflineAnnouncedCallId = null
                     isCaller = false
                     outgoingTargetId = null
+                    resetVideoNegotiationStateLocked()
                 } else {
                     endedCallId = null
                 }
@@ -1972,6 +2553,7 @@ object CNCallEngine {
         callId: String,
         callerId: String,
         callerName: String,
+        videoState: Int,
     ): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("startIncoming", callId, callbacks)
@@ -1980,7 +2562,12 @@ object CNCallEngine {
             return unavailable("startIncoming", callId, callbacks, "Native call engine is not initialized")
         }
 
-        return currentDelegate.startIncoming(callId, callerId, callerName)
+        return currentDelegate.startIncoming(
+            callId,
+            callerId,
+            callerName,
+            videoState,
+        )
     }
 
     fun prepareIncomingSignaling(callId: String): Boolean {
@@ -1994,7 +2581,11 @@ object CNCallEngine {
         return currentDelegate.prepareIncomingSignaling(callId)
     }
 
-    fun startOutgoing(callId: String, address: String): Boolean {
+    fun startOutgoing(
+        callId: String,
+        address: String,
+        videoState: Int,
+    ): Boolean {
         val currentDelegate = delegate
             ?: return unavailable("startOutgoing", callId, callbacks)
 
@@ -2002,7 +2593,11 @@ object CNCallEngine {
             return unavailable("startOutgoing", callId, callbacks, "Native call engine is not initialized")
         }
 
-        return currentDelegate.startOutgoing(callId, address)
+        return currentDelegate.startOutgoing(
+            callId,
+            address,
+            videoState,
+        )
     }
 
     fun answer(callId: String): Boolean {
@@ -2058,6 +2653,127 @@ object CNCallEngine {
         }
 
         return currentDelegate.setSpeaker(callId, speaker)
+    }
+
+    fun requestVideoState(
+        callId: String,
+        fromVideoState: Int,
+        toVideoState: Int,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("requestVideoState", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "requestVideoState",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.requestVideoState(
+            callId,
+            fromVideoState,
+            toVideoState,
+        )
+    }
+
+    fun handleVideoResponse(
+        callId: String,
+        videoState: Int,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("handleVideoResponse", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "handleVideoResponse",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.handleVideoResponse(callId, videoState)
+    }
+
+    fun handleRemoteVideoResponse(
+        callId: String,
+        success: Boolean,
+        videoState: Int,
+        requestId: String,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("handleRemoteVideoResponse", callId, callbacks)
+
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "handleRemoteVideoResponse",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+
+        return currentDelegate.handleRemoteVideoResponse(
+            callId,
+            success,
+            videoState,
+            requestId,
+        )
+    }
+
+    fun switchVideoCamera(callId: String, cameraId: String): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("switchVideoCamera", callId, callbacks)
+        if (state == State.UNINITIALIZED || state == State.TERMINATED) {
+            return unavailable(
+                "switchVideoCamera",
+                callId,
+                callbacks,
+                "Native call engine is not initialized",
+            )
+        }
+        return currentDelegate.switchVideoCamera(callId, cameraId)
+    }
+
+    fun setLocalVideoRenderer(
+        callId: String,
+        renderer: livekit.org.webrtc.VideoSink?,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("setLocalVideoRenderer", callId, callbacks)
+        return currentDelegate.setLocalVideoRenderer(callId, renderer)
+    }
+
+    fun setRemoteVideoRenderer(
+        callId: String,
+        renderer: livekit.org.webrtc.VideoSink?,
+    ): Boolean {
+        val currentDelegate = delegate
+            ?: return unavailable("setRemoteVideoRenderer", callId, callbacks)
+        return currentDelegate.setRemoteVideoRenderer(callId, renderer)
+    }
+
+    fun reportCameraCapabilities(callId: String) {
+        (delegate as? CNCallEngineImpl)?.reportCameraCapabilities(callId)
+    }
+
+    fun setVideoOrientation(callId: String, rotation: Int) {
+        (delegate as? CNCallEngineImpl)?.setVideoOrientation(callId, rotation)
+    }
+
+    fun setVideoZoom(callId: String, value: Float) {
+        (delegate as? CNCallEngineImpl)?.setVideoZoom(callId, value)
+    }
+
+    fun reportVideoDataUsage(callId: String) {
+        (delegate as? CNCallEngineImpl)?.reportVideoDataUsage(callId)
+    }
+
+    fun setVideoPauseImage(callId: String, uri: android.net.Uri?) {
+        (delegate as? CNCallEngineImpl)?.setVideoPauseImage(callId, uri)
     }
 
     fun hold(callId: String): Boolean {

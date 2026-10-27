@@ -3,10 +3,15 @@ package com.example.mobile
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.MediaPlayer
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
+import android.os.Build
 import android.provider.CallLog
 import android.telecom.Connection
 import android.telecom.DisconnectCause
+import android.telecom.VideoProfile
+import livekit.org.webrtc.VideoSink
 import java.io.IOException
 
 class CNCallConnection(
@@ -16,6 +21,7 @@ class CNCallConnection(
     private val callerId: String,
     private val callerName: String,
     private val address: Uri,
+    private val initialVideoState: Int,
 ) : Connection() {
     @Volatile
     private var terminal = false
@@ -23,6 +29,59 @@ class CNCallConnection(
     @Volatile
     private var active = false
     private val terminalLock = Any()
+
+    private val videoProvider =
+        CNCallVideoProvider(callId, object : CNCallVideoProvider.Listener {
+            override fun onSessionModifyRequest(
+                fromProfile: VideoProfile,
+                toProfile: VideoProfile,
+            ) {
+                CNCallEngine.requestVideoState(
+                    callId,
+                    fromProfile.videoState,
+                    toProfile.videoState,
+                )
+            }
+
+            override fun onSessionModifyResponse(responseProfile: VideoProfile) {
+                CNCallEngine.handleVideoResponse(
+                    callId,
+                    responseProfile.videoState,
+                )
+            }
+
+            override fun onSetCamera(cameraId: String) {
+                CNCallEngine.switchVideoCamera(callId, cameraId)
+            }
+
+            override fun onPreviewRendererChanged(renderer: VideoSink?) {
+                CNCallEngine.setLocalVideoRenderer(callId, renderer)
+            }
+
+            override fun onDisplayRendererChanged(renderer: VideoSink?) {
+                CNCallEngine.setRemoteVideoRenderer(callId, renderer)
+            }
+
+            override fun onRequestCameraCapabilities() {
+                CNCallEngine.reportCameraCapabilities(callId)
+            }
+
+            override fun onSetDeviceOrientation(rotation: Int) {
+                CNCallEngine.setVideoOrientation(callId, rotation)
+            }
+
+            override fun onSetZoom(value: Float) {
+                CNCallEngine.setVideoZoom(callId, value)
+            }
+
+            override fun onRequestCallDataUsage() {
+                CNCallEngine.reportVideoDataUsage(callId)
+            }
+
+            override fun onSetPauseImage(uri: android.net.Uri?) {
+                CNCallEngine.setVideoPauseImage(callId, uri)
+            }
+        })
     private val ringbackLock = Any()
     private var ringbackPlayer: MediaPlayer? = null
     private var ringbackGeneration = 0L
@@ -40,6 +99,10 @@ class CNCallConnection(
 
         override fun onMediaReady() {
             if (terminal || active) return
+
+            // LiveKit now owns a ready EGL context. If Samsung delivered the
+            // Telecom video surface earlier, let the provider bind it now.
+            videoProvider.onLiveKitReady()
 
             if (incoming) {
                 if (answering && CNCallRegistry.markActive(callId)) {
@@ -105,6 +168,40 @@ class CNCallConnection(
 
     init {
         setAudioModeIsVoip(true)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val connectivityManager =
+                appContext.getSystemService(ConnectivityManager::class.java)
+            val activeNetwork = connectivityManager?.activeNetwork
+            val networkCapabilities =
+                activeNetwork?.let(connectivityManager::getNetworkCapabilities)
+            if (
+                networkCapabilities?.hasTransport(
+                    NetworkCapabilities.TRANSPORT_WIFI,
+                ) == true
+            ) {
+                setConnectionProperties(
+                    getConnectionProperties() or PROPERTY_WIFI,
+                )
+                println(
+                    "[CN CALL][TELECOM] connection network=wifi call_id=$callId",
+                )
+            }
+        }
+        setConnectionCapabilities(
+            getConnectionCapabilities() or
+                CAPABILITY_SUPPORTS_VT_LOCAL_BIDIRECTIONAL or
+                CAPABILITY_SUPPORTS_VT_REMOTE_BIDIRECTIONAL,
+        )
+        setVideoProvider(videoProvider)
+        setVideoState(
+            when (initialVideoState) {
+                VideoProfile.STATE_AUDIO_ONLY,
+                VideoProfile.STATE_BIDIRECTIONAL,
+                VideoProfile.STATE_TX_ENABLED,
+                VideoProfile.STATE_RX_ENABLED -> initialVideoState
+                else -> VideoProfile.STATE_AUDIO_ONLY
+            },
+        )
         setAddress(address, CallLog.Calls.PRESENTATION_ALLOWED)
         if (!incoming) {
             prepareOutgoingRingback()
@@ -319,10 +416,40 @@ class CNCallConnection(
     }
 
     override fun onAnswer() {
+        answerIncoming(initialVideoState, "default")
+    }
+
+    /**
+     * Samsung/Telecom calls this overload when the user chooses to answer
+     * directly as a video call. The requested video state must be carried into
+     * the native answer path; the no-argument onAnswer() cannot express that
+     * choice.
+     */
+    override fun onAnswer(videoState: Int) {
+        answerIncoming(videoState, "video")
+    }
+
+    private fun answerIncoming(requestedVideoState: Int, source: String) {
         if (terminal || !incoming || answering || active) return
         if (!CNCallRegistry.claimAnswer(callId)) return
         answering = true
         CNCallNotification.cancel(appContext, callId)
+
+        val normalizedVideoState = when (requestedVideoState) {
+            VideoProfile.STATE_AUDIO_ONLY,
+            VideoProfile.STATE_BIDIRECTIONAL,
+            VideoProfile.STATE_TX_ENABLED,
+            VideoProfile.STATE_RX_ENABLED -> requestedVideoState
+            else -> VideoProfile.STATE_AUDIO_ONLY
+        }
+
+        println(
+            "[CN CALL][TELECOM] answer requested " +
+                "call_id=$callId source=$source videoState=$normalizedVideoState",
+        )
+        if (normalizedVideoState != VideoProfile.STATE_AUDIO_ONLY) {
+            setVideoState(normalizedVideoState)
+        }
 
         val t0 = System.currentTimeMillis()
         println("[CN CALL][SPEED_METRICS] T0_answer_pressed call_id=$callId ts=$t0")
@@ -334,6 +461,23 @@ class CNCallConnection(
             println("[CN CALL][TELECOM] pre-started CNCallAudioService onAnswer call_id=$callId ok=$fgsStarted")
         } catch (e: Exception) {
             println("[CN CALL][TELECOM] pre-start CNCallAudioService exception call_id=$callId err=$e")
+        }
+
+        val wantsInitialVideo = normalizedVideoState and
+            (VideoProfile.STATE_TX_ENABLED or VideoProfile.STATE_RX_ENABLED) != 0
+        if (wantsInitialVideo) {
+            try {
+                val videoFgsStarted = CNCallVideoService.startForCall(appContext, callId)
+                println(
+                    "[CN CALL][TELECOM] pre-started CNCallVideoService onAnswer " +
+                        "call_id=$callId ok=$videoFgsStarted",
+                )
+            } catch (e: Exception) {
+                println(
+                    "[CN CALL][TELECOM] pre-start CNCallVideoService exception " +
+                        "call_id=$callId err=$e",
+                )
+            }
         }
 
         // Phase 3: only the native signaling owner may answer. If Flutter still
@@ -355,7 +499,12 @@ class CNCallConnection(
             return
         }
         if (!CNCallEngine.initialize(appContext, engineCallbacks) ||
-            !CNCallEngine.startIncoming(callId, callerId, callerName)
+            !CNCallEngine.startIncoming(
+                callId,
+                callerId,
+                callerName,
+                normalizedVideoState,
+            )
         ) {
             fail(DisconnectCause.ERROR)
             return
@@ -464,6 +613,55 @@ class CNCallConnection(
         terminateFromRemote(DisconnectCause(code))
     }
 
+    internal fun updateVideoState(videoState: Int) {
+        if (terminal) return
+        setVideoState(videoState)
+    }
+
+    internal fun notifyRemoteVideoRequest(videoState: Int) {
+        if (terminal) return
+        try {
+            videoProvider.receiveSessionModifyRequest(
+                VideoProfile(videoState),
+            )
+        } catch (error: Exception) {
+            println(
+                "[CN CALL][VIDEO] Telecom request notification failed " +
+                    "call_id=" + callId +
+                    " error=" + error.message,
+            )
+        }
+    }
+
+    internal fun completeVideoSessionModify(
+        requestedVideoState: Int,
+        responseVideoState: Int,
+        status: Int,
+    ) {
+        if (terminal) return
+
+        val requestedProfile = VideoProfile(requestedVideoState)
+        val responseProfile = VideoProfile(responseVideoState)
+
+        try {
+            videoProvider.receiveSessionModifyResponse(
+                status,
+                requestedProfile,
+                responseProfile,
+            )
+        } catch (error: Exception) {
+            println(
+                "[CN CALL][VIDEO] Telecom response notification failed " +
+                    "call_id=" + callId +
+                    " error=" + error.message,
+            )
+        }
+
+        if (status == Connection.VideoProvider.SESSION_MODIFY_REQUEST_SUCCESS) {
+            setVideoState(responseVideoState)
+        }
+    }
+
     private fun terminateFromRemote(cause: DisconnectCause) {
         synchronized(terminalLock) {
             if (terminal || !CNCallRegistry.claimDisconnect(callId)) return
@@ -490,6 +688,9 @@ class CNCallConnection(
         CNCallRegistry.remove(callId)
         CNCallNotification.cancel(appContext, callId)
         CNCallEngine.notifyTelecomCallEnded(callId)
+        CNCallVideoService.stopForCall(appContext, callId)
+        println("[CN CALL][VIDEO SERVICE] stopped for ended call call_id=$callId")
+        videoProvider.release()
         destroy()
     }
 }

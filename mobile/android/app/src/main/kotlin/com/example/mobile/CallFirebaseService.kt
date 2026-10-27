@@ -142,6 +142,11 @@ class CallFirebaseService : FirebaseMessagingService() {
         val callId = message.data["call_id"]?.trim().orEmpty()
         if (callId.isEmpty()) return
 
+        val initialVideoState = normalizeVideoState(
+            message.data["video_state"]?.toIntOrNull()
+                ?: android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+        )
+
         // The FCM delivery itself can be stale because Android may deliver it
         // after the call already ended through WebSocket/another FCM path.
         // Check the local tombstone BEFORE responding to the old challenge.
@@ -229,6 +234,10 @@ class CallFirebaseService : FirebaseMessagingService() {
                     putString(CNCallConnectionService.EXTRA_CALL_ID, callId)
                     putString(CNCallConnectionService.EXTRA_CALLER_ID, callerId)
                     putString(CNCallConnectionService.EXTRA_CALLER_NAME, callerName)
+                    putInt(
+                        TelecomManager.EXTRA_INCOMING_VIDEO_STATE,
+                        initialVideoState,
+                    )
                 },
             )
 
@@ -243,6 +252,16 @@ class CallFirebaseService : FirebaseMessagingService() {
         }
 
         return
+    }
+
+    private fun normalizeVideoState(videoState: Int): Int {
+        return when (videoState) {
+            android.telecom.VideoProfile.STATE_AUDIO_ONLY,
+            android.telecom.VideoProfile.STATE_BIDIRECTIONAL,
+            android.telecom.VideoProfile.STATE_TX_ENABLED,
+            android.telecom.VideoProfile.STATE_RX_ENABLED -> videoState
+            else -> android.telecom.VideoProfile.STATE_AUDIO_ONLY
+        }
     }
 
     private fun isCallEnded(callId: String): Boolean {

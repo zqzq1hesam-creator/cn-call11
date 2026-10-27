@@ -34,7 +34,11 @@ object CNCallPhoneAccount {
             // offers it as an independent account for tel: addresses and the
             // app places "cncall:" addresses. It shares nothing with and never
             // interferes with SIM 1 / SIM 2 cellular calls.
-            .setCapabilities(PhoneAccount.CAPABILITY_CALL_PROVIDER)
+            .setCapabilities(
+                PhoneAccount.CAPABILITY_CALL_PROVIDER or
+                    PhoneAccount.CAPABILITY_SUPPORTS_VIDEO_CALLING or
+                    PhoneAccount.CAPABILITY_VIDEO_CALLING,
+            )
             .setSupportedUriSchemes(listOf("cncall", "tel"))
             .build()
 

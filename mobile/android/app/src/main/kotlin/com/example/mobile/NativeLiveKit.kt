@@ -6,13 +6,24 @@ import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import io.livekit.android.LiveKit
 import io.livekit.android.LiveKitOverrides
+import io.livekit.android.util.LoggingLevel
 import io.livekit.android.RoomOptions
 import io.livekit.android.AudioOptions
 import io.livekit.android.audio.NoAudioHandler
 import io.livekit.android.events.RoomEvent
 import io.livekit.android.events.collect
 import io.livekit.android.room.Room
+import io.livekit.android.room.track.LocalVideoTrack
+import io.livekit.android.room.track.RemoteVideoTrack
 import io.livekit.android.room.track.Track
+import io.livekit.android.room.participant.VideoTrackPublishDefaults
+import io.livekit.android.room.track.LocalVideoTrackOptions
+import io.livekit.android.room.track.VideoCodec
+import io.livekit.android.room.track.VideoEncoding
+import io.livekit.android.room.track.VideoPreset169
+import livekit.org.webrtc.VideoFrame
+import livekit.org.webrtc.VideoSink
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,6 +64,12 @@ interface NativeLiveKitListener {
 
     /** Raised on a LiveKit/transport error. */
     fun onError(t: Throwable)
+
+    /** Raised when the local camera track changes. */
+    fun onLocalVideoTrackChanged(track: LocalVideoTrack?) {}
+
+    /** Raised when the remote camera track changes. */
+    fun onRemoteVideoTrackChanged(track: RemoteVideoTrack?) {}
 }
 
 enum class NewNativeLiveKitState {
@@ -100,6 +117,41 @@ object NativeLiveKit {
     @Volatile
     private var room: Room? = null
 
+    @Volatile
+    private var localVideoTrack: LocalVideoTrack? = null
+
+    @Volatile
+    private var remoteVideoTrack: RemoteVideoTrack? = null
+
+    @Volatile
+    private var localVideoRenderer: VideoSink? = null
+
+    @Volatile
+    private var remoteVideoRenderer: VideoSink? = null
+
+    /**
+     * Keeps the official LocalVideoTrack.addRenderer()/CaptureDispatchObserver
+     * path intact while making frame delivery observable and explicit.
+     */
+    private class ForwardingVideoSink(
+        private val label: String,
+        private val delegate: VideoSink,
+    ) : VideoSink {
+        private val frames = AtomicInteger(0)
+
+        override fun onFrame(frame: VideoFrame) {
+            val count = frames.incrementAndGet()
+            if (count <= 3 || count % 60 == 0) {
+                println(
+                    "[CN CALL][VIDEO FRAME] " + label + " count=" + count +
+                        " size=" + frame.rotatedWidth + "x" + frame.rotatedHeight +
+                        " ts=" + frame.timestampNs,
+                )
+            }
+            delegate.onFrame(frame)
+        }
+    }
+
     private var eventCollectJob: Job? = null
 
     private var listener: NativeLiveKitListener? = null
@@ -116,6 +168,11 @@ object NativeLiveKit {
      * applicationContext; no automatic connection is started here.
      */
     fun initialize(appContext: Context) {
+        // Temporary diagnostic: enable LiveKit + underlying WebRTC logging
+        // before the first Room is created. No media/Surface behavior changes.
+        LiveKit.loggingLevel = LoggingLevel.VERBOSE
+        LiveKit.enableWebRTCLogging = true
+
         synchronized(lock) {
             this.appContext = appContext.applicationContext
         }
@@ -154,11 +211,41 @@ object NativeLiveKit {
 
         scope.launch {
             val newRoom = try {
+                println(
+                    "[CN CALL][VIDEO] publish profile " +
+                        "codec=${VideoCodec.VP9.codecName} bitrate=700000 fps=24 " +
+                        "degradation=MAINTAIN_RESOLUTION simulcast=false",
+                )
                 LiveKit.create(
                     context,
                     RoomOptions(
                         adaptiveStream = false,
                         dynacast = false,
+                        // Two-party Telecom calls use one video layer. The
+                        // previous default Simulcast path could leave the
+                        // remote endpoint on the 160x90 layer (observed as
+                        // 90x160 after rotation). H540 keeps a clear image
+                        // while using far less bandwidth than the H720/30
+                        // default and avoids sending extra simulcast layers.
+                        videoTrackCaptureDefaults = LocalVideoTrackOptions(
+                            position = io.livekit.android.room.track.CameraPosition.FRONT,
+                            captureParams = VideoPreset169.H540.capture,
+                        ),
+                        videoTrackPublishDefaults = VideoTrackPublishDefaults(
+                            // VP9 improves compression efficiency over the
+                            // previous VP8 profile. Keep H540 capture, cap
+                            // the encoder to 700 kbps / 24 FPS, and prefer
+                            // retaining resolution when bandwidth is tight.
+                            videoEncoding = VideoEncoding(
+                                maxBitrate = 700_000,
+                                maxFps = 24,
+                            ),
+                            simulcast = false,
+                            videoCodec = VideoCodec.VP9.codecName,
+                            degradationPreference =
+                                livekit.org.webrtc.RtpParameters.DegradationPreference
+                                    .MAINTAIN_RESOLUTION,
+                        ),
                     ),
                     overrides(),
                 )
@@ -218,6 +305,160 @@ object NativeLiveKit {
             }
         }
         return true
+    }
+
+    /**
+     * Enables/disables the local camera and publishes the camera track.
+     *
+     * Camera permission is intentionally checked by Android before this call;
+     * LiveKit owns camera capture and publication after Telecom requests video.
+     */
+    fun setCameraEnabled(
+        enabled: Boolean,
+        onComplete: ((Throwable?) -> Unit)? = null,
+    ) {
+        val target = room
+        val attempt = generation
+
+        if (target == null || state != NewNativeLiveKitState.CONNECTED) {
+            onComplete?.invoke(
+                IllegalStateException("LiveKit room is not connected"),
+            )
+            return
+        }
+
+        scope.launch {
+            if (attempt != generation ||
+                state != NewNativeLiveKitState.CONNECTED
+            ) {
+                onComplete?.invoke(
+                    IllegalStateException("LiveKit call became stale"),
+                )
+                return@launch
+            }
+
+            try {
+                target.localParticipant.setCameraEnabled(enabled)
+
+                if (attempt != generation ||
+                    state != NewNativeLiveKitState.CONNECTED
+                ) {
+                    onComplete?.invoke(
+                        IllegalStateException("LiveKit call became stale"),
+                    )
+                    return@launch
+                }
+
+                val publication =
+                    target.localParticipant.getTrackPublication(
+                        Track.Source.CAMERA,
+                    )
+                val track =
+                    publication?.track as? LocalVideoTrack
+                if (enabled && track == null) {
+                    throw IllegalStateException(
+                        "LiveKit camera track was not published",
+                    )
+                }
+
+                updateLocalVideoTrack(if (enabled) track else null)
+                onComplete?.invoke(null)
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                onComplete?.invoke(t)
+            }
+        }
+    }
+
+    /**
+     * Returns the EGL context owned by the current LiveKit Room.
+     * LiveKit's own Room.initVideoRenderer() uses this same context when
+     * initializing video renderers; sharing it keeps camera/decoder textures
+     * in the same EGL context as the output renderer.
+     */
+    fun getVideoEglBaseContext(): livekit.org.webrtc.EglBase.Context? {
+        val target = room ?: return null
+        return try {
+            target.lkObjects.eglBase.eglBaseContext
+        } catch (error: Throwable) {
+            println(
+                "[CN CALL][VIDEO] shared EGL context unavailable " +
+                    "error=\${error.message}",
+            )
+            null
+        }
+    }
+    fun setLocalVideoRenderer(renderer: VideoSink?) {
+        val oldTrack: LocalVideoTrack?
+        val oldRenderer: VideoSink?
+        val attachedRenderer = renderer?.let { ForwardingVideoSink("LOCAL", it) }
+        val newTrack: LocalVideoTrack?
+        synchronized(lock) {
+            oldTrack = localVideoTrack
+            oldRenderer = localVideoRenderer
+            localVideoRenderer = attachedRenderer
+            newTrack = localVideoTrack
+        }
+        println(
+            "[CN CALL][VIDEO RENDERER] local changed " +
+                "renderer_present=" + (renderer != null) +
+                " track_present=" + (newTrack != null),
+        )
+        if (oldTrack != null && oldRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] local removeRenderer")
+            oldTrack.removeRenderer(oldRenderer)
+        }
+        if (newTrack != null && attachedRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] local addRenderer")
+            newTrack.addRenderer(attachedRenderer)
+        }
+    }
+
+    fun setRemoteVideoRenderer(renderer: VideoSink?) {
+        val oldTrack: RemoteVideoTrack?
+        val oldRenderer: VideoSink?
+        val attachedRenderer = renderer?.let { ForwardingVideoSink("REMOTE", it) }
+        val newTrack: RemoteVideoTrack?
+        synchronized(lock) {
+            oldTrack = remoteVideoTrack
+            oldRenderer = remoteVideoRenderer
+            remoteVideoRenderer = attachedRenderer
+            newTrack = remoteVideoTrack
+        }
+        println(
+            "[CN CALL][VIDEO RENDERER] remote changed " +
+                "renderer_present=" + (renderer != null) +
+                " track_present=" + (newTrack != null),
+        )
+        if (oldTrack != null && oldRenderer != null) {
+            oldTrack.removeRenderer(oldRenderer)
+        }
+        if (newTrack != null && attachedRenderer != null) {
+            println("[CN CALL][VIDEO RENDERER] remote addRenderer")
+            newTrack.addRenderer(attachedRenderer)
+        }
+    }
+
+    fun switchCamera(
+        cameraId: String,
+        onComplete: ((Throwable?) -> Unit)? = null,
+    ) {
+        val track = localVideoTrack
+        if (track == null || cameraId.isBlank()) {
+            onComplete?.invoke(
+                IllegalStateException("Local camera track is not active"),
+            )
+            return
+        }
+        scope.launch {
+            try {
+                track.setDeviceId(cameraId)
+                onComplete?.invoke(null)
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                onComplete?.invoke(t)
+            }
+        }
     }
 
     /**
@@ -430,7 +671,70 @@ object NativeLiveKit {
         }
     }
 
+    private fun clearVideoTracks() {
+        val localTrack: LocalVideoTrack?
+        val remoteTrack: RemoteVideoTrack?
+        val localRenderer: VideoSink?
+        val remoteRenderer: VideoSink?
+        synchronized(lock) {
+            localTrack = localVideoTrack
+            remoteTrack = remoteVideoTrack
+            localRenderer = localVideoRenderer
+            remoteRenderer = remoteVideoRenderer
+            localVideoTrack = null
+            remoteVideoTrack = null
+        }
+        if (localTrack != null && localRenderer != null) {
+            localTrack.removeRenderer(localRenderer)
+        }
+        if (remoteTrack != null && remoteRenderer != null) {
+            remoteTrack.removeRenderer(remoteRenderer)
+        }
+    }
+
+    private fun updateLocalVideoTrack(track: LocalVideoTrack?) {
+        val oldTrack: LocalVideoTrack?
+        val renderer: VideoSink?
+        synchronized(lock) {
+            oldTrack = localVideoTrack
+            localVideoTrack = track
+            renderer = localVideoRenderer
+        }
+        println(
+            "[CN CALL][VIDEO TRACK] local changed " +
+                "track_present=" + (track != null) +
+                " renderer_present=" + (renderer != null),
+        )
+        if (oldTrack != null && renderer != null) {
+            println("[CN CALL][VIDEO TRACK] local removeRenderer")
+            oldTrack.removeRenderer(renderer)
+        }
+        if (track != null && renderer != null) {
+            println("[CN CALL][VIDEO TRACK] local addRenderer")
+            track.addRenderer(renderer)
+        }
+        listener?.onLocalVideoTrackChanged(track)
+    }
+
+    private fun updateRemoteVideoTrack(track: RemoteVideoTrack?) {
+        val oldTrack: RemoteVideoTrack?
+        val renderer: VideoSink?
+        synchronized(lock) {
+            oldTrack = remoteVideoTrack
+            remoteVideoTrack = track
+            renderer = remoteVideoRenderer
+        }
+        if (oldTrack != null && oldTrack !== track && renderer != null) {
+            oldTrack.removeRenderer(renderer)
+        }
+        if (track != null && renderer != null) {
+            track.addRenderer(renderer)
+        }
+        listener?.onRemoteVideoTrackChanged(track)
+    }
+
     private fun tearDownLocked() {
+        clearVideoTracks()
         eventCollectJob?.cancel()
         eventCollectJob = null
         val old = room
@@ -456,15 +760,36 @@ object NativeLiveKit {
                     if (attempt != generation) {
                         return@collect
                     }
-                    if (event is RoomEvent.Disconnected) {
-                        // Only the disconnect edge is needed to keep the
-                        // transport state in sync. FailedToConnect/Connected/
-                        // Reconnecting/Reconnected and participant/track
-                        // events are deliberately ignored here.
-                        if (state != NewNativeLiveKitState.DISCONNECTED) {
-                            state = NewNativeLiveKitState.DISCONNECTED
-                            notifyDisconnected()
+                    when (event) {
+                        is RoomEvent.TrackSubscribed -> {
+                            val track = event.track as? RemoteVideoTrack
+                            if (track != null &&
+                                event.publication.source == Track.Source.CAMERA
+                            ) {
+                                updateRemoteVideoTrack(track)
+                            }
                         }
+
+                        is RoomEvent.TrackUnsubscribed -> {
+                            val track = event.track as? RemoteVideoTrack
+                            if (track != null && track === remoteVideoTrack) {
+                                updateRemoteVideoTrack(null)
+                            }
+                        }
+
+                        is RoomEvent.Disconnected -> {
+                            // Only the disconnect edge is needed to keep the
+                            // transport state in sync. FailedToConnect/Connected/
+                            // Reconnecting/Reconnected and unrelated track
+                            // events do not change call state.
+                            clearVideoTracks()
+                            if (state != NewNativeLiveKitState.DISCONNECTED) {
+                                state = NewNativeLiveKitState.DISCONNECTED
+                                notifyDisconnected()
+                            }
+                        }
+
+                        else -> {}
                     }
                 }
             } catch (t: CancellationException) {
