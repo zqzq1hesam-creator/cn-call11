@@ -63,7 +63,7 @@ interface NativeWebSocketListener {
  * is invoked. Inactive in the current phase unless an external caller drives it.
  */
 object NativeWebSocketClient {
-    private const val WS_HOST = "cn-call11-production-79ea.up.railway.app"
+    private const val WS_HOST = "cn-call11.zqzq1hesam-cncall.workers.dev"
     private const val WS_SCHEME = "wss"
     private const val RECONNECT_DELAY_MAX_SHIFT = 5
     private const val CLOSE_NORMAL = 1000
