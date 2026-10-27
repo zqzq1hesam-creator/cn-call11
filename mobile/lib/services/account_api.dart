@@ -10,6 +10,31 @@ class AccountApi {
     return Uri.parse('${ServerConfig.httpUrl}$path');
   }
 
+  static Map<String, dynamic> _decodeResponse(
+    http.Response response, {
+    required String action,
+  }) {
+    try {
+      final data = jsonDecode(response.body);
+      if (data is Map) {
+        return Map<String, dynamic>.from(data);
+      }
+      return {
+        'success': false,
+        'message': 'استجابة غير صالحة من السيرفر (HTTP ${response.statusCode})',
+      };
+    } on FormatException {
+      final compact = response.body.replaceAll(RegExp(r'\\s+'), ' ').trim();
+      final preview = compact.length > 120
+          ? '${compact.substring(0, 120)}…'
+          : compact;
+      return {
+        'success': false,
+        'message': 'رد غير JSON من السيرفر عند $action (HTTP ${response.statusCode}): $preview',
+      };
+    }
+  }
+
   static Map<String, String> _headers() {
     final token = CallSession.instance.accessToken;
     return {
@@ -34,21 +59,7 @@ class AccountApi {
         }),
       ).timeout(const Duration(seconds: 15));
 
-      final data = jsonDecode(response.body);
-
-      if (data is Map) {
-        return Map<String, dynamic>.from(data);
-      }
-
-      return {
-        'success': false,
-        'message': 'استجابة غير صالحة من السيرفر',
-      };
-    } on FormatException catch (e) {
-      return {
-        'success': false,
-        'message': 'وصل رد غير صالح من السيرفر عند تسجيل الدخول: ${e.message}',
-      };
+      return _decodeResponse(response, action: 'تسجيل الدخول');
     } catch (e) {
       return {
         'success': false,
@@ -75,21 +86,7 @@ class AccountApi {
         }),
       ).timeout(const Duration(seconds: 15));
 
-      final data = jsonDecode(response.body);
-
-      if (data is Map) {
-        return Map<String, dynamic>.from(data);
-      }
-
-      return {
-        'success': false,
-        'message': 'استجابة غير صالحة من السيرفر',
-      };
-    } on FormatException catch (e) {
-      return {
-        'success': false,
-        'message': 'وصل رد غير صالح من السيرفر عند إنشاء الحساب: ${e.message}',
-      };
+      return _decodeResponse(response, action: 'إنشاء الحساب');
     } catch (e) {
       return {
         'success': false,
