@@ -35,5 +35,8 @@ jobs:
       - name: Resolve Cloudflare Worker dependencies
         run: uv sync
 
-      - name: Build the real CN CALL Worker bundle without deploying
+      - name: Compile application Python
+        run: python -m compileall -q cloudflare server/main.py
+
+      - name: Build the CN CALL Worker bundle without deploying
         run: uv run pywrangler deploy --dry-run

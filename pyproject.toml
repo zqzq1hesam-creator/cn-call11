@@ -1,13 +1,11 @@
 [project]
 name = "cn-call11-cloudflare"
 version = "1.0.0"
-description = "CN CALL production Cloudflare Workers entry point"
+description = "CN CALL backend for Cloudflare Workers"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi",
-    "firebase-admin==7.5.0",
-    "livekit-api",
-    "psycopg",
+    "pg8000>=1.31.4,<2",
 ]
 
 [dependency-groups]

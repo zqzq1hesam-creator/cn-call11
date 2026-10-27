@@ -1,9 +1,9 @@
-# Railway deploy marker: keep runtime behavior unchanged; force GitHub source refresh.
+# CN CALL Cloudflare Workers backend.
 from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from pathlib import Path
+import base64
 import hashlib
 import asyncio
 import hmac
@@ -11,17 +11,11 @@ import json
 import os
 import re
 import secrets
-import sqlite3
 import time
-import psycopg
-from psycopg.rows import dict_row
-import shutil
+import pg8000.dbapi
 import uuid
 from datetime import datetime, timedelta, timezone
 
-import firebase_admin
-from firebase_admin import credentials, messaging
-from livekit import api
 
 
 app = FastAPI(title="CN CALL Server")
@@ -48,31 +42,66 @@ async def migration_maintenance_middleware(request, call_next):
     return await call_next(request)
 
 
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-CN_CALL_PLATFORM = os.getenv("CN_CALL_PLATFORM", "").strip().lower()
+CN_CALL_PLATFORM = "cloudflare"
+
+CN_CALL_DB_HOST = os.getenv("CN_CALL_DB_HOST", "").strip()
+CN_CALL_DB_PORT = int(os.getenv("CN_CALL_DB_PORT", "5432").strip() or "5432")
+CN_CALL_DB_NAME = os.getenv("CN_CALL_DB_NAME", "").strip()
+CN_CALL_DB_USER = os.getenv("CN_CALL_DB_USER", "").strip()
+CN_CALL_DB_PASSWORD = os.getenv("CN_CALL_DB_PASSWORD", "")
+CN_CALL_DB_SSL = os.getenv("CN_CALL_DB_SSL", "true").strip().lower() not in {"0", "false", "no"}
+
+try:
+    FCM_SERVICE_ACCOUNT = json.loads(os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON", "{}"))
+except (TypeError, ValueError):
+    FCM_SERVICE_ACCOUNT = {}
+
+CN_CALL_DB_CONFIGURED = all((
+    CN_CALL_DB_HOST,
+    CN_CALL_DB_NAME,
+    CN_CALL_DB_USER,
+    CN_CALL_DB_PASSWORD,
+))
+CN_CALL_FCM_CONFIGURED = all((
+    FCM_SERVICE_ACCOUNT.get("project_id"),
+    FCM_SERVICE_ACCOUNT.get("client_email"),
+    FCM_SERVICE_ACCOUNT.get("private_key"),
+))
+CN_CALL_LIVEKIT_CONFIGURED = all((
+    os.getenv("LIVEKIT_URL", "").strip(),
+    os.getenv("LIVEKIT_API_KEY", "").strip(),
+    os.getenv("LIVEKIT_API_SECRET", "").strip(),
+))
+
+CN_CALL_CONFIGURATION_MISSING = []
+if not CN_CALL_DB_CONFIGURED:
+    CN_CALL_CONFIGURATION_MISSING.extend([
+        name for name, value in (
+            ("CN_CALL_DB_HOST", CN_CALL_DB_HOST),
+            ("CN_CALL_DB_NAME", CN_CALL_DB_NAME),
+            ("CN_CALL_DB_USER", CN_CALL_DB_USER),
+            ("CN_CALL_DB_PASSWORD", CN_CALL_DB_PASSWORD),
+        ) if not value
+    ])
+if not CN_CALL_FCM_CONFIGURED:
+    CN_CALL_CONFIGURATION_MISSING.append("FIREBASE_SERVICE_ACCOUNT_JSON")
+if not CN_CALL_LIVEKIT_CONFIGURED:
+    CN_CALL_CONFIGURATION_MISSING.extend([
+        name for name, value in (
+            ("LIVEKIT_URL", os.getenv("LIVEKIT_URL", "").strip()),
+            ("LIVEKIT_API_KEY", os.getenv("LIVEKIT_API_KEY", "").strip()),
+            ("LIVEKIT_API_SECRET", os.getenv("LIVEKIT_API_SECRET", "").strip()),
+        ) if not value
+    ])
+
 CN_CALL_MIGRATION_MODE = (
     os.getenv("CN_CALL_MIGRATION_MODE", "").strip().lower() in {"1", "true", "yes"}
-    or (CN_CALL_PLATFORM == "cloudflare" and not DATABASE_URL)
+    or bool(CN_CALL_CONFIGURATION_MISSING)
 )
-VOLUME_DIR = Path("/app/data")
-DB_PATH = VOLUME_DIR / "cn_call.db"
-LEGACY_DB_PATH = BASE_DIR / "cn_call.db"
-
-# Railway retains its existing SQLite/Volume fallback. Cloudflare Workers do
-# not provide a persistent local disk, so they must not create a local SQLite
-# database when DATABASE_URL is absent. In that situation the Worker fails
-# closed in maintenance mode until a persistent database is configured.
-if not DATABASE_URL and CN_CALL_PLATFORM == "cloudflare":
-    print("[CN CALL][DB] Cloudflare has no DATABASE_URL; maintenance mode enabled")
-elif not DATABASE_URL:
-    VOLUME_DIR.mkdir(parents=True, exist_ok=True)
-
-    if not DB_PATH.exists() and LEGACY_DB_PATH.exists():
-        shutil.copy2(LEGACY_DB_PATH, DB_PATH)
-        print("[CN CALL][DB] Legacy database migrated to Railway Volume")
+if CN_CALL_MIGRATION_MODE:
+    print("[CN CALL][CONFIG] Maintenance mode: required Cloudflare secrets are not all configured")
 else:
-    print("[CN CALL][DB] PostgreSQL backend selected via DATABASE_URL")
+    print("[CN CALL][CONFIG] Required Cloudflare database and media credentials are present")
 
 
 connections: dict[str, WebSocket] = {}
@@ -425,9 +454,6 @@ def transition_call_state(
 
     db = get_db()
     try:
-        if not db.is_postgres:
-            db.execute("BEGIN")
-
         row = db.execute(
             """
             SELECT status,
@@ -1217,64 +1243,84 @@ async def stop_call_expiry_loop():
 
 FCM_TOKENS: dict[str, str] = {}
 
-firebase_key = BASE_DIR / "secrets" / "firebase-service-account.json"
-firebase_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-
-if not firebase_admin._apps:
-    if firebase_json:
-        cred = credentials.Certificate(
-            __import__("json").loads(firebase_json)
-        )
-        firebase_admin.initialize_app(cred)
-    elif firebase_key.exists():
-        cred = credentials.Certificate(str(firebase_key))
-        firebase_admin.initialize_app(cred)
-
-
 
 # ============================================================
 # DATABASE
 # ============================================================
 
+class DictCursor:
+    """Adapt pg8000 tuple rows to the dictionary rows expected by CN CALL."""
+
+    def __init__(self, cursor):
+        self._cursor = cursor
+
+    @property
+    def rowcount(self):
+        return self._cursor.rowcount
+
+    def _mapping(self, row):
+        if row is None:
+            return None
+        columns = self._cursor.description or ()
+        return {column[0]: row[index] for index, column in enumerate(columns)}
+
+    def fetchone(self):
+        return self._mapping(self._cursor.fetchone())
+
+    def fetchall(self):
+        return [self._mapping(row) for row in self._cursor.fetchall()]
+
+    def __iter__(self):
+        for row in self._cursor:
+            yield self._mapping(row)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
 class DatabaseHandle:
-    """Small compatibility wrapper for PostgreSQL and temporary SQLite fallback."""
+    """PostgreSQL-only connection adapter for Cloudflare Workers + pg8000."""
+
+    is_postgres = True
 
     def __init__(self):
-        self.is_postgres = bool(DATABASE_URL)
-
-        if self.is_postgres:
-            self._db = psycopg.connect(
-                DATABASE_URL,
-                row_factory=dict_row,
-                connect_timeout=10,
-            )
-        else:
-            self._db = sqlite3.connect(DB_PATH)
-            self._db.row_factory = sqlite3.Row
+        if not CN_CALL_DB_CONFIGURED:
+            raise RuntimeError("CN CALL PostgreSQL is not configured")
+        self._db = pg8000.dbapi.connect(
+            user=CN_CALL_DB_USER,
+            password=CN_CALL_DB_PASSWORD,
+            host=CN_CALL_DB_HOST,
+            port=CN_CALL_DB_PORT,
+            database=CN_CALL_DB_NAME,
+            ssl_context=CN_CALL_DB_SSL,
+            timeout=10,
+        )
 
     def execute(self, sql, params=None):
-        if self.is_postgres:
-            sql = sql.replace("?", "%s")
+        # Keep existing query call sites stable while using pg8000's DB-API.
+        sql = sql.replace("?", "%s")
+        sql = re.sub(
+            r"\bCURRENT_TIMESTAMP\b",
+            "CURRENT_TIMESTAMP::text",
+            sql,
+        )
+        if re.match(
+            r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
+            sql,
+            flags=re.IGNORECASE,
+        ):
             sql = re.sub(
-                r"\bCURRENT_TIMESTAMP\b",
-                "CURRENT_TIMESTAMP::text",
-                sql,
-            )
-            if re.match(
                 r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
+                "INSERT INTO",
                 sql,
+                count=1,
                 flags=re.IGNORECASE,
-            ):
-                sql = re.sub(
-                    r"^\s*INSERT\s+OR\s+IGNORE\s+INTO\b",
-                    "INSERT INTO",
-                    sql,
-                    count=1,
-                    flags=re.IGNORECASE,
-                ).rstrip()
-                sql += "\nON CONFLICT DO NOTHING"
+            ).rstrip()
+            sql += "\nON CONFLICT DO NOTHING"
 
-        return self._db.execute(sql, params or ())
+        cursor = self._db.cursor()
+        cursor.execute(sql, params or ())
+        return DictCursor(cursor)
 
     def commit(self):
         self._db.commit()
@@ -1485,68 +1531,22 @@ def init_db():
         """
     )
 
-    # Safe migration for pre-existing schemas.
-    # PostgreSQL supports ADD COLUMN IF NOT EXISTS, so each check is
-    # idempotent and cannot abort the whole transaction when the column
-    # already exists. SQLite keeps the legacy try/except path because its
-    # ALTER TABLE syntax differs.
-    if db.is_postgres:
-        for statement in (
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS video_state INTEGER NOT NULL DEFAULT 0",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS negotiation_expires_at INTEGER",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed_at BIGINT",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_deadline_at BIGINT",
-            "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS reachability_proven_at BIGINT",
-            "ALTER TABLE call_records ALTER COLUMN delivery_confirmed_at TYPE BIGINT",
-            "ALTER TABLE call_records ALTER COLUMN delivery_deadline_at TYPE BIGINT",
-            "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
-            "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
-        ):
-            db.execute(statement)
-    else:
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN video_state INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN negotiation_expires_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN connection_expires_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN state_version INTEGER NOT NULL DEFAULT 1")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN media_ready_users TEXT NOT NULL DEFAULT '[]'")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN delivery_confirmed_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN delivery_deadline_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE call_records ADD COLUMN reachability_proven_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE durable_terminal_events ADD COLUMN last_attempt_at INTEGER")
-        except Exception:
-            pass
-        try:
-            db.execute("ALTER TABLE durable_terminal_events ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0")
-        except Exception:
-            pass
+    # Idempotent PostgreSQL schema upgrades.
+    for statement in (
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS video_state INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS negotiation_expires_at INTEGER",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS connection_expires_at INTEGER",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS state_version INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS media_ready_users TEXT NOT NULL DEFAULT '[]'",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_confirmed_at BIGINT",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS delivery_deadline_at BIGINT",
+        "ALTER TABLE call_records ADD COLUMN IF NOT EXISTS reachability_proven_at BIGINT",
+        "ALTER TABLE call_records ALTER COLUMN delivery_confirmed_at TYPE BIGINT",
+        "ALTER TABLE call_records ALTER COLUMN delivery_deadline_at TYPE BIGINT",
+        "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS last_attempt_at INTEGER",
+        "ALTER TABLE durable_terminal_events ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
+    ):
+        db.execute(statement)
 
     # Commit the schema first. The cleanup opens its own connection, so it
     # must not run while the current schema transaction is still uncommitted.
@@ -1573,10 +1573,10 @@ def init_db():
         db.close()
 
 
-if not (CN_CALL_PLATFORM == "cloudflare" and not DATABASE_URL):
+if not CN_CALL_MIGRATION_MODE:
     init_db()
 else:
-    print("[CN CALL][DB] Skipped local schema initialization on Cloudflare")
+    print("[CN CALL][DB] Schema initialization deferred until Cloudflare database/secrets are configured")
 
 
 def rebuild_active_calls_from_db():
@@ -1783,8 +1783,9 @@ def load_access_tokens():
         user_access_tokens[row["user_id"]] = row["token"]
 
 
-load_fcm_tokens()
-load_access_tokens()
+if not CN_CALL_MIGRATION_MODE:
+    load_fcm_tokens()
+    load_access_tokens()
 
 
 # ============================================================
@@ -2048,7 +2049,9 @@ def fcm_debug(authorization: str | None = Header(default=None)):
 @app.get("/health")
 async def health():
     return {
-        "status": "ok",
+        "status": "maintenance" if CN_CALL_MIGRATION_MODE else "ok",
+        "ready": not CN_CALL_MIGRATION_MODE,
+        "missing_configuration": CN_CALL_CONFIGURATION_MISSING,
         "users": len(connections),
     }
 
@@ -2361,127 +2364,6 @@ def remove_fcm_token_if_matches(user_id: str, token: str, reason: str) -> bool:
     return removed
 
 
-def send_call_notification(
-    target_id: str,
-    caller_id: str,
-    caller_name: str,
-    call_id: str,
-    message_type: str = "incoming_call",
-    event_id: str | None = None,
-    video_state: int | None = None,
-    reachability_challenge_id: str | None = None,
-    reachability_nonce: str | None = None,
-    reason: str | None = None,
-) -> bool:
-    token = FCM_TOKENS.get(target_id)
-
-    print("FCM TARGET:", target_id)
-    print("FCM TOKEN FOUND:", bool(token))
-
-    if not token:
-        db = get_db()
-        row = db.execute(
-            "SELECT token FROM fcm_tokens WHERE user_id = ?",
-            (target_id,),
-        ).fetchone()
-        db.close()
-
-        if row:
-            token = row["token"]
-            FCM_TOKENS[target_id] = token
-
-    if not token:
-        print(
-            "[CN CALL][FCM FAILED] "
-            f"call_id={call_id} target={target_id} reason=no_token"
-        )
-        return False
-
-    if not firebase_admin._apps:
-        print(
-            "[CN CALL][FCM FAILED] "
-            f"call_id={call_id} target={target_id} reason=firebase_unavailable"
-        )
-        return False
-
-    try:
-        message = messaging.Message(
-            token=token,
-            data={
-                "type": message_type,
-                "call_id": call_id,
-                "caller_id": caller_id,
-                "caller_name": caller_name,
-                "target_id": target_id,
-                **(
-                    {"event_id": event_id}
-                    if event_id
-                    else {}
-                ),
-                **(
-                    {"reason": reason.strip()}
-                    if reason and reason.strip()
-                    else {}
-                ),
-                **(
-                    {
-                        "reachability_challenge_id": reachability_challenge_id,
-                        "reachability_nonce": reachability_nonce,
-                    }
-                    if message_type == "incoming_call"
-                    and reachability_challenge_id
-                    and reachability_nonce
-                    else {}
-                ),
-                **(
-                    {
-                        "video_state": str(video_state),
-                    }
-                    if message_type == "incoming_call" and video_state is not None
-                    else {}
-                ),
-            },
-            android=messaging.AndroidConfig(
-                priority="high",
-                collapse_key=(
-                    f"missed-call-{call_id}"
-                    if message_type == "missed_call"
-                    else f"call-{call_id}"
-                ),
-                ttl=timedelta(
-                    seconds=(28 * 24 * 60 * 60)
-                    if message_type == "missed_call"
-                    else 95
-                ),
-            ),
-        )
-
-        response = messaging.send(message)
-        print('FCM SENT:', response)
-        return True
-
-    except messaging.UnregisteredError:
-        # Firebase confirms that this registration is no longer valid.
-        # Delete it only if it is still the token currently owned by target_id.
-        remove_fcm_token_if_matches(
-            target_id,
-            token,
-            "unregistered",
-        )
-        print(
-            "[CN CALL][FCM FAILED] "
-            f"call_id={call_id} target={target_id} reason=unregistered"
-        )
-        return False
-    except Exception as e:
-        print(f"FCM send error: {e}")
-        print(
-            "[CN CALL][FCM FAILED] "
-            f"call_id={call_id} target={target_id} error={e}"
-        )
-        return False
-
-
 async def send_call_notification_async(
     *,
     target_id: str,
@@ -2495,20 +2377,79 @@ async def send_call_notification_async(
     reachability_nonce: str | None = None,
     reason: str | None = None,
 ) -> bool:
-    """Run the blocking Firebase Admin SDK send outside FastAPI's event loop."""
-    return await asyncio.to_thread(
-        send_call_notification,
-        target_id=target_id,
-        caller_id=caller_id,
-        caller_name=caller_name,
-        call_id=call_id,
-        message_type=message_type,
-        event_id=event_id,
-        video_state=video_state,
-        reachability_challenge_id=reachability_challenge_id,
-        reachability_nonce=reachability_nonce,
-        reason=reason,
-    )
+    """Send FCM through Google's HTTP v1 API; no Firebase Admin/gRPC SDK."""
+
+    token = FCM_TOKENS.get(target_id)
+    if not token:
+        db = get_db()
+        try:
+            row = db.execute(
+                "SELECT token FROM fcm_tokens WHERE user_id = ?",
+                (target_id,),
+            ).fetchone()
+        finally:
+            db.close()
+        if row:
+            token = str(row["token"])
+            FCM_TOKENS[target_id] = token
+
+    if not token:
+        print(f"[CN CALL][FCM FAILED] call_id={call_id} reason=no_token")
+        return False
+
+    if not CN_CALL_FCM_CONFIGURED:
+        print(f"[CN CALL][FCM FAILED] call_id={call_id} reason=service_account_unavailable")
+        return False
+
+    data = {
+        "type": message_type,
+        "call_id": call_id,
+        "caller_id": caller_id,
+        "caller_name": caller_name,
+        "target_id": target_id,
+    }
+    if event_id:
+        data["event_id"] = event_id
+    if reason and reason.strip():
+        data["reason"] = reason.strip()
+    if (
+        message_type == "incoming_call"
+        and reachability_challenge_id
+        and reachability_nonce
+    ):
+        data["reachability_challenge_id"] = reachability_challenge_id
+        data["reachability_nonce"] = reachability_nonce
+    if message_type == "incoming_call" and video_state is not None:
+        data["video_state"] = str(video_state)
+
+    try:
+        from cloudflare.fcm_rest import send_fcm_v1
+
+        sent, unregistered, detail = await send_fcm_v1(
+            service_account=FCM_SERVICE_ACCOUNT,
+            registration_token=token,
+            data=data,
+            collapse_key=(
+                f"missed-call-{call_id}"
+                if message_type == "missed_call"
+                else f"call-{call_id}"
+            ),
+            ttl_seconds=(
+                28 * 24 * 60 * 60
+                if message_type == "missed_call"
+                else 95
+            ),
+        )
+        if unregistered:
+            remove_fcm_token_if_matches(target_id, token, "unregistered")
+        if not sent:
+            print(f"[CN CALL][FCM FAILED] call_id={call_id} reason={detail}")
+            return False
+        print(f"[CN CALL][FCM SENT] call_id={call_id} type={message_type}")
+        return True
+    except Exception as exc:
+        print(f"[CN CALL][FCM REST ERROR] call_id={call_id} error={exc}")
+        return False
 
 
 # ============================================================
@@ -2552,44 +2493,55 @@ async def get_turn_credentials(
     }
 
 
-@app.get("/livekit/token")
-def _generate_livekit_token_for_user(user_id: str, call_id: str) -> dict[str, str] | None:
-    """Generates LiveKit join credentials for a given participant with 10-min TTL.
+def _base64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
-    Secrets and tokens are never logged. Returns dict with url, token, room or
-    None if LiveKit is unconfigured.
-    """
-    livekit_url = os.getenv("LIVEKIT_URL")
-    livekit_key = os.getenv("LIVEKIT_API_KEY")
-    livekit_secret = os.getenv("LIVEKIT_API_SECRET")
+
+def _generate_livekit_token_for_user(user_id: str, call_id: str) -> dict[str, str] | None:
+    """Create LiveKit's HS256 access JWT without importing the LiveKit SDK."""
+
+    livekit_url = os.getenv("LIVEKIT_URL", "").strip()
+    livekit_key = os.getenv("LIVEKIT_API_KEY", "").strip()
+    livekit_secret = os.getenv("LIVEKIT_API_SECRET", "")
 
     if not livekit_url or not livekit_key or not livekit_secret:
         return None
 
     room_name = f"call-{call_id}"
-
-    jwt = (
-        api.AccessToken(
-            livekit_key,
-            livekit_secret,
-        )
-        .with_identity(user_id)
-        .with_ttl(timedelta(minutes=10))
-        .with_grants(
-            api.VideoGrants(
-                room_join=True,
-                room=room_name,
-            )
-        )
+    now = int(time.time())
+    header = {"alg": "HS256", "typ": "JWT"}
+    claims = {
+        "iss": livekit_key,
+        "sub": user_id,
+        "nbf": now,
+        "iat": now,
+        "exp": now + 600,
+        "video": {
+            "roomJoin": True,
+            "room": room_name,
+            "canPublish": True,
+            "canSubscribe": True,
+            "canPublishData": True,
+        },
+    }
+    signing_input = (
+        _base64url(json.dumps(header, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+        + "."
+        + _base64url(json.dumps(claims, separators=(",", ":"), sort_keys=True).encode("utf-8"))
     )
-
+    signature = hmac.new(
+        livekit_secret.encode("utf-8"),
+        signing_input.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
     return {
         "url": livekit_url,
-        "token": jwt.to_jwt(),
+        "token": signing_input + "." + _base64url(signature),
         "room": room_name,
     }
 
 
+@app.get("/livekit/token")
 def livekit_token(
     user_id: str,
     call_id: str,
@@ -2981,7 +2933,7 @@ async def websocket_endpoint(
                         and previous_record.get("status") == "ringing"
                         and target_id not in connections
                     ):
-                        send_call_notification(
+                        await send_call_notification_async(
                             target_id=target_id,
                             caller_id=str(previous_record["caller_id"]),
                             caller_name=str(

@@ -1,10 +1,4 @@
-"""Cloudflare entry point for CN CALL.
-
-All HTTP and WebSocket requests are routed through one Durable Object so the
-existing in-memory signaling state is coordinated by a single authoritative
-instance. If persistent database configuration is absent, the app stays in
-maintenance mode rather than writing to non-persistent local disk.
-"""
+"""Cloudflare entry point for the production CN CALL backend."""
 import os
 
 from workers import DurableObject, WorkerEntrypoint, asgi, env
@@ -23,7 +17,12 @@ def _copy_binding_to_environment(name: str) -> None:
 
 
 for _setting in (
-    "DATABASE_URL",
+    "CN_CALL_DB_HOST",
+    "CN_CALL_DB_PORT",
+    "CN_CALL_DB_NAME",
+    "CN_CALL_DB_USER",
+    "CN_CALL_DB_PASSWORD",
+    "CN_CALL_DB_SSL",
     "FIREBASE_SERVICE_ACCOUNT_JSON",
     "LIVEKIT_URL",
     "LIVEKIT_API_KEY",
@@ -36,18 +35,14 @@ for _setting in (
     _copy_binding_to_environment(_setting)
 
 os.environ["CN_CALL_PLATFORM"] = "cloudflare"
-if not os.environ.get("DATABASE_URL", "").strip():
-    os.environ["CN_CALL_MIGRATION_MODE"] = "true"
-else:
-    os.environ.setdefault("CN_CALL_MIGRATION_MODE", "false")
 
-# Import only after Cloudflare bindings have been copied into os.environ;
-# server/main.py reads these settings during module initialization.
+# Import after copying bindings because server.main reads its configuration at
+# import time. Missing database/Firebase/LiveKit values cause safe maintenance.
 from server.main import app  # noqa: E402
 
 
 class CNCallHub(DurableObject):
-    """Single coordinator for CN CALL HTTP and WebSocket signaling."""
+    """One authoritative signaling coordinator for the CN CALL service."""
 
     def __init__(self, ctx, env):
         super().__init__(ctx, env)
