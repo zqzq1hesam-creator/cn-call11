@@ -2038,10 +2038,16 @@ class FcmTokenRequest(BaseModel):
     token: str
 
 
-def lookup_access_token(token: str) -> str | None:
+def _auth_token_fingerprint(token: str) -> str:
+    # Non-reversible diagnostic marker only; never log an access token itself.
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()[:12]
+
+
+def lookup_access_token(token: str, source: str = "unknown") -> str | None:
     """Validate a session against PostgreSQL, not an isolate-local cache."""
     token = str(token).strip()
     if not token:
+        print("[CN CALL][AUTH FAIL] source=", source, "reason=empty_token")
         return None
 
     db = get_db()
@@ -2059,10 +2065,17 @@ def lookup_access_token(token: str) -> str | None:
         cached_user = access_tokens.pop(token, None)
         if cached_user is not None and user_access_tokens.get(cached_user) == token:
             user_access_tokens.pop(cached_user, None)
+        print(
+            "[CN CALL][AUTH FAIL] source=", source,
+            "reason=token_not_in_database",
+            "token_length=", len(token),
+            "token_fp=", _auth_token_fingerprint(token),
+        )
         return None
 
     user_id = str(row["user_id"]).strip()
     if not user_id:
+        print("[CN CALL][AUTH FAIL] source=", source, "reason=empty_user_id")
         return None
 
     old_token = user_access_tokens.get(user_id)
@@ -2073,12 +2086,27 @@ def lookup_access_token(token: str) -> str | None:
     return user_id
 
 
-def authenticated_user(authorization: str | None) -> str | None:
+def authenticated_user(
+    authorization: str | None,
+    source: str = "http",
+) -> str | None:
     if not authorization or not authorization.startswith("Bearer "):
+        print(
+            "[CN CALL][AUTH FAIL] source=", source,
+            "reason=missing_or_invalid_bearer_header",
+            "authorization_present=", bool(authorization),
+        )
         return None
 
     token = authorization[7:].strip()
-    return lookup_access_token(token)
+    user_id = lookup_access_token(token, source)
+    if user_id is not None:
+        print(
+            "[CN CALL][AUTH OK] source=", source,
+            "user_id=", user_id,
+            "token_fp=", _auth_token_fingerprint(token),
+        )
+    return user_id
 
 
 def _normalized_identity_text(value: str) -> str:
@@ -2862,7 +2890,7 @@ def livekit_token(
 
     token = authorization.replace("Bearer ", "", 1).strip()
 
-    if lookup_access_token(token) != user_id:
+    if lookup_access_token(token, "livekit_token") != user_id:
         raise HTTPException(status_code=401, detail="invalid session")
 
     # A token must never create or revive a room for an ended/unknown call.
@@ -2894,7 +2922,7 @@ async def call_reachability_http(
     request: dict,
     authorization: str | None = Header(default=None),
 ):
-    user_id = authenticated_user(authorization)
+    user_id = authenticated_user(authorization, "reachability_http")
     if user_id is None:
         raise HTTPException(status_code=401, detail="invalid session")
 
@@ -2923,7 +2951,7 @@ async def call_delivered_http(
     call_id: str,
     authorization: str | None = Header(default=None),
 ):
-    user_id = authenticated_user(authorization)
+    user_id = authenticated_user(authorization, "delivered_http")
     if user_id is None:
         raise HTTPException(status_code=401, detail="invalid session")
 
@@ -2954,7 +2982,7 @@ async def websocket_endpoint(
         return
 
     token = websocket.query_params.get("token", "").strip()
-    if lookup_access_token(token) != user_id:
+    if lookup_access_token(token, "websocket_handshake") != user_id:
         await websocket.accept()
         await websocket.send_json({
             "type": "session_invalid",
@@ -3141,7 +3169,7 @@ async def websocket_endpoint(
                 await websocket.close()
                 return
 
-            if lookup_access_token(token) != user_id:
+            if lookup_access_token(token, "websocket_frame") != user_id:
                 await release_calls_for_user(user_id, token)
                 await websocket.send_json({
                     "type": "session_invalid",
