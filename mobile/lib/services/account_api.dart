@@ -32,7 +32,7 @@ class AccountApi {
           'user_id': userId,
           'password': password,
         }),
-      );
+      ).timeout(const Duration(seconds: 15));
 
       final data = jsonDecode(response.body);
 
@@ -44,10 +44,15 @@ class AccountApi {
         'success': false,
         'message': 'استجابة غير صالحة من السيرفر',
       };
-    } catch (_) {
+    } on FormatException catch (e) {
       return {
         'success': false,
-        'message': 'تعذر الاتصال بالسيرفر',
+        'message': 'وصل رد غير صالح من السيرفر عند تسجيل الدخول: ${e.message}',
+      };
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'تعذر الاتصال بالسيرفر [${e.runtimeType}]: $e',
       };
     }
   }
@@ -68,7 +73,7 @@ class AccountApi {
           'username': username,
           'password': password,
         }),
-      );
+      ).timeout(const Duration(seconds: 15));
 
       final data = jsonDecode(response.body);
 
@@ -80,10 +85,15 @@ class AccountApi {
         'success': false,
         'message': 'استجابة غير صالحة من السيرفر',
       };
+    } on FormatException catch (e) {
+      return {
+        'success': false,
+        'message': 'وصل رد غير صالح من السيرفر عند إنشاء الحساب: ${e.message}',
+      };
     } catch (e) {
       return {
         'success': false,
-        'message': 'تعذر الاتصال بالسيرفر',
+        'message': 'تعذر الاتصال بالسيرفر [${e.runtimeType}]: $e',
       };
     }
   }
