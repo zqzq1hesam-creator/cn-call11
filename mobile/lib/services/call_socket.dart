@@ -39,7 +39,26 @@ class CallSocket {
 
   Future<void> connect(String userId, String token) async {
     if (connected && _userId == userId && _token == token) return;
-    if (_connecting) return _readyCompleter?.future ?? Future<void>.value();
+    if (_connecting) {
+      if (_userId == userId && _token == token) {
+        return _readyCompleter?.future ?? Future<void>.value();
+      }
+
+      // Login may rotate the access token while the old socket is still
+      // completing its handshake. Do not treat that stale attempt as success:
+      // fence its callbacks and allow a new attempt using the fresh token.
+      print('SOCKET CONNECT REPLACED: credentials changed during handshake');
+      ++_connectionGeneration;
+      _connecting = false;
+      _ready = false;
+      final staleCompleter = _readyCompleter;
+      _readyCompleter = null;
+      if (staleCompleter != null && !staleCompleter.isCompleted) {
+        staleCompleter.completeError(
+          StateError('CN CALL socket superseded by refreshed credentials'),
+        );
+      }
+    }
 
     // Phase 2.1 ownership gate: never open (or reopen) a WebSocket when
     // Flutter does not currently own signaling. Ownership loss is terminal for
