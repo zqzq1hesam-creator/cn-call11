@@ -45,37 +45,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          node --input-type=module <<'NODE'
+          npm install --no-save ws@8
+          node <<'NODE'
+          const WebSocket = require("ws");
           const url = "wss://cn-call11.zqzq1hesam-cncall.workers.dev/ws/000000000000?token=invalid-production-smoke-token";
-          await new Promise((resolve, reject) => {
-            let completed = false;
-            const finish = (err) => {
-              if (completed) return;
-              completed = true;
+          new Promise((resolve, reject) => {
+            let done = false;
+            const finish = (error) => {
+              if (done) return;
+              done = true;
               clearTimeout(timer);
               try { ws.close(); } catch {}
-              err ? reject(err) : resolve();
+              error ? reject(error) : resolve();
             };
-            const ws = new WebSocket(url);
-            const timer = setTimeout(() => finish(new Error("Timed out waiting for the expected session_invalid frame")), 15000);
-            ws.addEventListener("open", () => console.log("WSS_OPEN"));
-            ws.addEventListener("message", (event) => {
-              const raw = String(event.data);
-              console.log("WSS_MESSAGE=" + raw);
+            const ws = new WebSocket(url, { handshakeTimeout: 15000 });
+            const timer = setTimeout(() => finish(new Error("Timed out waiting for session_invalid")), 17000);
+            ws.on("open", () => console.log("WSS_OPEN"));
+            ws.on("message", (raw) => {
+              const text = raw.toString();
+              console.log("WSS_MESSAGE=" + text);
               let data;
-              try { data = JSON.parse(raw); } catch { return finish(new Error("Server sent a non-JSON WebSocket frame")); }
+              try { data = JSON.parse(text); }
+              catch { return finish(new Error("Server returned non-JSON WebSocket frame: " + text)); }
               if (data.type === "session_invalid" && data.reason === "invalid_session") {
                 console.log("WSS_ASGI_ROUTE_VERIFIED");
-                finish();
-              } else {
-                finish(new Error("Unexpected WebSocket protocol response: " + raw));
+                return finish();
               }
+              return finish(new Error("Unexpected WebSocket protocol response: " + text));
             });
-            ws.addEventListener("error", () => {
-              if (!completed) finish(new Error("Could not establish the production WebSocket handshake"));
+            ws.on("unexpected-response", (request, response) => {
+              let body = "";
+              response.on("data", chunk => body += chunk.toString());
+              response.on("end", () => {
+                console.error("WSS_UNEXPECTED_HTTP_STATUS=" + response.statusCode);
+                console.error("WSS_UNEXPECTED_HTTP_BODY=" + body.slice(0, 2000));
+                finish(new Error("WebSocket upgrade was rejected with HTTP " + response.statusCode));
+              });
             });
-            ws.addEventListener("close", (event) => {
-              if (!completed) finish(new Error("WebSocket closed before session_invalid; code=" + event.code + " reason=" + event.reason));
+            ws.on("error", (error) => {
+              if (!done) finish(new Error("WebSocket transport/handshake failed: " + error.message));
             });
+            ws.on("close", (code, reason) => {
+              if (!done) finish(new Error("WebSocket closed before session_invalid; code=" + code + " reason=" + reason.toString()));
+            });
+          }).catch(error => {
+            console.error(error.stack || String(error));
+            process.exitCode = 1;
           });
           NODE
