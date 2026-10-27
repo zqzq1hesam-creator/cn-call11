@@ -2038,12 +2038,47 @@ class FcmTokenRequest(BaseModel):
     token: str
 
 
+def lookup_access_token(token: str) -> str | None:
+    """Validate a session against PostgreSQL, not an isolate-local cache."""
+    token = str(token).strip()
+    if not token:
+        return None
+
+    db = get_db()
+    try:
+        row = db.execute(
+            "SELECT user_id FROM access_tokens WHERE token = ?",
+            (token,),
+        ).fetchone()
+    finally:
+        db.close()
+
+    # A local cache entry is not proof of a current session: login can rotate
+    # this user's token on another Cloudflare Worker isolate.
+    if row is None:
+        cached_user = access_tokens.pop(token, None)
+        if cached_user is not None and user_access_tokens.get(cached_user) == token:
+            user_access_tokens.pop(cached_user, None)
+        return None
+
+    user_id = str(row["user_id"]).strip()
+    if not user_id:
+        return None
+
+    old_token = user_access_tokens.get(user_id)
+    if old_token and old_token != token:
+        access_tokens.pop(old_token, None)
+    access_tokens[token] = user_id
+    user_access_tokens[user_id] = token
+    return user_id
+
+
 def authenticated_user(authorization: str | None) -> str | None:
     if not authorization or not authorization.startswith("Bearer "):
         return None
 
     token = authorization[7:].strip()
-    return access_tokens.get(token)
+    return lookup_access_token(token)
 
 
 def _normalized_identity_text(value: str) -> str:
@@ -2827,7 +2862,7 @@ def livekit_token(
 
     token = authorization.replace("Bearer ", "", 1).strip()
 
-    if access_tokens.get(token) != user_id:
+    if lookup_access_token(token) != user_id:
         raise HTTPException(status_code=401, detail="invalid session")
 
     # A token must never create or revive a room for an ended/unknown call.
@@ -2919,7 +2954,7 @@ async def websocket_endpoint(
         return
 
     token = websocket.query_params.get("token", "").strip()
-    if access_tokens.get(token) != user_id:
+    if lookup_access_token(token) != user_id:
         await websocket.accept()
         await websocket.send_json({
             "type": "session_invalid",
@@ -3106,7 +3141,7 @@ async def websocket_endpoint(
                 await websocket.close()
                 return
 
-            if access_tokens.get(token) != user_id:
+            if lookup_access_token(token) != user_id:
                 await release_calls_for_user(user_id, token)
                 await websocket.send_json({
                     "type": "session_invalid",
@@ -3526,7 +3561,7 @@ async def websocket_endpoint(
             accepted_target_has_valid_session = (
                 message_type == "call_accept"
                 and sender_role == "target"
-                and access_tokens.get(token) == user_id
+                and lookup_access_token(token) == user_id
             )
             if sender_role is None or (not token_matches_call and not accepted_target_has_valid_session):
                 print(
