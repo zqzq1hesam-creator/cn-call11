@@ -49,6 +49,11 @@ jobs:
         run: uv run pywrangler deploy --dry-run
 
       - name: Smoke-test the Worker entry and safe maintenance response
+        # Wrangler requires a local Hyperdrive URL during local dev. The app
+        # remains in maintenance mode in CI because Firebase/LiveKit secrets are
+        # intentionally absent, so this placeholder is never connected to.
+        env:
+          CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_HYPERDRIVE: "postgres://local-dev:local-dev@127.0.0.1:5432/cncall_local"
         shell: bash
         run: |
           set -euo pipefail
