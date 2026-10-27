@@ -110,6 +110,12 @@ class CNCallHub(DurableObject):
 
     async def fetch(self, request):
         app = _get_app(self.env)
+        # ASGI's HTTP fetch adapter does not perform WebSocket upgrades.
+        # Route signaling sockets through the dedicated ASGI WebSocket adapter;
+        # otherwise /ws/{user_id} is treated as an ordinary HTTP request and
+        # calls/rejections never reach the connected Android clients.
+        if (request.headers.get("upgrade") or "").lower() == "websocket":
+            return await asgi.websocket(app, request, self.env)
         return await asgi.fetch(app, request, self.env)
 
 
