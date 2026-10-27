@@ -2204,7 +2204,7 @@ async def register(request: RegisterRequest):
             "message": "ID المستخدم مطلوب",
         }
 
-    if not re.fullmatch(r"\\d+", user_id):
+    if not re.fullmatch(r"\d+", user_id):
         return {
             "success": False,
             "message": "ID المستخدم يجب أن يكون أرقامًا فقط",
