@@ -62,7 +62,7 @@ object NativeCallTokenHelper {
     private const val KEY_ACCESS_TOKEN = "flutter.cn_call_access_token"
 
     // Mirrors ServerConfig.host (mobile/lib/services/server_config.dart).
-    private const val HOST = "cn-call11-production-79ea.up.railway.app"
+    private const val HOST = "cn-call11.zqzq1hesam-cncall.workers.dev"
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
