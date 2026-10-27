@@ -6,6 +6,8 @@ on:
       - main
     paths:
       - ".github/workflows/cn-call11-cloudflare-error-audit.yml"
+  schedule:
+    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       lookback_hours:
