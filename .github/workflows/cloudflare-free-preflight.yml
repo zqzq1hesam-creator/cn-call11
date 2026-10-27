@@ -37,3 +37,36 @@ jobs:
 
       - name: Build Cloudflare Worker bundle without deploying
         run: uv run pywrangler deploy --dry-run
+
+      - name: Smoke-test the local Worker runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run pywrangler dev --ip 127.0.0.1 --port 8787 > /tmp/cn-call11-worker.log 2>&1 &
+          worker_pid=$!
+          cleanup() {
+            kill "$worker_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for attempt in $(seq 1 40); do
+            if curl --fail --silent http://127.0.0.1:8787/health > /tmp/cn-call11-health.json; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$worker_pid" 2>/dev/null; then
+              cat /tmp/cn-call11-worker.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            cat /tmp/cn-call11-worker.log
+            echo "Worker did not become ready in time."
+            exit 1
+          fi
+
+          cat /tmp/cn-call11-health.json
+          python -c 'import json; d=json.load(open("/tmp/cn-call11-health.json")); assert d["production_ready"] is False; assert d["call_signaling_enabled"] is False; print("PREFLIGHT_HEALTH_OK")'
