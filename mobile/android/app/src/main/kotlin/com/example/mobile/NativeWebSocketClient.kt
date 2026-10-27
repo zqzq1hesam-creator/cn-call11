@@ -370,12 +370,36 @@ object NativeWebSocketClient {
         var myGeneration = 0
         synchronized(this) {
             if (connected && userId == currentUserId && token == currentToken) return true
-            if (connecting.get()) return true
+
+            // Share only an in-flight attempt that uses the SAME credentials.
+            // A login can rotate the access token while an older socket is
+            // connecting/reconnecting. Previously the unconditional
+            // connecting.get() return ignored the new token, so the old
+            // handshake kept retrying with a session no longer in PostgreSQL.
+            if (
+                connecting.get() &&
+                userId == currentUserId &&
+                token == currentToken
+            ) {
+                return true
+            }
+
+            val credentialsChanged =
+                currentUserId != null &&
+                (userId != currentUserId || token != currentToken)
+
+            // Supersede any in-flight attempt using stale credentials. Its
+            // callbacks are fenced by generation; if it opens late, onOpen
+            // closes it as "superseded" and cannot replace the new socket.
+            if (connecting.get() && credentialsChanged) {
+                println(
+                    "[CN CALL][WS] replacing in-flight connection after credential change " +
+                        "user_id=$userId",
+                )
+            }
 
             // Mark connecting + bump the generation atomically BEFORE any
-            // stale in-flight attempt can observe itself as current. Once we
-            // win here, no other caller can also open a socket, and a loser
-            // simply shares this attempt (mirrors CallSocket.connect()).
+            // stale in-flight attempt can observe itself as current.
             connecting.set(true)
             myGeneration = ++generation
             currentUserId = userId
