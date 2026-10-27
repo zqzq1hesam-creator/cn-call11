@@ -36,9 +36,9 @@ for _setting in (
 
 os.environ["CN_CALL_PLATFORM"] = "cloudflare"
 
-# Import after copying bindings because server.main reads its configuration at
+# Import after copying bindings because server_main reads its configuration at
 # import time. Missing database/Firebase/LiveKit values cause safe maintenance.
-from server.main import app  # noqa: E402
+from server_main import app  # noqa: E402
 
 
 class CNCallHub(DurableObject):

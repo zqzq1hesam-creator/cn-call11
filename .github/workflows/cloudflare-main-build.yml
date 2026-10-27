@@ -6,7 +6,6 @@ on:
       - main
     paths:
       - "cloudflare/**"
-      - "server/main.py"
       - "wrangler.jsonc"
       - "pyproject.toml"
       - ".github/workflows/cloudflare-main-build.yml"
@@ -36,7 +35,7 @@ jobs:
         run: uv sync
 
       - name: Compile application Python
-        run: python -m compileall -q cloudflare server/main.py
+        run: python -m compileall -q cloudflare
 
       - name: Build the CN CALL Worker bundle without deploying
         run: uv run pywrangler deploy --dry-run

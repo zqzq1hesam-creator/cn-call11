@@ -1,8 +1,7 @@
 # CN CALL — Cloudflare Workers production configuration
 
-The canonical application branch is `main`. This repository no longer uses a
-Railway deployment configuration, a local SQLite fallback, or the Firebase
-Admin/gRPC SDK.
+The canonical application branch is `main`. This repository no longer contains the old server/ application entry point,
+Railway deployment files, local SQLite runtime, or the Firebase Admin/gRPC SDK.
 
 ## Cloudflare Git deployment
 

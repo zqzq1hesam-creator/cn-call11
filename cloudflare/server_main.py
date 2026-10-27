@@ -2423,7 +2423,7 @@ async def send_call_notification_async(
         data["video_state"] = str(video_state)
 
     try:
-        from cloudflare.fcm_rest import send_fcm_v1
+        from fcm_rest import send_fcm_v1
 
         sent, unregistered, detail = await send_fcm_v1(
             service_account=FCM_SERVICE_ACCOUNT,
