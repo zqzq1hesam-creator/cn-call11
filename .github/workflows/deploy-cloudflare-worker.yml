@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
-          EXPECTED="2026-10-27-register-diagnostics-v1"
+          EXPECTED="2026-10-27-register-pbkdf2-100k-v2"
           BODY="/tmp/cn-call11-production-health.json"
 
           for attempt in $(seq 1 10); do

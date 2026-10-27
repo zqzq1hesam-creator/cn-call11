@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 app = FastAPI(title="CN CALL Server")
 
-CN_CALL_BACKEND_VERSION = "2026-10-27-register-diagnostics-v1"
+CN_CALL_BACKEND_VERSION = "2026-10-27-register-pbkdf2-100k-v2"
 
 app.add_middleware(
     CORSMiddleware,
@@ -1864,10 +1864,10 @@ if not CN_CALL_MIGRATION_MODE:
 async def hash_password(password: str, salt: bytes | None = None):
     """PBKDF2-SHA256 using Cloudflare Web Crypto, preserving stored hash format.
 
-    Native Web Crypto avoids running a CPU-heavy PBKDF2 loop in Python/WASM
-    under Cloudflare Workers' per-request CPU budget. The algorithm, iteration
-    count, salt size, and output hex format match the legacy hashlib version,
-    so existing password hashes remain verifiable.
+    Native Web Crypto avoids a CPU-heavy PBKDF2 loop in Python/WASM. Cloudflare
+    Workers limits PBKDF2 to 100,000 iterations; the live production database
+    was verified to contain zero users before this change. Keep this iteration
+    count consistent for registration and subsequent verification.
     """
     from js import crypto, Object, Uint8Array
     from pyodide.ffi import to_js
@@ -1881,7 +1881,7 @@ async def hash_password(password: str, salt: bytes | None = None):
     algorithm = Object.new()
     algorithm.name = "PBKDF2"
     algorithm.salt = _uint8_array(salt)
-    algorithm.iterations = 200_000
+    algorithm.iterations = 100_000
     algorithm.hash = "SHA-256"
 
     raw_password = _uint8_array(password.encode("utf-8"))
