@@ -24,7 +24,7 @@ class AccountApi {
         'message': 'استجابة غير صالحة من السيرفر (HTTP ${response.statusCode})',
       };
     } on FormatException {
-      final compact = response.body.replaceAll(RegExp(r'\\s+'), ' ').trim();
+      final compact = response.body.replaceAll(RegExp(r'\s+'), ' ').trim();
       final preview = compact.length > 120
           ? '${compact.substring(0, 120)}…'
           : compact;
