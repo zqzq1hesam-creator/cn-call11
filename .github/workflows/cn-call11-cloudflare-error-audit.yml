@@ -218,7 +218,7 @@ jobs:
                   break
               trace_cursor = last_id
 
-                    def metadata_of(event):
+          def metadata_of(event):
               m = event.get("$metadata") or {}
               source = event.get("source")
               if isinstance(source, dict):
@@ -455,7 +455,7 @@ jobs:
               for keyword in matched_keywords:
                   trace_types[keyword.upper()] += 1
 
-                    print("QUERY_SUCCESS=true")
+          print("QUERY_SUCCESS=true")
           print("EVENTS_RETURNED=" + str(len(all_events)))
           print("EVENTS_MATCHED_REPORTED=" + str(total_reported))
           print("ERROR_LOG_EVENTS_CLASSIFIED=" + str(error_records))
