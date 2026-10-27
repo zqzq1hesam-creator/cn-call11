@@ -55,6 +55,42 @@ def _get_app(runtime_env):
         if text_value.strip():
             os.environ[name] = text_value
 
+    # Prefer Hyperdrive when the binding is available. Hyperdrive manages TLS
+    # to Neon and presents its pooled endpoint to the Worker; the Worker-side
+    # pg8000 connection must therefore not initiate a second TLS handshake.
+    try:
+        hyperdrive = getattr(runtime_env, "HYPERDRIVE")
+    except Exception:
+        hyperdrive = None
+
+    if hyperdrive is not None:
+        binding_fields = {
+            "CN_CALL_DB_HOST": "host",
+            "CN_CALL_DB_PORT": "port",
+            "CN_CALL_DB_NAME": "database",
+            "CN_CALL_DB_USER": "user",
+            "CN_CALL_DB_PASSWORD": "password",
+        }
+        missing_fields = []
+        for setting_name, binding_name in binding_fields.items():
+            try:
+                value = getattr(hyperdrive, binding_name)
+            except Exception:
+                value = None
+            if value is None or not str(value).strip():
+                missing_fields.append(binding_name)
+            else:
+                os.environ[setting_name] = str(value).strip()
+
+        if missing_fields:
+            raise RuntimeError(
+                "HYPERDRIVE binding missing required fields: "
+                + ", ".join(missing_fields)
+            )
+
+        os.environ["CN_CALL_DB_SSL"] = "false"
+        print("[CN CALL][DB] Hyperdrive binding detected; using pooled database connection")
+
     os.environ["CN_CALL_PLATFORM"] = "cloudflare"
 
     # Import after the runtime bindings are available. server_main initializes

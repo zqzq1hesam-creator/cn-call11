@@ -39,6 +39,22 @@ async def migration_maintenance_middleware(request, call_next):
                 "message": "CN CALL is temporarily under maintenance",
             },
         )
+
+    # Avoid routing ordinary HTTP requests into handlers whose database schema
+    # has not initialized. The retry helper is rate-limited and never hides the
+    # failure from /health.
+    if request.url.path != "/health" and not _DB_INIT_SUCCEEDED:
+        _attempt_db_init()
+        if not _DB_INIT_SUCCEEDED:
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": str(int(_DB_INIT_RETRY_INTERVAL_SECONDS))},
+                content={
+                    "success": False,
+                    "message": "CN CALL database is temporarily unavailable",
+                },
+            )
+
     return await call_next(request)
 
 
@@ -1332,7 +1348,21 @@ class DatabaseHandle:
         self._db.close()
 
 
+_DB_INIT_SUCCEEDED = False
+_DB_INIT_IN_PROGRESS = False
+_DB_INIT_LAST_ATTEMPT = 0.0
+_DB_INIT_RETRY_INTERVAL_SECONDS = 15.0
+
+
 def get_db():
+    # Retry a failed startup initialization on later requests, while preventing
+    # recursive retries when init_db() itself obtains a connection.
+    if (
+        not CN_CALL_MIGRATION_MODE
+        and not _DB_INIT_SUCCEEDED
+        and not _DB_INIT_IN_PROGRESS
+    ):
+        _attempt_db_init()
     return DatabaseHandle()
 
 
@@ -1573,8 +1603,45 @@ def init_db():
         db.close()
 
 
+def _attempt_db_init(force: bool = False) -> bool:
+    """Initialize schema and permit controlled retries after transient failures."""
+    global _DB_INIT_SUCCEEDED, _DB_INIT_IN_PROGRESS, _DB_INIT_LAST_ATTEMPT
+
+    if _DB_INIT_SUCCEEDED:
+        return True
+    if _DB_INIT_IN_PROGRESS or CN_CALL_MIGRATION_MODE:
+        return False
+
+    now = time.monotonic()
+    if (
+        not force
+        and _DB_INIT_LAST_ATTEMPT
+        and now - _DB_INIT_LAST_ATTEMPT < _DB_INIT_RETRY_INTERVAL_SECONDS
+    ):
+        return False
+
+    _DB_INIT_LAST_ATTEMPT = now
+    _DB_INIT_IN_PROGRESS = True
+    try:
+        init_db()
+    except Exception as exc:
+        _DB_INIT_SUCCEEDED = False
+        # Exception text may contain connection details; log only the class.
+        print(
+            "[CN CALL][DB] Schema initialization failed; retryable; type=",
+            type(exc).__name__,
+        )
+    else:
+        _DB_INIT_SUCCEEDED = True
+        print("[CN CALL][DB] Schema initialization completed")
+    finally:
+        _DB_INIT_IN_PROGRESS = False
+
+    return _DB_INIT_SUCCEEDED
+
+
 if not CN_CALL_MIGRATION_MODE:
-    init_db()
+    _attempt_db_init(force=True)
 else:
     print("[CN CALL][DB] Schema initialization deferred until Cloudflare database/secrets are configured")
 
@@ -2048,10 +2115,52 @@ def fcm_debug(authorization: str | None = Header(default=None)):
 
 @app.get("/health")
 async def health():
+    global _DB_INIT_SUCCEEDED, _DB_INIT_LAST_ATTEMPT
+
+    missing = list(CN_CALL_CONFIGURATION_MISSING)
+    database_ready = False
+    database_status = "not_checked" if CN_CALL_MIGRATION_MODE else "unavailable"
+
+    if not CN_CALL_MIGRATION_MODE:
+        if not _DB_INIT_SUCCEEDED:
+            _attempt_db_init()
+
+        if _DB_INIT_SUCCEEDED:
+            db = None
+            try:
+                # Check the actual database connection. Secret names alone do
+                # not make the service ready.
+                db = DatabaseHandle()
+                row = db.execute("SELECT 1 AS ok").fetchone()
+                database_ready = bool(row and int(row.get("ok", 0)) == 1)
+                if not database_ready:
+                    raise RuntimeError("Database health probe returned no result")
+                database_status = "ok"
+            except Exception as exc:
+                _DB_INIT_SUCCEEDED = False
+                _DB_INIT_LAST_ATTEMPT = time.monotonic()
+                database_status = "unavailable"
+                print(
+                    "[CN CALL][DB] Health probe failed; type=",
+                    type(exc).__name__,
+                )
+            finally:
+                if db is not None:
+                    try:
+                        db.close()
+                    except Exception:
+                        pass
+
+    if CN_CALL_DB_CONFIGURED and not database_ready and not CN_CALL_MIGRATION_MODE:
+        if "DATABASE_CONNECTION" not in missing:
+            missing.append("DATABASE_CONNECTION")
+
+    ready = not CN_CALL_MIGRATION_MODE and _DB_INIT_SUCCEEDED and database_ready
     return {
-        "status": "maintenance" if CN_CALL_MIGRATION_MODE else "ok",
-        "ready": not CN_CALL_MIGRATION_MODE,
-        "missing_configuration": CN_CALL_CONFIGURATION_MISSING,
+        "status": "ok" if ready else "maintenance",
+        "ready": ready,
+        "missing_configuration": missing,
+        "database": database_status,
         "users": len(connections),
     }
 
