@@ -1,0 +1,14 @@
+[project]
+name = "cn-call11-cloudflare-free-preflight"
+version = "0.1.0"
+description = "Preflight-only Cloudflare Python Worker scaffold for CN CALL migration"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi",
+]
+
+[dependency-groups]
+dev = [
+    "workers-py",
+    "workers-runtime-sdk",
+]

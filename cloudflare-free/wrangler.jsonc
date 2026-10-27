@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "cn-call11-free-staging",
+  "main": "src/entry.py",
+  "compatibility_date": "2026-10-27",
+  "compatibility_flags": ["python_workers"],
+  "workers_dev": true,
+  "vars": {
+    "CN_CALL_STAGE": "preflight-only"
+  }
+}
