@@ -4,6 +4,9 @@
   "main": "cloudflare/entry.py",
   "compatibility_date": "2026-10-27",
   "compatibility_flags": ["python_workers"],
+  // Preserve Production variables/secrets configured in the Cloudflare dashboard
+  // during future Git-based deployments.
+  "keep_vars": true,
   // Production workers.dev URL stays enabled; preview URLs stay disabled.
   "workers_dev": true,
   "preview_urls": false,
@@ -20,7 +23,7 @@
   },
   "exports": {
     "CNCallHub": {
-      "type": "durable-object",
+      "type": "sqlite",
       "storage": "sqlite"
     }
   }
