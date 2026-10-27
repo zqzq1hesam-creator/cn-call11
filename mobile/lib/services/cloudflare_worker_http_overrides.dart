@@ -33,7 +33,7 @@ class _CloudflareWorkerHttpOverrides extends HttpOverrides {
 
       if (uri.host.toLowerCase() == _cnCallWorkerHost) {
         return Future<ConnectionTask<Socket>>.value(
-          ConnectionTask<Socket>.fromSocket(
+          ConnectionTask.fromSocket<Socket>(
             _connectWorker(uri.port),
             () {},
           ),
