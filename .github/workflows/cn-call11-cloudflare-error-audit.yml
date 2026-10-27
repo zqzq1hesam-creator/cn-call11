@@ -185,6 +185,10 @@ jobs:
           levels = collections.Counter()
           outcomes = collections.Counter()
           signatures = collections.Counter()
+          root_exceptions = collections.Counter()
+          status_codes = collections.Counter()
+          trigger_statuses = collections.Counter()
+          failed_request_ids = set()
           invocations_failed = 0
           fatal_critical = 0
           error_records = 0
@@ -193,8 +197,57 @@ jobs:
           known_bad_outcomes = {
               "exception", "exceededcpu", "scriptnotfound", "canceled",
               "cancelled", "memorylimitexceeded", "walltimeexceeded",
-              "timelimitexceeded", "killSwitch".lower(),
+              "timelimitexceeded", "killswitch",
           }
+          root_exception_re = re.compile(
+              r"^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*(?:Error|Exception|Timeout|Fault|Failure|Disconnect|Rejected)|WebSocketDisconnect|HTTPException)(?::.*)?$"
+          )
+
+          def is_stack_frame_line(value):
+              line = str(value or "").strip()
+              if not line:
+                  return True
+              return bool(
+                  line.startswith((
+                      "Traceback (most recent call last):",
+                      "File """,
+                      "File '",
+                      "During handling of the above exception",
+                      "The above exception was the direct cause",
+                  ))
+                  or re.match(
+                      r"^(?:await|raise|return|pass|try|except|finally|if|elif|else|for|while|with|async with|async for|yield|break|continue)\b",
+                      line,
+                  )
+                  or re.match(r"^(?:GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD)\s+/", line)
+                  or re.fullmatch(r"[\^~|()\[\]{},]+", line)
+              )
+
+          def useful_signature(values):
+              candidates = []
+              for value in values:
+                  if value is None:
+                      continue
+                  if isinstance(value, dict):
+                      value = value.get("error") or value.get("message") or value.get("detail") or ""
+                  lines = [line.strip() for line in str(value).splitlines() if line.strip()]
+                  if lines:
+                      candidates.append(lines)
+
+              # Prefer an actual exception class/message over any traceback frame.
+              for lines in candidates:
+                  for line in reversed(lines):
+                      if root_exception_re.match(line) and not is_stack_frame_line(line):
+                          return scrub(line), True
+
+              # Otherwise keep the first meaningful message, skipping traceback frames,
+              # source-code lines, and HTTP trigger labels that are not root causes.
+              for lines in candidates:
+                  for line in reversed(lines):
+                      if not is_stack_frame_line(line):
+                          return scrub(line), False
+              return None, False
+
           for event in all_events:
               meta = metadata_of(event)
               worker = event.get("$workers") or {}
@@ -207,11 +260,34 @@ jobs:
                   outcomes[outcome] += 1
               if outcome in known_bad_outcomes:
                   invocations_failed += 1
+                  request_id = (
+                      meta.get("requestId")
+                      or meta.get("traceId")
+                      or worker.get("requestId")
+                      or worker.get("traceId")
+                  )
+                  if request_id:
+                      failed_request_ids.add(str(request_id))
               if level in ("fatal", "critical"):
                   fatal_critical += 1
-              error_value = meta.get("error") or (source.get("error") if isinstance(source, dict) else None)
-              message_value = meta.get("errorTemplate") or meta.get("messageTemplate") or error_value or meta.get("message")
+
+              trigger = str(meta.get("trigger") or "")
+              if trigger:
+                  trigger = re.sub(r"https?://[^\s]+", "<url>", trigger)
+                  trigger = re.sub(r"\b[0-9a-f-]{16,}\b", "<id>", trigger, flags=re.I)
+                  trigger = re.sub(r"\b\d{6,}\b", "<id>", trigger)
+                  trigger = trigger[:100]
+
+              status_code = meta.get("statusCode") or worker.get("statusCode")
+              if status_code is not None:
+                  status_codes[str(status_code)] += 1
+                  if trigger:
+                      trigger_statuses[(trigger, str(status_code))] += 1
+
+              source_error = source.get("error") if isinstance(source, dict) else None
+              source_message = source.get("message") if isinstance(source, dict) else None
               source_text = source if isinstance(source, str) else ""
+              error_value = meta.get("error") or source_error
               is_error = (
                   level in ("error", "fatal", "critical")
                   or bool(error_value)
@@ -221,43 +297,56 @@ jobs:
               if not is_error:
                   continue
               error_records += 1
-              if message_value:
-                  signature = scrub(message_value)
-              elif source_text:
-                  # Do not print raw logs: keep a short, scrubbed signature only.
-                  first_line = source_text.splitlines()[0] if source_text.splitlines() else "unclassified log error"
-                  match = re.search(r"([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Timeout|Fault))", first_line)
-                  signature = match.group(1) if match else scrub(first_line)
-              else:
-                  signature = "(error event without message)"
-              signatures[signature or "(empty error signature)"] += 1
-              trigger = str(meta.get("trigger") or "")
-              if trigger:
-                  trigger = re.sub(r"https?://[^\s]+", "<url>", trigger)
-                  trigger = re.sub(r"\b[0-9a-f-]{16,}\b", "<id>", trigger, flags=re.I)
-                  trigger = re.sub(r"\b\d{6,}\b", "<id>", trigger)
-                  routes[trigger[:100]] += 1
 
-          print("QUERY_SUCCESS=true")
+              signature, is_root_exception = useful_signature([
+                  meta.get("errorTemplate"),
+                  error_value,
+                  source_message,
+                  meta.get("message"),
+                  meta.get("messageTemplate"),
+                  source_text,
+              ])
+              if signature:
+                  signatures[signature] += 1
+                  if is_root_exception:
+                      root_exceptions[signature] += 1
+              trigger_label = trigger or "(trigger unavailable)"
+              routes[trigger_label] += 1
+
+                    print("QUERY_SUCCESS=true")
           print("EVENTS_RETURNED=" + str(len(all_events)))
           print("EVENTS_MATCHED_REPORTED=" + str(total_reported))
-          print("ERROR_EVENTS_CLASSIFIED=" + str(error_records))
-          print("FATAL_OR_CRITICAL_EVENTS=" + str(fatal_critical))
-          print("FAILED_INVOCATIONS=" + str(invocations_failed))
+          print("ERROR_LOG_EVENTS_CLASSIFIED=" + str(error_records))
+          print("FATAL_OR_CRITICAL_LOG_EVENTS=" + str(fatal_critical))
+          print("EVENTS_WITH_FAILED_OUTCOME=" + str(invocations_failed))
+          print("DISTINCT_FAILED_REQUEST_IDS=" + str(len(failed_request_ids)))
           print("LEVEL_COUNTS=" + json.dumps(dict(levels.most_common()), sort_keys=True))
           print("OUTCOME_COUNTS=" + json.dumps(dict(outcomes.most_common()), sort_keys=True))
+          print("ERROR_LOG_STATUS_CODE_COUNTS=" + json.dumps(dict(status_codes.most_common()), sort_keys=True))
           if total_reported > len(all_events):
               print("NOTE=Result count exceeds collected events; query pagination or API limits may have capped the sample.")
-          print("TOP_ERROR_SIGNATURES_BEGIN")
+          print("NOTE=Event/log counts are not equivalent to unique failed calls.")
+          print("TOP_ROOT_EXCEPTION_SIGNATURES_BEGIN")
+          for signature, count in root_exceptions.most_common(20):
+              print(str(count) + "x | " + signature)
+          if not root_exceptions:
+              print("No explicit exception class/message was extracted from matched events.")
+          print("TOP_ROOT_EXCEPTION_SIGNATURES_END")
+          print("TOP_ERROR_MESSAGE_SIGNATURES_BEGIN")
           for signature, count in signatures.most_common(20):
               print(str(count) + "x | " + signature)
           if not signatures:
-              print("No error signatures returned for cn-call11 in the selected interval.")
-          print("TOP_ERROR_SIGNATURES_END")
+              print("No non-stack-frame error messages were extracted.")
+          print("TOP_ERROR_MESSAGE_SIGNATURES_END")
+          if trigger_statuses:
+              print("TOP_TRIGGER_STATUS_CODES_BEGIN")
+              for (trigger, status), count in trigger_statuses.most_common(20):
+                  print(str(count) + "x | status=" + status + " | " + scrub(trigger))
+              print("TOP_TRIGGER_STATUS_CODES_END")
           if routes:
-              print("TOP_ERROR_TRIGGERS_BEGIN")
+              print("TOP_ERROR_TRIGGER_LOG_COUNTS_BEGIN")
               for route, count in routes.most_common(10):
-                  print(str(count) + "x | " + scrub(route))
-              print("TOP_ERROR_TRIGGERS_END")
+                  print(str(count) + " log-events | " + scrub(route))
+              print("TOP_ERROR_TRIGGER_LOG_COUNTS_END")
           print("AUDIT_COMPLETE")
           PY
