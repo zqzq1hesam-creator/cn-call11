@@ -280,10 +280,10 @@ def _presence_is_fresh(user_id: str) -> bool:
     if lease is None:
         return False
 
-    return (
-        bool(lease["network_validated"])
-        and int(lease["lease_expires_at"]) > int(time.time() * 1000)
-    )
+    # A fresh authenticated WebSocket heartbeat proves the device can reach
+    # this Worker. Android's NET_CAPABILITY_VALIDATED flag is only a network
+    # heuristic and must not decide whether an active call can be delivered.
+    return int(lease["lease_expires_at"]) > int(time.time() * 1000)
 
 
 async def _record_reachability_response(
@@ -326,9 +326,9 @@ async def _record_reachability_response(
     if int(record["ring_expires_at"]) <= int(time.time() * 1000):
         return False, "challenge_expired"
 
-    if not network_validated:
-        return False, "network_not_validated"
-
+    # A valid authenticated response carrying this call's unpredictable nonce
+    # proves reachability even when Android reports a captive/no-Internet network.
+    # Do not reject a real response based only on NET_CAPABILITY_VALIDATED.
     now = int(time.time() * 1000)
     db = get_db()
     try:
@@ -371,6 +371,7 @@ async def _record_reachability_response(
         "[CN CALL][REACHABILITY PROVEN]",
         "call_id=", call_id,
         "target=", user_id,
+        "android_network_validated=", network_validated,
     )
     return True, "proven"
 
@@ -975,51 +976,55 @@ async def _acknowledge_call_delivery(
     user_id: str,
     call_id: str,
 ) -> tuple[bool, str]:
-    """Persist native delivery confirmation and notify the caller."""
+    """Persist native delivery confirmation using durable state across Worker isolates."""
     user_id = user_id.strip()
     call_id = call_id.strip()
     if not user_id or not call_id:
         return False, "invalid_request"
 
-    record = active_calls.get(call_id)
-    if record is None:
-        return False, "unknown_or_ended_call"
-
-    caller_id = str(record["caller_id"])
-    target_id = str(record["target_id"])
-    if user_id != target_id:
-        return False, "sender_not_call_owner"
-
+    # WebSocket and HTTPS requests may be served by different Worker isolates.
+    # Therefore, call_records—not the isolate-local active_calls dictionary—is
+    # authoritative for this acknowledgement.
     db = get_db()
     try:
         row = db.execute(
             """
-            SELECT status, target_id, delivery_confirmed_at
+            SELECT caller_id, target_id, status, delivery_confirmed_at
             FROM call_records
             WHERE call_id = ?
+            FOR UPDATE
             """,
             (call_id,),
         ).fetchone()
-
         if row is None:
+            db.rollback()
             return False, "unknown_or_ended_call"
-        if str(row["target_id"]) != user_id:
+
+        caller_id = str(row["caller_id"])
+        target_id = str(row["target_id"])
+        status = str(row["status"])
+        if user_id != target_id:
+            db.rollback()
             return False, "sender_not_call_owner"
 
         already_confirmed = row["delivery_confirmed_at"] is not None
-        if not already_confirmed:
-            if str(row["status"]) != "ringing":
-                return False, "unknown_or_ended_call"
+        active_statuses = {"ringing", "accepted", "negotiating", "connected"}
+        if status not in active_statuses and not already_confirmed:
+            db.rollback()
+            return False, "unknown_or_ended_call"
 
+        # A delivery ACK can race with call_accept; once the authenticated
+        # target is answering/connected, accept the ACK as successful instead
+        # of returning 409 just because status has advanced beyond ringing.
+        if not already_confirmed:
             confirmed_at = int(time.time() * 1000)
             db.execute(
                 """
                 UPDATE call_records
-                SET delivery_confirmed_at = ?,
-                    delivery_deadline_at = NULL
+                SET delivery_confirmed_at = ?, delivery_deadline_at = NULL
                 WHERE call_id = ?
                   AND target_id = ?
-                  AND status = 'ringing'
+                  AND status IN ('ringing', 'accepted', 'negotiating', 'connected')
                   AND delivery_confirmed_at IS NULL
                 """,
                 (confirmed_at, call_id, user_id),
@@ -1044,6 +1049,7 @@ async def _acknowledge_call_delivery(
             "[CN CALL][CALL DELIVERED HTTPS ACK]",
             "call_id=", call_id,
             "target=", user_id,
+            "status_at_ack=", status,
         )
 
     caller_socket = connections.get(caller_id)
@@ -1065,7 +1071,7 @@ async def _acknowledge_call_delivery(
                 "[CN CALL][CALL DELIVERED FORWARD FAILED]",
                 "call_id=", call_id,
                 "caller=", caller_id,
-                "error=", exc,
+                "error_type=", type(exc).__name__,
             )
 
     return True, "already_confirmed" if already_confirmed else "confirmed"
@@ -3034,7 +3040,7 @@ async def websocket_endpoint(
                 SELECT call_id, target_id, status
                 FROM call_records
                 WHERE caller_id = ?
-                  AND status IN ('accepted', 'negotiating')
+                  AND status IN ('accepted', 'negotiating', 'connected')
                 ORDER BY created_at DESC
                 LIMIT 10
                 """,
@@ -3121,25 +3127,16 @@ async def websocket_endpoint(
                     str(message.get("network_validated", "")).strip().lower() == "true"
                 )
                 _record_presence_lease(user_id, network_validated)
-
-                if not network_validated:
-                    for active_call_id, rec in list(active_calls.items()):
-                        if (
-                            str(rec["target_id"]) == user_id
-                            and str(rec["status"]) == "ringing"
-                        ):
-                            await _finalize_target_offline(
-                                active_call_id,
-                                "presence_heartbeat",
-                            )
-
+                # Never terminate a ringing call from this advisory flag: this
+                # authenticated heartbeat itself proves the socket is reachable.
                 await websocket.send_json({
                     "type": "presence_ack",
                     "user_id": user_id,
                     "network_validated": network_validated,
                 })
-                if network_validated:
-                    await replay_accepted_calls_to_caller()
+                # Also replay durable accept signaling when Android's network
+                # validation heuristic is false; the WebSocket is still live.
+                await replay_accepted_calls_to_caller()
                 continue
 
             if message_type == "reachability_response":
