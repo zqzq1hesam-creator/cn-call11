@@ -29,7 +29,7 @@ import java.util.ArrayDeque
  * and the server endpoint server/main.py /ws/{user_id}:
  *
  *   URL      : wss://<host>/ws/<userId>?token=<token>
- *              (host = cn-call11-production-79ea.up.railway.app, as ServerConfig.host)
+ *              (host = cn-call11.zqzq1hesam-cncall.workers.dev, as ServerConfig.host)
  *   Auth     : the access token is passed as the `token` query parameter.
  *              An invalid/revoked token makes the server send
  *              {"type":"session_invalid","reason":...} and close with 1008.
@@ -191,6 +191,7 @@ object NativeWebSocketClient {
 
     private val okHttpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
+            .dns(CloudflareWorkerDns)
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(0, TimeUnit.MILLISECONDS)
             .pingInterval(25, TimeUnit.SECONDS)

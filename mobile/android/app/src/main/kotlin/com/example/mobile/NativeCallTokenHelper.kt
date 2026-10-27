@@ -33,7 +33,7 @@ import java.util.concurrent.TimeUnit
  *   - "flutter.cn_call_display_name" (stored, but not needed by this helper)
  *
  * LiveKit token endpoint:
- *   GET https://cn-call11-production-79ea.up.railway.app/livekit/token
+ *   GET https://cn-call11.zqzq1hesam-cncall.workers.dev/livekit/token
  *       ?user_id=<userId>&call_id=<callId>
  *   Authorization: Bearer <accessToken>
  *   Success: 200 {"success": true, "url": "<LIVEKIT_URL>",
@@ -66,6 +66,7 @@ object NativeCallTokenHelper {
 
     private val httpClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
+            .dns(CloudflareWorkerDns)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .callTimeout(20, TimeUnit.SECONDS)
