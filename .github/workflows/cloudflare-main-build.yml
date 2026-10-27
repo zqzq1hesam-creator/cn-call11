@@ -85,3 +85,32 @@ jobs:
 
           cat /tmp/cn-call11-health.json
           python -c 'import json; d=json.load(open("/tmp/cn-call11-health.json")); assert d["status"] == "maintenance"; assert d["ready"] is False; print("CLOUDFLARE_ENTRY_HEALTH_OK")'
+      - name: Diagnose live Cloudflare Worker deployment (non-blocking)
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          set -u
+          URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
+          EXPECTED="2026-10-27-register-diagnostics-v1"
+          BODY="/tmp/cn-call11-production-health.json"
+          echo "Expected production backend version: $EXPECTED"
+          for attempt in $(seq 1 12); do
+            CODE="$(curl --silent --show-error --max-time 15 -o "$BODY" -w '%{http_code}' "$URL" 2>/tmp/cn-call11-production-curl.err || true)"
+            echo "Attempt=$attempt HTTP=$CODE"
+            if [ -s "$BODY" ]; then
+              cat "$BODY"
+              echo
+              VERSION="$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("backend_version", ""))' "$BODY" 2>/dev/null || true)"
+              READY="$(python -c 'import json,sys; d=json.load(open(sys.argv[1])); print(str(d.get("ready", "")).lower())' "$BODY" 2>/dev/null || true)"
+              echo "Observed backend_version=$VERSION ready=$READY"
+              if [ "$CODE" = "200" ] && [ "$VERSION" = "$EXPECTED" ]; then
+                echo "PRODUCTION_VERSION_MATCH"
+                exit 0
+              fi
+            else
+              cat /tmp/cn-call11-production-curl.err || true
+            fi
+            sleep 5
+          done
+          echo "PRODUCTION_VERSION_NOT_CONFIRMED; worker may not yet have deployed or production health is unavailable."
+
