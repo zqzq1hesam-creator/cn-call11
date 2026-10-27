@@ -405,7 +405,7 @@ jobs:
           trace_types = collections.Counter()
           trace_event_timestamps = []
           trace_keyword_re = re.compile(
-              r"(?i)(CALL_ACCEPT SERVER|CALL_ACCEPT ACK SENT|CALL_ACCEPT ACK FAILED|"
+              r"(?i)(AUTH FAIL|AUTH OK|CALL DB REFRESH|CALL_ACCEPT SERVER|CALL_ACCEPT ACK SENT|CALL_ACCEPT ACK FAILED|"
               r"CALL_ACCEPT FORWARDED TO CALLER|CALL_ACCEPT FORWARD FAILED|"
               r"CALL MESSAGE|SIGNALING_REJECTED|SOCKET READY|SOCKET CLOSED|"
               r"CALL INITIAL WS|CALL FORWARD WS ERROR|ACTIVE_USERS|"
