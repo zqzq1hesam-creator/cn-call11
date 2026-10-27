@@ -1,0 +1,263 @@
+name: CN CALL Cloudflare Error Audit
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/cn-call11-cloudflare-error-audit.yml"
+  workflow_dispatch:
+    inputs:
+      lookback_hours:
+        description: "How many recent hours to inspect (1-720)"
+        required: false
+        default: "168"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Query Cloudflare Workers Observability (read-only)
+        shell: bash
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          LOOKBACK_HOURS: ${{ inputs.lookback_hours || '168' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ]; then
+            echo "::error::Required Cloudflare GitHub Actions secrets are missing. No secret values were printed."
+            exit 1
+          fi
+          python - <<'PY'
+          import collections
+          import datetime as dt
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          token = os.environ["CLOUDFLARE_API_TOKEN"]
+          account = os.environ["CLOUDFLARE_ACCOUNT_ID"]
+          try:
+              hours = int(os.environ.get("LOOKBACK_HOURS", "168"))
+          except ValueError:
+              hours = 168
+          hours = max(1, min(hours, 720))
+
+          now = dt.datetime.now(dt.timezone.utc)
+          start = now - dt.timedelta(hours=hours)
+          base = "https://api.cloudflare.com/client/v4/accounts/" + account + "/workers/observability/telemetry"
+
+          def scrub(value):
+              s = str(value or "")
+              s = re.sub(r"https?://[^\\s\"']+", "<url>", s)
+              s = re.sub(r"(?i)\\b[\\w.+%-]+@[\\w.-]+\\.[A-Z]{2,}\\b", "<email>", s)
+              s = re.sub(r"(?i)\\b(authorization|token|secret|password|api[_ -]?key)\\s*[:=]\\s*[^,;\\s]+", r"\\1=<redacted>", s)
+              s = re.sub(r"(?i)\\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\b", "<uuid>", s)
+              s = re.sub(r"\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b", "<ip>", s)
+              s = re.sub(r"\\b\\+?\\d[\\d\\s().-]{7,}\\d\\b", "<number>", s)
+              s = re.sub(r"\\b\\d{6,}\\b", "<id>", s)
+              s = re.sub(r"\\b[a-f0-9]{24,}\\b", "<opaque>", s, flags=re.I)
+              return " ".join(s.split())[:180]
+
+          def api_post(path, body):
+              req = urllib.request.Request(
+                  base + path,
+                  data=json.dumps(body).encode("utf-8"),
+                  headers={
+                      "Authorization": "Bearer " + token,
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                  },
+                  method="POST",
+              )
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      status = response.status
+                      payload = json.loads(response.read().decode("utf-8", "replace"))
+              except urllib.error.HTTPError as exc:
+                  raw = exc.read().decode("utf-8", "replace")
+                  try:
+                      error_payload = json.loads(raw)
+                      errors = error_payload.get("errors") or []
+                      details = "; ".join(
+                          scrub(x.get("message", x.get("code", "Cloudflare API error")))
+                          for x in errors[:3] if isinstance(x, dict)
+                      )
+                  except Exception:
+                      details = "Cloudflare returned a non-JSON error body."
+                  print("CLOUDFLARE_API_HTTP_STATUS=" + str(exc.code))
+                  if details:
+                      print("CLOUDFLARE_API_ERROR=" + details)
+                  if exc.code in (401, 403):
+                      print("AUTH_HINT=The token may lack Workers Observability Write permission.")
+                  raise SystemExit(2)
+              except Exception as exc:
+                  print("CLOUDFLARE_API_TRANSPORT_ERROR=" + scrub(type(exc).__name__ + ": " + str(exc)))
+                  raise SystemExit(3)
+              if not payload.get("success", False):
+                  errors = payload.get("errors") or []
+                  print("CLOUDFLARE_API_SUCCESS=false")
+                  for err in errors[:3]:
+                      if isinstance(err, dict):
+                          print("CLOUDFLARE_API_ERROR=" + scrub(err.get("message", err.get("code", "Unknown error"))))
+                  raise SystemExit(4)
+              return payload
+
+          service_filter = {
+              "key": "$metadata.service",
+              "operation": "eq",
+              "type": "string",
+              "value": "cn-call11",
+          }
+          error_group = {
+              "kind": "group",
+              "filterCombination": "or",
+              "filters": [
+                  {"key": "$metadata.level", "operation": "eq", "type": "string", "value": "error"},
+                  {"key": "$metadata.level", "operation": "eq", "type": "string", "value": "fatal"},
+                  {"key": "$metadata.level", "operation": "eq", "type": "string", "value": "critical"},
+                  {"key": "$metadata.error", "operation": "exists", "type": "string"},
+              ],
+          }
+
+          print("CLOUDFLARE_WORKER=cn-call11")
+          print("LOOKBACK_HOURS=" + str(hours))
+          print("TIMEFRAME_UTC=" + start.isoformat() + " to " + now.isoformat())
+          print("RAW_LOG_LINES=NOT_PRINTED")
+
+          limit = 2000
+          all_events = []
+          total_reported = 0
+          cursor = None
+          for page in range(5):
+              body = {
+                  "queryId": "cn-call11-error-audit-readonly",
+                  "timeframe": {
+                      "from": int(start.timestamp() * 1000),
+                      "to": int(now.timestamp() * 1000),
+                  },
+                  "view": "events",
+                  "limit": limit,
+                  "dry": True,
+                  "parameters": {
+                      "datasets": ["cloudflare-workers"],
+                      "filterCombination": "and",
+                      "filters": [service_filter, error_group],
+                  },
+              }
+              if cursor:
+                  body["offset"] = cursor
+                  body["offsetDirection"] = "next"
+              data = api_post("/query", body)
+              result = data.get("result") or {}
+              event_block = result.get("events") or {}
+              events = event_block.get("events") or []
+              try:
+                  total_reported = max(total_reported, int(event_block.get("count") or 0))
+              except (TypeError, ValueError):
+                  pass
+              if not events:
+                  break
+              all_events.extend(events)
+              last_id = (events[-1].get("$metadata") or {}).get("id")
+              if len(events) < limit or not last_id:
+                  break
+              cursor = last_id
+
+          def metadata_of(event):
+              m = event.get("$metadata") or {}
+              source = event.get("source")
+              if isinstance(source, dict):
+                  for k in ("level", "error", "errorTemplate", "message", "messageTemplate", "statusCode", "trigger", "service"):
+                      if not m.get(k) and source.get(k) is not None:
+                          m[k] = source.get(k)
+              return m
+
+          levels = collections.Counter()
+          outcomes = collections.Counter()
+          signatures = collections.Counter()
+          invocations_failed = 0
+          fatal_critical = 0
+          error_records = 0
+          routes = collections.Counter()
+
+          known_bad_outcomes = {
+              "exception", "exceededcpu", "scriptnotfound", "canceled",
+              "cancelled", "memorylimitexceeded", "walltimeexceeded",
+              "timelimitexceeded", "killSwitch".lower(),
+          }
+          for event in all_events:
+              meta = metadata_of(event)
+              worker = event.get("$workers") or {}
+              source = event.get("source")
+              level = str(meta.get("level") or "").lower()
+              outcome = str(worker.get("outcome") or meta.get("outcome") or "").lower()
+              if level:
+                  levels[level] += 1
+              if outcome:
+                  outcomes[outcome] += 1
+              if outcome in known_bad_outcomes:
+                  invocations_failed += 1
+              if level in ("fatal", "critical"):
+                  fatal_critical += 1
+              error_value = meta.get("error") or (source.get("error") if isinstance(source, dict) else None)
+              message_value = meta.get("errorTemplate") or meta.get("messageTemplate") or error_value or meta.get("message")
+              source_text = source if isinstance(source, str) else ""
+              is_error = (
+                  level in ("error", "fatal", "critical")
+                  or bool(error_value)
+                  or outcome in known_bad_outcomes
+                  or bool(re.search(r"(?i)\\b(fatal error|uncaught exception|traceback|unhandled exception)\\b", source_text))
+              )
+              if not is_error:
+                  continue
+              error_records += 1
+              if message_value:
+                  signature = scrub(message_value)
+              elif source_text:
+                  # Do not print raw logs: keep a short, scrubbed signature only.
+                  first_line = source_text.splitlines()[0] if source_text.splitlines() else "unclassified log error"
+                  match = re.search(r"([A-Za-z_][A-Za-z0-9_.]*(?:Error|Exception|Timeout|Fault))", first_line)
+                  signature = match.group(1) if match else scrub(first_line)
+              else:
+                  signature = "(error event without message)"
+              signatures[signature or "(empty error signature)"] += 1
+              trigger = str(meta.get("trigger") or "")
+              if trigger:
+                  trigger = re.sub(r"https?://[^\\s]+", "<url>", trigger)
+                  trigger = re.sub(r"\\b[0-9a-f-]{16,}\\b", "<id>", trigger, flags=re.I)
+                  trigger = re.sub(r"\\b\\d{6,}\\b", "<id>", trigger)
+                  routes[trigger[:100]] += 1
+
+          print("QUERY_SUCCESS=true")
+          print("EVENTS_RETURNED=" + str(len(all_events)))
+          print("EVENTS_MATCHED_REPORTED=" + str(total_reported))
+          print("ERROR_EVENTS_CLASSIFIED=" + str(error_records))
+          print("FATAL_OR_CRITICAL_EVENTS=" + str(fatal_critical))
+          print("FAILED_INVOCATIONS=" + str(invocations_failed))
+          print("LEVEL_COUNTS=" + json.dumps(dict(levels.most_common()), sort_keys=True))
+          print("OUTCOME_COUNTS=" + json.dumps(dict(outcomes.most_common()), sort_keys=True))
+          if total_reported > len(all_events):
+              print("NOTE=Result count exceeds collected events; query pagination or API limits may have capped the sample.")
+          print("TOP_ERROR_SIGNATURES_BEGIN")
+          for signature, count in signatures.most_common(20):
+              print(str(count) + "x | " + signature)
+          if not signatures:
+              print("No error signatures returned for cn-call11 in the selected interval.")
+          print("TOP_ERROR_SIGNATURES_END")
+          if routes:
+              print("TOP_ERROR_TRIGGERS_BEGIN")
+              for route, count in routes.most_common(10):
+                  print(str(count) + "x | " + scrub(route))
+              print("TOP_ERROR_TRIGGERS_END")
+          print("AUDIT_COMPLETE")
+          PY
