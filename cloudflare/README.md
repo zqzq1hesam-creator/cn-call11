@@ -1,7 +1,7 @@
 # CN CALL — Cloudflare Workers production configuration
 
-The canonical application branch is `main`. This repository no longer contains the old server/ application entry point,
-Railway deployment files, local SQLite runtime, or the Firebase Admin/gRPC SDK.
+The canonical application branch is `main`. This repository no longer contains the legacy server entry point, deployment files, local SQLite runtime, or the
+Firebase Admin/gRPC SDK.
 
 ## Cloudflare Git deployment
 
@@ -44,7 +44,7 @@ HS256 using Python's standard library. The legacy Firebase Admin SDK, its gRPC
 dependency, the LiveKit Python SDK, Railway's Docker configuration, and the
 SQLite volume fallback are no longer used.
 
-Keep the previous database file only for recovery/migration until user records
-are safely migrated into the new PostgreSQL database. The old SQLite data file is retained at `recovery/cn_call_legacy.db` only as a
-migration/recovery artifact. The running Cloudflare application never reads
-that file.
+Legacy migration scripts and the previous SQLite database are stored under
+`recovery/` only as migration/recovery artifacts. They are not imported by the
+Worker and never participate in its runtime. The database should be safely
+migrated and verified before removing these archives.
