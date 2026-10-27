@@ -45,5 +45,6 @@ dependency, the LiveKit Python SDK, Railway's Docker configuration, and the
 SQLite volume fallback are no longer used.
 
 Keep the previous database file only for recovery/migration until user records
-are safely migrated into the new PostgreSQL database. The running Cloudflare
-application does not read it.
+are safely migrated into the new PostgreSQL database. The old SQLite data file is retained at `recovery/cn_call_legacy.db` only as a
+migration/recovery artifact. The running Cloudflare application never reads
+that file.
