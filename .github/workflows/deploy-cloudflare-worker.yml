@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
-          EXPECTED="2026-10-27-register-pbkdf2-100k-v2"
+          EXPECTED="2026-10-27-signaling-websocket-route-v3"
           BODY="/tmp/cn-call11-production-health.json"
 
           for attempt in $(seq 1 10); do
@@ -85,3 +85,57 @@ jobs:
           echo "::error::Production health endpoint did not report the expected backend version."
           if [ -f "$BODY" ]; then cat "$BODY"; fi
           exit 1
+
+      - name: Verify production WebSocket signaling route
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/cn-call11-ws-smoke
+          npm install --prefix /tmp/cn-call11-ws-smoke --no-save --package-lock=false ws@8
+          NODE_PATH=/tmp/cn-call11-ws-smoke/node_modules node <<'NODE'
+          const WebSocket = require("ws");
+          const url = "wss://cn-call11.zqzq1hesam-cncall.workers.dev/ws/000000000000?token=invalid-production-smoke-token";
+          new Promise((resolve, reject) => {
+            let done = false;
+            const finish = (error) => {
+              if (done) return;
+              done = true;
+              clearTimeout(timer);
+              try { ws.close(); } catch {}
+              error ? reject(error) : resolve();
+            };
+            const ws = new WebSocket(url, { handshakeTimeout: 15000 });
+            const timer = setTimeout(() => finish(new Error("Timed out waiting for session_invalid")), 17000);
+            ws.on("open", () => console.log("WSS_OPEN"));
+            ws.on("message", (raw) => {
+              const message = raw.toString();
+              console.log("WSS_MESSAGE=" + message);
+              let data;
+              try { data = JSON.parse(message); }
+              catch { return finish(new Error("Non-JSON WebSocket frame received")); }
+              if (data.type === "session_invalid" && data.reason === "invalid_session") {
+                console.log("WSS_ASGI_ROUTE_VERIFIED");
+                return finish();
+              }
+              return finish(new Error("Unexpected WebSocket response: " + message));
+            });
+            ws.on("unexpected-response", (request, response) => {
+              let body = "";
+              response.on("data", chunk => body += chunk.toString());
+              response.on("end", () => {
+                console.error("WSS_UNEXPECTED_HTTP_STATUS=" + response.statusCode);
+                console.error("WSS_UNEXPECTED_HTTP_BODY=" + body.slice(0, 2000));
+                finish(new Error("WebSocket upgrade rejected with HTTP " + response.statusCode));
+              });
+            });
+            ws.on("error", (error) => {
+              if (!done) finish(new Error("WebSocket handshake failed: " + error.message));
+            });
+            ws.on("close", (code, reason) => {
+              if (!done) finish(new Error("Closed before session_invalid; code=" + code + " reason=" + reason.toString()));
+            });
+          }).catch((error) => {
+            console.error(error.stack || String(error));
+            process.exitCode = 1;
+          });
+          NODE

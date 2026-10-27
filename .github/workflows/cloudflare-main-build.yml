@@ -91,7 +91,7 @@ jobs:
         run: |
           set -u
           URL="https://cn-call11.zqzq1hesam-cncall.workers.dev/health"
-          EXPECTED="2026-10-27-register-pbkdf2-100k-v2"
+          EXPECTED="2026-10-27-signaling-websocket-route-v3"
           BODY="/tmp/cn-call11-production-health.json"
           echo "Expected production backend version: $EXPECTED"
           for attempt in $(seq 1 3); do

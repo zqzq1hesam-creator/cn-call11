@@ -1,15 +1,6 @@
 name: Cloudflare WebSocket production smoke test
 
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - ".github/workflows/cloudflare-websocket-smoke.yml"
-      - "cloudflare/**"
-      - "wrangler.jsonc"
-      - "pyproject.toml"
-      - "uv.lock"
   workflow_dispatch:
 
 permissions:
@@ -33,7 +24,7 @@ jobs:
           print(json.dumps(data, ensure_ascii=False))
           assert data.get("ready") is True, "Worker health is not ready"
           assert data.get("database") == "ok", "Database is not healthy"
-          assert data.get("backend_version") == "2026-10-27-register-pbkdf2-100k-v2", "Unexpected production version"
+          assert data.get("backend_version") == "2026-10-27-signaling-websocket-route-v3", "Unexpected production version"
           PY
 
       - name: Verify authenticated WebSocket protocol reaches the FastAPI route

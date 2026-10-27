@@ -20,7 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 app = FastAPI(title="CN CALL Server")
 
-CN_CALL_BACKEND_VERSION = "2026-10-27-register-pbkdf2-100k-v2"
+CN_CALL_BACKEND_VERSION = "2026-10-27-signaling-websocket-route-v3"
 
 app.add_middleware(
     CORSMiddleware,

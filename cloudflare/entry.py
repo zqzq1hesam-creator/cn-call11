@@ -110,11 +110,14 @@ class CNCallHub(DurableObject):
 
     async def fetch(self, request):
         app = _get_app(self.env)
-        # ASGI's HTTP fetch adapter does not perform WebSocket upgrades.
-        # Route signaling sockets through the dedicated ASGI WebSocket adapter;
-        # otherwise /ws/{user_id} is treated as an ordinary HTTP request and
-        # calls/rejections never reach the connected Android clients.
-        if (request.headers.get("upgrade") or "").lower() == "websocket":
+        # FastAPI signaling is a WebSocket-only endpoint. Use its dedicated
+        # adapter for /ws/ requests even if the Upgrade header was not preserved
+        # while the request was forwarded into this Durable Object.
+        upgrade = str(request.headers.get("upgrade") or "").lower()
+        request_url = str(request.url).split("?", 1)[0]
+        is_signaling_route = "/ws/" in request_url
+        if upgrade == "websocket" or is_signaling_route:
+            print("[CN CALL][WS ROUTE] adapter=websocket upgrade=" + (upgrade or "(missing)"))
             return await asgi.websocket(app, request, self.env)
         return await asgi.fetch(app, request, self.env)
 
